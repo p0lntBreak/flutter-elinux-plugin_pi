@@ -243,7 +243,7 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // fakesink"
 //UPDATE:
 bool GstVideoPlayer::CreatePipeline() {
-  // Force curlhttpsrc for HTTPS streams (fix SSL/TLS issues with souphttpsrc)
+  // Force curlhttpsrc for HTTPS streams
   GstRegistry* registry = gst_registry_get();
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
@@ -306,6 +306,49 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to link elements" << std::endl;
     return false;
   }
+
+  auto* sinkpad = gst_element_get_static_pad(gst_.video_convert, "sink");
+  auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
+  gst_pad_set_active(ghost_sinkpad, TRUE);
+  gst_element_add_pad(gst_.output, ghost_sinkpad);
+  gst_object_unref(sinkpad);
+
+  // Sets properties to playbin.
+  g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
+  g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
+  
+  // Create audio sink for HDMI audio output
+  GstElement* audio_convert = gst_element_factory_make("audioconvert", "audioconvert");
+  GstElement* audio_resample = gst_element_factory_make("audioresample", "audioresample");
+  GstElement* audio_sink = gst_element_factory_make("alsasink", "audiosink");
+  
+  if (audio_convert && audio_resample && audio_sink) {
+    // Set ALSA device to HDMI output (card 1 for second HDMI)
+    g_object_set(audio_sink, "device", "hw:1,0", NULL);
+    
+    GstElement* audio_bin = gst_bin_new("audiobin");
+    gst_bin_add_many(GST_BIN(audio_bin), audio_convert, audio_resample, audio_sink, NULL);
+    
+    if (gst_element_link_many(audio_convert, audio_resample, audio_sink, NULL)) {
+      GstPad* audio_pad = gst_element_get_static_pad(audio_convert, "sink");
+      GstPad* ghost_audio_pad = gst_ghost_pad_new("sink", audio_pad);
+      gst_element_add_pad(audio_bin, ghost_audio_pad);
+      gst_object_unref(audio_pad);
+      
+      g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
+      std::cout << "Audio output configured for HDMI (hw:1,0)" << std::endl;
+    } else {
+      std::cerr << "Failed to link audio elements" << std::endl;
+      gst_object_unref(audio_bin);
+    }
+  } else {
+    std::cerr << "Warning: Could not create audio sink, audio disabled" << std::endl;
+  }
+  
+  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
+
+  return true;
+}
 
   auto* sinkpad = gst_element_get_static_pad(gst_.video_convert, "sink");
   auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
