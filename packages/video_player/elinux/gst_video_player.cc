@@ -241,7 +241,22 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // Creats a video pipeline using playbin.
 // $ playbin uri=<file> video-sink="videoconvert ! video/x-raw,format=RGBA !
 // fakesink"
+//UPDATE:
 bool GstVideoPlayer::CreatePipeline() {
+  // Force curlhttpsrc for HTTPS streams (fix SSL/TLS issues with souphttpsrc)
+  GstRegistry* registry = gst_registry_get();
+  GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
+  GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
+  
+  if (curl_feature) {
+    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 100);
+    gst_object_unref(curl_feature);
+  }
+  if (soup_feature) {
+    gst_plugin_feature_set_rank(soup_feature, GST_RANK_NONE);
+    gst_object_unref(soup_feature);
+  }
+
   gst_.pipeline = gst_pipeline_new("pipeline");
   if (!gst_.pipeline) {
     std::cerr << "Failed to create a pipeline" << std::endl;
@@ -275,7 +290,7 @@ bool GstVideoPlayer::CreatePipeline() {
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
   // Sets properties to fakesink to get the callback of a decoded frame.
-  g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
+  g_object_set(G_OBJECT(gst_.video_sink), "sync", FALSE, "qos", FALSE, NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
