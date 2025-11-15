@@ -350,20 +350,6 @@ bool GstVideoPlayer::CreatePipeline() {
   return true;
 }
 
-  auto* sinkpad = gst_element_get_static_pad(gst_.video_convert, "sink");
-  auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
-  gst_pad_set_active(ghost_sinkpad, TRUE);
-  gst_element_add_pad(gst_.output, ghost_sinkpad);
-  gst_object_unref(sinkpad);
-
-  // Sets properties to playbin.
-  g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
-  g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
-  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
-
-  return true;
-}
-
 bool GstVideoPlayer::Preroll() {
   if (!gst_.playbin) {
     return false;
