@@ -40,21 +40,30 @@ void GstVideoPlayer::GstLibraryLoad() { gst_init(NULL, NULL); }
 void GstVideoPlayer::GstLibraryUnload() { gst_deinit(); }
 
 bool GstVideoPlayer::Init() {
+  std::cout << "Init: Starting..." << std::endl;
+  
   if (!gst_.pipeline) {
+    std::cerr << "Init: Pipeline is null!" << std::endl;
     return false;
   }
 
   // Prerolls before getting information from the pipeline.
   if (!Preroll()) {
+    std::cerr << "Init: Preroll failed!" << std::endl;
     DestroyPipeline();
     return false;
   }
 
+
   // Sets internal video size and buffier.
   GetVideoSize(width_, height_);
+  std::cout << "Init: Video size: " << width_ << "x" << height_ << std::endl;
+  
   pixels_.reset(new uint32_t[width_ * height_]);
 
   stream_handler_->OnNotifyInitialized();
+  
+  std::cout << "Init: Completed successfully" << std::endl;
 
   return true;
 }
@@ -244,17 +253,19 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 //UPDATE:
 bool GstVideoPlayer::CreatePipeline() {
   // Force curlhttpsrc for HTTPS streams
-  GstRegistry* registry = gst_registry_get();
+ GstRegistry* registry = gst_registry_get();
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
   
   if (curl_feature) {
     gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 100);
     gst_object_unref(curl_feature);
+    std::cout << "CreatePipeline: curlhttpsrc rank boosted" << std::endl;
   }
   if (soup_feature) {
     gst_plugin_feature_set_rank(soup_feature, GST_RANK_NONE);
     gst_object_unref(soup_feature);
+    std::cout << "CreatePipeline: souphttpsrc rank set to NONE" << std::endl;
   }
 
   gst_.pipeline = gst_pipeline_new("pipeline");
@@ -342,16 +353,18 @@ bool GstVideoPlayer::CreatePipeline() {
       gst_object_unref(audio_bin);
     }
   } else {
-    std::cerr << "Warning: Could not create audio sink, audio disabled" << std::endl;
-  }
+    std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
   
-  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
+    gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
 
 bool GstVideoPlayer::Preroll() {
+  std::cout << "Preroll: Starting..." << std::endl;
+  
   if (!gst_.playbin) {
+    std::cerr << "Preroll: playbin is null!" << std::endl;
     return false;
   }
 
@@ -361,16 +374,21 @@ bool GstVideoPlayer::Preroll() {
     return false;
   }
 
+  std::cout << "Preroll: State change result: " << result << std::endl;
+
   // Waits until the state becomes GST_STATE_PAUSED.
   if (result == GST_STATE_CHANGE_ASYNC) {
+    std::cout << "Preroll: Waiting for PAUSED state..." << std::endl;
     GstState state;
-    result =
-        gst_element_get_state(gst_.pipeline, &state, NULL, GST_CLOCK_TIME_NONE);
+    result = gst_element_get_state(gst_.pipeline, &state, NULL, GST_CLOCK_TIME_NONE);
     if (result == GST_STATE_CHANGE_FAILURE) {
       std::cerr << "Failed to get the current state" << std::endl;
       return false;
     }
+    std::cout << "Preroll: Final state: " << state << std::endl;
   }
+  
+  std::cout << "Preroll: Completed successfully" << std::endl;
   return true;
 }
 
