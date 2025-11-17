@@ -256,7 +256,7 @@ bool GstVideoPlayer::CreatePipeline() {
   std::cout << "CreatePipeline: Starting..." << std::endl;
   std::cout << "CreatePipeline: URI = " << uri_ << std::endl;  
   // Force curlhttpsrc for HTTPS streams
- GstRegistry* registry = gst_registry_get();
+  GstRegistry* registry = gst_registry_get();
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
   
@@ -331,14 +331,14 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
-  // Create audio sink for HDMI audio output
+  // Create audio sink using default system audio device
   GstElement* audio_convert = gst_element_factory_make("audioconvert", "audioconvert");
   GstElement* audio_resample = gst_element_factory_make("audioresample", "audioresample");
   GstElement* audio_sink = gst_element_factory_make("alsasink", "audiosink");
   
   if (audio_convert && audio_resample && audio_sink) {
-    // Set ALSA device to HDMI output (card 1 for second HDMI)
-    g_object_set(audio_sink, "device", "hw:1,0", NULL);
+    // Use system default audio device instead of hardcoding hw:1,0
+    // This allows the system to route audio to the appropriate output
     
     GstElement* audio_bin = gst_bin_new("audiobin");
     gst_bin_add_many(GST_BIN(audio_bin), audio_convert, audio_resample, audio_sink, NULL);
@@ -350,20 +350,21 @@ bool GstVideoPlayer::CreatePipeline() {
       gst_object_unref(audio_pad);
       
       g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-      std::cout << "Audio output configured for HDMI (hw:1,0)" << std::endl;
+      std::cout << "Audio output configured for system default device" << std::endl;
     } else {
       std::cerr << "Failed to link audio elements" << std::endl;
       gst_object_unref(audio_bin);
     }
   } else {
-    std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
+    std::cout << "CreatePipeline: Audio elements not available, continuing without audio" << std::endl;
   }
+
+  std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
 
   gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
-
 bool GstVideoPlayer::Preroll() {
   std::cout << "Preroll: Starting..." << std::endl;
   
