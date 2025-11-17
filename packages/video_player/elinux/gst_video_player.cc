@@ -251,6 +251,7 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // $ playbin uri=<file> video-sink="videoconvert ! video/x-raw,format=RGBA !
 // fakesink"
 //UPDATE:
+
 bool GstVideoPlayer::CreatePipeline() {
   // Force curlhttpsrc for HTTPS streams
  GstRegistry* registry = gst_registry_get();
@@ -354,8 +355,9 @@ bool GstVideoPlayer::CreatePipeline() {
     }
   } else {
     std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
-  
-    gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
+  }
+
+  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
