@@ -253,6 +253,8 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 //UPDATE:
 
 bool GstVideoPlayer::CreatePipeline() {
+  std::cout << "CreatePipeline: Starting..." << std::endl;
+  std::cout << "CreatePipeline: URI = " << uri_ << std::endl;  
   // Force curlhttpsrc for HTTPS streams
  GstRegistry* registry = gst_registry_get();
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
@@ -378,44 +380,76 @@ bool GstVideoPlayer::Preroll() {
 
   std::cout << "Preroll: State change result: " << result << std::endl;
 
-  // Waits until the state becomes GST_STATE_PAUSED.
-  if (result == GST_STATE_CHANGE_ASYNC) {
-    std::cout << "Preroll: Waiting for PAUSED state (with 10s timeout)..." << std::endl;
-    GstState state;
-    GstState pending;
+  // Check bus for messages while waiting
+  GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
+  bool done = false;
+  bool success = false;
+  
+  while (!done) {
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 
+        1 * GST_SECOND,  // Check every second
+        (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | 
+                         GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_WARNING));
     
-    // Use 10 second timeout instead of infinite wait
-    result = gst_element_get_state(gst_.pipeline, &state, &pending, 10 * GST_SECOND);
-    
-    if (result == GST_STATE_CHANGE_FAILURE) {
-      std::cerr << "Preroll: Failed to get the current state" << std::endl;
+    if (msg != NULL) {
+      GError* err;
+      gchar* debug_info;
       
-      // Check for error messages
-      GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
-      GstMessage* msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
-      if (msg) {
-        GError* err;
-        gchar* debug_info;
-        gst_message_parse_error(msg, &err, &debug_info);
-        std::cerr << "Preroll Error: " << err->message << std::endl;
-        std::cerr << "Debug info: " << (debug_info ? debug_info : "none") << std::endl;
-        g_clear_error(&err);
-        g_free(debug_info);
-        gst_message_unref(msg);
+      switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR:
+          gst_message_parse_error(msg, &err, &debug_info);
+          std::cerr << "Preroll ERROR from " << GST_OBJECT_NAME(msg->src) 
+                    << ": " << err->message << std::endl;
+          std::cerr << "Debug: " << (debug_info ? debug_info : "none") << std::endl;
+          g_clear_error(&err);
+          g_free(debug_info);
+          done = true;
+          success = false;
+          break;
+          
+        case GST_MESSAGE_WARNING:
+          gst_message_parse_warning(msg, &err, &debug_info);
+          std::cerr << "Preroll WARNING from " << GST_OBJECT_NAME(msg->src) 
+                    << ": " << err->message << std::endl;
+          g_clear_error(&err);
+          g_free(debug_info);
+          break;
+          
+        case GST_MESSAGE_STATE_CHANGED:
+          if (GST_MESSAGE_SRC(msg) == GST_OBJECT(gst_.pipeline)) {
+            GstState old_state, new_state, pending_state;
+            gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
+            std::cout << "Preroll: Pipeline state changed from " << old_state 
+                      << " to " << new_state << " (pending: " << pending_state << ")" << std::endl;
+            
+            if (new_state == GST_STATE_PAUSED) {
+              std::cout << "Preroll: Reached PAUSED state!" << std::endl;
+              done = true;
+              success = true;
+            }
+          }
+          break;
+          
+        default:
+          break;
       }
-      gst_object_unref(bus);
-      
-      return false;
-    } else if (result == GST_STATE_CHANGE_ASYNC) {
-      std::cerr << "Preroll: Timeout waiting for PAUSED state" << std::endl;
-      return false;
+      gst_message_unref(msg);
+    } else {
+      // Timeout - still waiting
+      std::cout << "Preroll: Still waiting..." << std::endl;
     }
-    
-    std::cout << "Preroll: Current state: " << state << ", Pending: " << pending << std::endl;
   }
   
-  std::cout << "Preroll: Completed successfully" << std::endl;
-  return true;
+  gst_object_unref(bus);
+  
+  if (success) {
+    std::cout << "Preroll: Completed successfully" << std::endl;
+    return true;
+  } else {
+    std::cerr << "Preroll: Failed!" << std::endl;
+    return false;
+  }
 }
 
 void GstVideoPlayer::DestroyPipeline() {
