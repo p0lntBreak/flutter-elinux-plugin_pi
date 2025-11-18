@@ -335,36 +335,38 @@ bool GstVideoPlayer::CreatePipeline() {
   GstElement* audio_convert = gst_element_factory_make("audioconvert", "audioconvert");
   GstElement* audio_resample = gst_element_factory_make("audioresample", "audioresample");
   GstElement* audio_sink = gst_element_factory_make("alsasink", "audiosink");
-  
+
   if (audio_convert && audio_resample && audio_sink) {
-    // Use system default audio device instead of hardcoding hw:1,0
-    // This allows the system to route audio to the appropriate output
-    
     GstElement* audio_bin = gst_bin_new("audiobin");
     gst_bin_add_many(GST_BIN(audio_bin), audio_convert, audio_resample, audio_sink, NULL);
+  
+  if (gst_element_link_many(audio_convert, audio_resample, audio_sink, NULL)) {
+    GstPad* audio_pad = gst_element_get_static_pad(audio_convert, "sink");
+    GstPad* ghost_audio_pad = gst_ghost_pad_new("sink", audio_pad);
+    gst_element_add_pad(audio_bin, ghost_audio_pad);
+    gst_object_unref(audio_pad);
     
-    if (gst_element_link_many(audio_convert, audio_resample, audio_sink, NULL)) {
-      GstPad* audio_pad = gst_element_get_static_pad(audio_convert, "sink");
-      GstPad* ghost_audio_pad = gst_ghost_pad_new("sink", audio_pad);
-      gst_element_add_pad(audio_bin, ghost_audio_pad);
-      gst_object_unref(audio_pad);
-      
-      g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-      std::cout << "Audio output configured for system default device" << std::endl;
-    } else {
-      std::cerr << "Failed to link audio elements" << std::endl;
-      gst_object_unref(audio_bin);
-    }
+    g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
+    std::cout << "Audio output configured for system default device" << std::endl;
   } else {
-    std::cout << "CreatePipeline: Audio elements not available, continuing without audio" << std::endl;
+    std::cerr << "Failed to link audio elements" << std::endl;
+    gst_object_unref(audio_bin);
   }
-
+} else {
+  // Use fakesink for audio as fallback
+  GstElement* audio_fakesink = gst_element_factory_make("fakesink", "audiofakesink");
+  if (audio_fakesink) {
+    g_object_set(gst_.playbin, "audio-sink", audio_fakesink, NULL);
+    std::cout << "CreatePipeline: Audio disabled, using fakesink" << std::endl;
+  }
+}
   std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
 
   gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
+
 bool GstVideoPlayer::Preroll() {
   std::cout << "Preroll: Starting..." << std::endl;
   
