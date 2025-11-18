@@ -331,7 +331,7 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
-  // Create audio sink using default system audio device
+  /* Create audio sink using default system audio device
   GstElement* audio_convert = gst_element_factory_make("audioconvert", "audioconvert");
   GstElement* audio_resample = gst_element_factory_make("audioresample", "audioresample");
   GstElement* audio_sink = gst_element_factory_make("alsasink", "audiosink");
@@ -360,6 +360,22 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cout << "CreatePipeline: Audio disabled, using fakesink" << std::endl;
   }
 }
+  std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
+
+  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
+
+  return true;
+}*/
+  
+  // Disable audio completely - use fakesink
+  GstElement* audio_fakesink = gst_element_factory_make("fakesink", "audiofakesink");
+  if (audio_fakesink) {
+    g_object_set(gst_.playbin, "audio-sink", audio_fakesink, NULL);
+    std::cout << "CreatePipeline: Audio disabled, using fakesink" << std::endl;
+  } else {
+    std::cout << "CreatePipeline: Warning - could not create audio fakesink" << std::endl;
+  }
+
   std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
 
   gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
