@@ -252,19 +252,43 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // fakesink"
 //UPDATE:
 
+static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointer user_data) {
+  std::cout << "SourceSetupCallback: Source element created: " 
+            << GST_ELEMENT_NAME(source) << " (type: " 
+            << G_OBJECT_TYPE_NAME(source) << ")" << std::endl;
+  
+  // Configure curlhttpsrc if that's what was created
+  if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstCurlHttpSrc") == 0) {
+    std::cout << "SourceSetupCallback: Configuring curlhttpsrc" << std::endl;
+    g_object_set(source, "timeout", 30, NULL);
+    g_object_set(source, "compress", TRUE, NULL);
+    g_object_set(source, "keep-alive", TRUE, NULL);
+  }
+  // If souphttpsrc was created despite our rank changes, warn about it
+  else if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstSoupHTTPSrc") == 0) {
+    std::cerr << "SourceSetupCallback: WARNING - souphttpsrc was selected!" << std::endl;
+    g_object_set(source, "timeout", 30, NULL);
+    g_object_set(source, "compress", TRUE, NULL);
+  }
+}
+
 bool GstVideoPlayer::CreatePipeline() {
   std::cout << "CreatePipeline: Starting..." << std::endl;
   std::cout << "CreatePipeline: URI = " << uri_ << std::endl;  
-  // Force curlhttpsrc for HTTPS streams
+  
+  // Force curlhttpsrc for HTTPS streams by setting ranks BEFORE creating pipeline
   GstRegistry* registry = gst_registry_get();
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
   
   if (curl_feature) {
-    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 100);
+    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 200);
     gst_object_unref(curl_feature);
-    std::cout << "CreatePipeline: curlhttpsrc rank boosted" << std::endl;
+    std::cout << "CreatePipeline: curlhttpsrc rank boosted to PRIMARY+200" << std::endl;
+  } else {
+    std::cerr << "CreatePipeline: WARNING - curlhttpsrc not found!" << std::endl;
   }
+  
   if (soup_feature) {
     gst_plugin_feature_set_rank(soup_feature, GST_RANK_NONE);
     gst_object_unref(soup_feature);
@@ -276,26 +300,35 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to create a pipeline" << std::endl;
     return false;
   }
+  
   gst_.playbin = gst_element_factory_make("playbin", "playbin");
   if (!gst_.playbin) {
     std::cerr << "Failed to create a source" << std::endl;
     return false;
   }
+  
+  // Connect to source-setup signal to configure the HTTP source
+  g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
+  std::cout << "CreatePipeline: Connected source-setup signal" << std::endl;
+  
   gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
   if (!gst_.video_convert) {
     std::cerr << "Failed to create a videoconvert" << std::endl;
     return false;
   }
+  
   gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
   if (!gst_.video_sink) {
     std::cerr << "Failed to create a videosink" << std::endl;
     return false;
   }
+  
   gst_.output = gst_bin_new("output");
   if (!gst_.output) {
     std::cerr << "Failed to create an output" << std::endl;
     return false;
   }
+  
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
   if (!gst_.bus) {
     std::cerr << "Failed to create a bus" << std::endl;
@@ -331,49 +364,33 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
-  /* Create audio sink using default system audio device
+  // Configure network buffering for better streaming performance
+  g_object_set(gst_.playbin, "buffer-size", 2097152, NULL);  // 2MB buffer
+  g_object_set(gst_.playbin, "buffer-duration", 2000000000LL, NULL);  // 2 seconds
+  
+  // Create audio sink using autoaudiosink (automatically selects best output)
   GstElement* audio_convert = gst_element_factory_make("audioconvert", "audioconvert");
   GstElement* audio_resample = gst_element_factory_make("audioresample", "audioresample");
-  GstElement* audio_sink = gst_element_factory_make("alsasink", "audiosink");
-
+  GstElement* audio_sink = gst_element_factory_make("autoaudiosink", "audiosink");
+  
   if (audio_convert && audio_resample && audio_sink) {
     GstElement* audio_bin = gst_bin_new("audiobin");
     gst_bin_add_many(GST_BIN(audio_bin), audio_convert, audio_resample, audio_sink, NULL);
-  
-  if (gst_element_link_many(audio_convert, audio_resample, audio_sink, NULL)) {
-    GstPad* audio_pad = gst_element_get_static_pad(audio_convert, "sink");
-    GstPad* ghost_audio_pad = gst_ghost_pad_new("sink", audio_pad);
-    gst_element_add_pad(audio_bin, ghost_audio_pad);
-    gst_object_unref(audio_pad);
     
-    g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-    std::cout << "Audio output configured for system default device" << std::endl;
+    if (gst_element_link_many(audio_convert, audio_resample, audio_sink, NULL)) {
+      GstPad* audio_pad = gst_element_get_static_pad(audio_convert, "sink");
+      GstPad* ghost_audio_pad = gst_ghost_pad_new("sink", audio_pad);
+      gst_element_add_pad(audio_bin, ghost_audio_pad);
+      gst_object_unref(audio_pad);
+      
+      g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
+      std::cout << "Audio output configured with autoaudiosink" << std::endl;
+    } else {
+      std::cerr << "Failed to link audio elements" << std::endl;
+      gst_object_unref(audio_bin);
+    }
   } else {
-    std::cerr << "Failed to link audio elements" << std::endl;
-    gst_object_unref(audio_bin);
-  }
-} else {
-  // Use fakesink for audio as fallback
-  GstElement* audio_fakesink = gst_element_factory_make("fakesink", "audiofakesink");
-  if (audio_fakesink) {
-    g_object_set(gst_.playbin, "audio-sink", audio_fakesink, NULL);
-    std::cout << "CreatePipeline: Audio disabled, using fakesink" << std::endl;
-  }
-}
-  std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
-
-  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
-
-  return true;
-}*/
-  
-  // Disable audio completely - use fakesink
-  GstElement* audio_fakesink = gst_element_factory_make("fakesink", "audiofakesink");
-  if (audio_fakesink) {
-    g_object_set(gst_.playbin, "audio-sink", audio_fakesink, NULL);
-    std::cout << "CreatePipeline: Audio disabled, using fakesink" << std::endl;
-  } else {
-    std::cout << "CreatePipeline: Warning - could not create audio fakesink" << std::endl;
+    std::cout << "CreatePipeline: Audio elements not available, continuing without audio" << std::endl;
   }
 
   std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
