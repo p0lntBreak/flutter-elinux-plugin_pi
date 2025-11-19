@@ -365,32 +365,21 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
   // Configure network buffering for better streaming performance
-  g_object_set(gst_.playbin, "buffer-size", 2097152, NULL);  // 2MB buffer
-  g_object_set(gst_.playbin, "buffer-duration", 2000000000LL, NULL);  // 2 seconds
+  g_object_set(gst_.playbin, "buffer-size", 4194304, NULL);  // 4MB buffer (increased)
+  g_object_set(gst_.playbin, "buffer-duration", 3000000000LL, NULL);  // 3 seconds
   
-  // Create audio sink using autoaudiosink (automatically selects best output)
-  GstElement* audio_convert = gst_element_factory_make("audioconvert", "audioconvert");
-  GstElement* audio_resample = gst_element_factory_make("audioresample", "audioresample");
-  GstElement* audio_sink = gst_element_factory_make("autoaudiosink", "audiosink");
+  std::cout << "CreatePipeline: Setting up audio pipeline..." << std::endl;
   
-  if (audio_convert && audio_resample && audio_sink) {
-    GstElement* audio_bin = gst_bin_new("audiobin");
-    gst_bin_add_many(GST_BIN(audio_bin), audio_convert, audio_resample, audio_sink, NULL);
-    
-    if (gst_element_link_many(audio_convert, audio_resample, audio_sink, NULL)) {
-      GstPad* audio_pad = gst_element_get_static_pad(audio_convert, "sink");
-      GstPad* ghost_audio_pad = gst_ghost_pad_new("sink", audio_pad);
-      gst_element_add_pad(audio_bin, ghost_audio_pad);
-      gst_object_unref(audio_pad);
-      
-      g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-      std::cout << "Audio output configured with autoaudiosink" << std::endl;
-    } else {
-      std::cerr << "Failed to link audio elements" << std::endl;
-      gst_object_unref(audio_bin);
-    }
+  // Use fakesink for audio to avoid audio device issues
+  // This discards audio but allows the video pipeline to work
+  GstElement* audio_sink = gst_element_factory_make("fakesink", "audiosink");
+  
+  if (audio_sink) {
+    g_object_set(audio_sink, "sync", FALSE, NULL);  // Don't sync to clock
+    g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
+    std::cout << "CreatePipeline: Audio configured with fakesink (silent mode)" << std::endl;
   } else {
-    std::cout << "CreatePipeline: Audio elements not available, continuing without audio" << std::endl;
+    std::cerr << "CreatePipeline: WARNING - Even fakesink is not available!" << std::endl;
   }
 
   std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
@@ -399,7 +388,6 @@ bool GstVideoPlayer::CreatePipeline() {
 
   return true;
 }
-
 bool GstVideoPlayer::Preroll() {
   std::cout << "Preroll: Starting..." << std::endl;
   
