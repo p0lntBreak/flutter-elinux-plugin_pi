@@ -644,7 +644,9 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       break;
   }
 
-  gst_message_unref(message);
-
-  return GST_BUS_DROP;
+  // Return GST_BUS_PASS so the message is still posted to the default
+  // bus handlers/watchers. Previously returning GST_BUS_DROP prevented
+  // other consumers (like timed_pop_filtered in Preroll) from ever
+  // seeing STATE_CHANGED messages.
+  return GST_BUS_PASS;
 }
