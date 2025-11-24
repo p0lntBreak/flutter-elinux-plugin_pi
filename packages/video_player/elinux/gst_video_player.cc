@@ -276,15 +276,16 @@ bool GstVideoPlayer::CreatePipeline() {
   std::cout << "CreatePipeline: Starting..." << std::endl;
   std::cout << "CreatePipeline: URI = " << uri_ << std::endl;  
   
-  // Force curlhttpsrc for HTTPS streams by setting ranks BEFORE creating pipeline
   GstRegistry* registry = gst_registry_get();
+  
+  // Force curlhttpsrc for HTTPS streams
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
   
   if (curl_feature) {
-    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 200);
+    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 300);
     gst_object_unref(curl_feature);
-    std::cout << "CreatePipeline: curlhttpsrc rank boosted to PRIMARY+200" << std::endl;
+    std::cout << "CreatePipeline: curlhttpsrc rank boosted to PRIMARY+300" << std::endl;
   } else {
     std::cerr << "CreatePipeline: WARNING - curlhttpsrc not found!" << std::endl;
   }
@@ -293,6 +294,53 @@ bool GstVideoPlayer::CreatePipeline() {
     gst_plugin_feature_set_rank(soup_feature, GST_RANK_NONE);
     gst_object_unref(soup_feature);
     std::cout << "CreatePipeline: souphttpsrc rank set to NONE" << std::endl;
+  }
+  
+  // CRITICAL: Force hardware video decoders to MAX rank
+  GstPluginFeature* v4l2_h264 = gst_registry_lookup_feature(registry, "v4l2h264dec");
+  GstPluginFeature* v4l2_h265 = gst_registry_lookup_feature(registry, "v4l2h265dec");
+  GstPluginFeature* avdec_h264 = gst_registry_lookup_feature(registry, "avdec_h264");
+  GstPluginFeature* avdec_h265 = gst_registry_lookup_feature(registry, "avdec_h265");
+  
+  if (v4l2_h264) {
+    gst_plugin_feature_set_rank(v4l2_h264, GST_RANK_PRIMARY + 300);
+    gst_object_unref(v4l2_h264);
+    std::cout << "CreatePipeline: v4l2h264dec rank boosted to PRIMARY+300" << std::endl;
+  }
+  
+  if (v4l2_h265) {
+    gst_plugin_feature_set_rank(v4l2_h265, GST_RANK_PRIMARY + 300);
+    gst_object_unref(v4l2_h265);
+    std::cout << "CreatePipeline: v4l2h265dec rank boosted to PRIMARY+300" << std::endl;
+  }
+  
+  // Demote software decoders completely
+  if (avdec_h264) {
+    gst_plugin_feature_set_rank(avdec_h264, GST_RANK_NONE);
+    gst_object_unref(avdec_h264);
+    std::cout << "CreatePipeline: avdec_h264 rank set to NONE" << std::endl;
+  }
+  
+  if (avdec_h265) {
+    gst_plugin_feature_set_rank(avdec_h265, GST_RANK_NONE);
+    gst_object_unref(avdec_h265);
+    std::cout << "CreatePipeline: avdec_h265 rank set to NONE" << std::endl;
+  }
+  
+  // Boost hlsdemux rank for HLS streams
+  GstPluginFeature* hls_feature = gst_registry_lookup_feature(registry, "hlsdemux");
+  if (hls_feature) {
+    gst_plugin_feature_set_rank(hls_feature, GST_RANK_PRIMARY + 300);
+    gst_object_unref(hls_feature);
+    std::cout << "CreatePipeline: hlsdemux rank boosted to PRIMARY+300" << std::endl;
+  }
+  
+  // Boost parsebin (it's actually a typefind element type)
+  GstPluginFeature* parsebin_feature = gst_registry_lookup_feature(registry, "parsebin");
+  if (parsebin_feature) {
+    gst_plugin_feature_set_rank(parsebin_feature, GST_RANK_PRIMARY + 300);
+    gst_object_unref(parsebin_feature);
+    std::cout << "CreatePipeline: parsebin rank boosted" << std::endl;
   }
 
   gst_.pipeline = gst_pipeline_new("pipeline");
@@ -303,91 +351,163 @@ bool GstVideoPlayer::CreatePipeline() {
   
   gst_.playbin = gst_element_factory_make("playbin", "playbin");
   if (!gst_.playbin) {
-    std::cerr << "Failed to create a source" << std::endl;
+    std::cerr << "Failed to create playbin" << std::endl;
     return false;
   }
   
-  // Connect to source-setup signal to configure the HTTP source
+  // Connect to source-setup signal
   g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
   std::cout << "CreatePipeline: Connected source-setup signal" << std::endl;
   
-  gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
+  // Try hardware color conversion first
+  gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
+  if (gst_.video_convert) {
+    std::cout << "CreatePipeline: Using v4l2convert (hardware)" << std::endl;
+  } else {
+    std::cout << "CreatePipeline: Fallback to videoconvert (software)" << std::endl;
+    gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
+  }
+  
   if (!gst_.video_convert) {
-    std::cerr << "Failed to create a videoconvert" << std::endl;
+    std::cerr << "Failed to create videoconvert" << std::endl;
     return false;
   }
   
   gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
   if (!gst_.video_sink) {
-    std::cerr << "Failed to create a videosink" << std::endl;
+    std::cerr << "Failed to create videosink" << std::endl;
     return false;
+  }
+  
+  // Create queue with settings matching your working CLI command
+  GstElement* video_queue = gst_element_factory_make("queue", "vqueue");
+  if (!video_queue) {
+    std::cerr << "Failed to create video queue" << std::endl;
+    return false;
+  }
+  
+  // Detect stream type
+  bool is_live_stream = (uri_.find("/live/") != std::string::npos) || 
+                        (uri_.find("live.") != std::string::npos) ||
+                        (uri_.find("livestream") != std::string::npos) ||
+                        (uri_.find("cnngo") != std::string::npos);
+  
+  // Queue settings matching working CLI: max-size-buffers=3
+  if (is_live_stream) {
+    std::cout << "CreatePipeline: LIVE stream - minimal buffering, low latency" << std::endl;
+    g_object_set(video_queue, 
+                 "max-size-buffers", 3,        // Match CLI
+                 "max-size-time", (guint64)0,  // Match CLI
+                 "max-size-bytes", 0,          // Match CLI
+                 "leaky", 2,                   // Drop old buffers
+                 NULL);
+  } else {
+    std::cout << "CreatePipeline: VOD stream - balanced buffering" << std::endl;
+    g_object_set(video_queue, 
+                 "max-size-buffers", 3,        // Match CLI
+                 "max-size-time", (guint64)0,  // Match CLI
+                 "max-size-bytes", 0,          // Match CLI
+                 NULL);
   }
   
   gst_.output = gst_bin_new("output");
   if (!gst_.output) {
-    std::cerr << "Failed to create an output" << std::endl;
+    std::cerr << "Failed to create output bin" << std::endl;
     return false;
   }
   
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
   if (!gst_.bus) {
-    std::cerr << "Failed to create a bus" << std::endl;
+    std::cerr << "Failed to get bus" << std::endl;
     return false;
   }
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
-  // Sets properties to fakesink to get the callback of a decoded frame.
+  // Configure fakesink
   g_object_set(G_OBJECT(gst_.video_sink), "sync", FALSE, "qos", FALSE, NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
-  gst_bin_add_many(GST_BIN(gst_.output), gst_.video_convert, gst_.video_sink,
-                   NULL);
+  
+  // Build output bin: queue -> convert -> sink
+  gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert, 
+                   gst_.video_sink, NULL);
 
-  // Adds caps to the converter to convert the color format to RGBA.
-  auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
-  auto link_ok =
-      gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
-  gst_caps_unref(caps);
-  if (!link_ok) {
-    std::cerr << "Failed to link elements" << std::endl;
+  // Link queue to converter
+  if (!gst_element_link(video_queue, gst_.video_convert)) {
+    std::cerr << "Failed to link queue to videoconvert" << std::endl;
     return false;
   }
 
-  auto* sinkpad = gst_element_get_static_pad(gst_.video_convert, "sink");
+  // Link converter to sink with RGBA caps
+  auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
+  auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
+  gst_caps_unref(caps);
+  if (!link_ok) {
+    std::cerr << "Failed to link videoconvert to sink" << std::endl;
+    return false;
+  }
+
+  // Create ghost pad from queue input
+  auto* sinkpad = gst_element_get_static_pad(video_queue, "sink");
   auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
   gst_pad_set_active(ghost_sinkpad, TRUE);
   gst_element_add_pad(gst_.output, ghost_sinkpad);
   gst_object_unref(sinkpad);
 
-  // Sets properties to playbin.
+  // Configure playbin
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
-  // Configure network buffering for better streaming performance
-  g_object_set(gst_.playbin, "buffer-size", 4194304, NULL);  // 4MB buffer (increased)
-  g_object_set(gst_.playbin, "buffer-duration", 3000000000LL, NULL);  // 3 seconds
+  // Critical playbin flags for HLS
+  gint flags;
+  g_object_get(gst_.playbin, "flags", &flags, NULL);
   
-  std::cout << "CreatePipeline: Setting up audio pipeline..." << std::endl;
+  // Enable: video, native-video, download, buffering
+  // Disable: audio, text, soft-volume (since we're not playing audio)
+  flags |= 0x00000001;   // GST_PLAY_FLAG_VIDEO
+  flags |= 0x00000080;   // GST_PLAY_FLAG_NATIVE_VIDEO
+  flags |= 0x00000080;   // GST_PLAY_FLAG_DOWNLOAD
+  flags |= 0x00000080;   // GST_PLAY_FLAG_BUFFERING
+  flags &= ~0x00000002;  // Disable GST_PLAY_FLAG_AUDIO
+  flags &= ~0x00000004;  // Disable GST_PLAY_FLAG_TEXT
   
-  // Use fakesink for audio to avoid audio device issues
-  // This discards audio but allows the video pipeline to work
-  GstElement* audio_sink = gst_element_factory_make("fakesink", "audiosink");
+  g_object_set(gst_.playbin, "flags", flags, NULL);
+  std::cout << "CreatePipeline: Playbin flags configured for HLS" << std::endl;
   
-  if (audio_sink) {
-    g_object_set(audio_sink, "sync", FALSE, NULL);  // Don't sync to clock
-    g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
-    std::cout << "CreatePipeline: Audio configured with fakesink (silent mode)" << std::endl;
+  // Network buffering configuration
+  if (is_live_stream) {
+    // Live: minimal buffering for low latency
+    g_object_set(gst_.playbin, "buffer-size", 1048576, NULL);      // 1MB
+    g_object_set(gst_.playbin, "buffer-duration", 1000000000LL, NULL);  // 1 sec
+    g_object_set(gst_.playbin, "latency", 1000, NULL);             // 1 sec max latency
+    std::cout << "CreatePipeline: LIVE config (1MB, 1s)" << std::endl;
   } else {
-    std::cerr << "CreatePipeline: WARNING - Even fakesink is not available!" << std::endl;
+    // VOD: larger buffer to prevent stalls
+    g_object_set(gst_.playbin, "buffer-size", 5242880, NULL);      // 5MB
+    g_object_set(gst_.playbin, "buffer-duration", 5000000000LL, NULL);  // 5 sec
+    std::cout << "CreatePipeline: VOD config (5MB, 5s)" << std::endl;
+  }
+  
+  // Connection speed for adaptive streaming
+  g_object_set(gst_.playbin, "connection-speed", 5000, NULL);  // 5 Mbps
+  
+  // Configure audio sink (silent)
+  GstElement* audio_sink = gst_element_factory_make("fakesink", "audiosink");
+  if (audio_sink) {
+    g_object_set(audio_sink, "sync", FALSE, NULL);
+    g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
+    std::cout << "CreatePipeline: Audio sink configured (silent)" << std::endl;
   }
 
-  std::cout << "CreatePipeline: Pipeline created successfully" << std::endl;
+  std::cout << "CreatePipeline: SUCCESS - Hardware accelerated pipeline ready" << std::endl;
 
   gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
+
+
 bool GstVideoPlayer::Preroll() {
   std::cout << "Preroll: Starting..." << std::endl;
   
