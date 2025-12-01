@@ -167,12 +167,30 @@ int64_t GstVideoPlayer::GetDuration() {
 }
 
 int64_t GstVideoPlayer::GetCurrentPosition() {
+  if (!gst_.pipeline) {
+    return 0;
+  }
+
+  // Check pipeline state - position might not be available in NULL or READY states
+  GstState state, pending;
+  gst_element_get_state(gst_.pipeline, &state, &pending, 0);
+  
+  // Position is only available when pipeline is PAUSED or PLAYING
+  if (state < GST_STATE_PAUSED) {
+    return 0;  // Return 0 instead of -1 when not ready yet
+  }
+
   gint64 position = 0;
 
-  // Sometimes we get an error when playing streaming videos.
+  // Sometimes we get an error when playing streaming videos, especially during buffering.
+  // Return 0 instead of -1 to allow progress bar to start at 0 and update when available.
   if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
-    std::cerr << "Failed to get current position" << std::endl;
-    return -1;
+    // Don't log error for streaming videos during initial buffering - this is normal
+    // Only log if we're actually playing (state is PLAYING)
+    if (state == GST_STATE_PLAYING) {
+      std::cerr << "Failed to get current position (pipeline is playing)" << std::endl;
+    }
+    return 0;  // Return 0 instead of -1 to prevent progress bar from breaking
   }
 
   // TODO: We need to handle this code in the proper plase.
