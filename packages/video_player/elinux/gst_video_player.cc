@@ -489,7 +489,7 @@ bool GstVideoPlayer::CreatePipeline() {
   flags |= 0x00000080;   // GST_PLAY_FLAG_NATIVE_VIDEO
   flags |= 0x00000080;   // GST_PLAY_FLAG_DOWNLOAD
   flags |= 0x00000080;   // GST_PLAY_FLAG_BUFFERING
-  flags &= ~0x00000002;  // Disable GST_PLAY_FLAG_AUDIO
+  //flags &= ~0x00000002;  // Disable GST_PLAY_FLAG_AUDIO
   flags &= ~0x00000004;  // Disable GST_PLAY_FLAG_TEXT
   
   g_object_set(gst_.playbin, "flags", flags, NULL);
@@ -512,24 +512,33 @@ bool GstVideoPlayer::CreatePipeline() {
   // Connection speed for adaptive streaming
   g_object_set(gst_.playbin, "connection-speed", 5000, NULL);  // 5 Mbps
   
-  // Configure audio sink (silent)
+  /*Configure audio sink (silent)
   GstElement* audio_sink = gst_element_factory_make("fakesink", "audiosink");
   if (audio_sink) {
     g_object_set(audio_sink, "sync", FALSE, NULL);
     g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
     std::cout << "CreatePipeline: Audio sink configured (silent)" << std::endl;
-  }
+  }*/
 
-  /* Card 0, device 0 (vc4-hdmi-0):
-GstElement* audio_sink = gst_element_factory_make("alsasink", "audiosink");
-if (audio_sink) {
-  g_object_set(audio_sink,
-               "device", "hw:0,0",  // or "hw:1,0" for vc4-hdmi-1
-               "sync", TRUE,
-               NULL);
-  g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
-  std::cout << "CreatePipeline: Audio sink configured (ALSA hw:0,0)" << std::endl;
-}*/
+
+  GError* error = nullptr;
+  GstElement* audio_sink = gst_parse_launch(
+      "audioconvert ! alsasink device=plughw:0,0", &error);
+  
+  if (!audio_sink || error) {
+    if (error) {
+      std::cerr << "CreatePipeline: Failed to create audio sink: "
+                << error->message << std::endl;
+      g_error_free(error);
+    } else {
+      std::cerr << "CreatePipeline: Failed to create audio sink (unknown error)"
+                << std::endl;
+    }
+  } else {
+    g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
+    std::cout << "CreatePipeline: Audio sink configured (audioconvert ! alsasink device=plughw:0,0)"
+              << std::endl;
+  }
 
   std::cout << "CreatePipeline: SUCCESS - Hardware accelerated pipeline ready" << std::endl;
 
