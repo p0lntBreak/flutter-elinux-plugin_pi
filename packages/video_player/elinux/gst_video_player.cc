@@ -521,24 +521,31 @@ bool GstVideoPlayer::CreatePipeline() {
   }*/
 
 
-  GError* error = nullptr;
-  GstElement* audio_sink = gst_parse_launch(
-      "audioconvert ! alsasink device=plughw:0,0", &error);
-  
-  if (!audio_sink || error) {
-    if (error) {
-      std::cerr << "CreatePipeline: Failed to create audio sink: "
-                << error->message << std::endl;
-      g_error_free(error);
-    } else {
-      std::cerr << "CreatePipeline: Failed to create audio sink (unknown error)"
-                << std::endl;
-    }
+// audio_bin: [sink pad] -> audioconvert -> alsasink
+GstElement* audio_bin = gst_bin_new("audio_bin");
+GstElement* conv = gst_element_factory_make("audioconvert", "audio_convert");
+GstElement* sink = gst_element_factory_make("alsasink", "audio_alsa");
+
+if (!audio_bin || !conv || !sink) {
+  std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
+} else {
+  g_object_set(sink, "device", "plughw:0,0", NULL);  // matches your working test
+
+  gst_bin_add_many(GST_BIN(audio_bin), conv, sink, NULL);
+  if (!gst_element_link(conv, sink)) {
+    std::cerr << "CreatePipeline: Failed to link audioconvert -> alsasink" << std::endl;
   } else {
-    g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
-    std::cout << "CreatePipeline: Audio sink configured (audioconvert ! alsasink device=plughw:0,0)"
-              << std::endl;
+    // Create ghost sink pad on the bin
+    GstPad* sinkpad = gst_element_get_static_pad(conv, "sink");
+    GstPad* ghost = gst_ghost_pad_new("sink", sinkpad);
+    gst_pad_set_active(ghost, TRUE);
+    gst_element_add_pad(audio_bin, ghost);
+    gst_object_unref(sinkpad);
+
+    g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
+    std::cout << "CreatePipeline: Audio sink configured (audioconvert ! alsasink device=plughw:0,0)" << std::endl;
   }
+}
 
   std::cout << "CreatePipeline: SUCCESS - Hardware accelerated pipeline ready" << std::endl;
 
