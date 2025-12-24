@@ -67,6 +67,34 @@ class AudioplayersElinuxPlugin : public flutter::Plugin {
             plugin_pointer->HandleGlobalMethodCall(call, std::move(result));
           });
     }
+    {
+      // Register global event channel
+      auto event_channel =
+          std::make_unique<flutter::EventChannel<flutter::EncodableValue>>(
+              registrar->messenger(), "xyz.luan/audioplayers.global/events",
+              &flutter::StandardMethodCodec::GetInstance());
+      auto event_channel_handler = std::make_unique<
+          flutter::StreamHandlerFunctions<flutter::EncodableValue>>(
+          // StreamHandlerFunctions
+          [plugin_pointer = plugin.get()](
+              const flutter::EncodableValue* arguments,
+              std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&&
+                  events)
+              -> std::unique_ptr<
+                  flutter::StreamHandlerError<flutter::EncodableValue>> {
+            plugin_pointer->global_event_sink_ = std::move(events);
+            return nullptr;
+          },
+          // StreamHandlerCancel
+          [plugin_pointer = plugin.get()](
+              const flutter::EncodableValue* arguments)
+              -> std::unique_ptr<
+                  flutter::StreamHandlerError<flutter::EncodableValue>> {
+            plugin_pointer->global_event_sink_.reset();
+            return nullptr;
+          });
+      event_channel->SetStreamHandler(std::move(event_channel_handler));
+    }
     registrar->AddPlugin(std::move(plugin));
   }
 
@@ -197,7 +225,10 @@ class AudioplayersElinuxPlugin : public flutter::Plugin {
       const flutter::MethodCall<flutter::EncodableValue>& method_call,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
     const std::string &method_name = method_call.method_name();
-    if (method_name == "setAudioContext") {
+    if (method_name == "init") {
+      // Global initialization - already done in constructor (GstLibraryLoad)
+      result->Success();
+    } else if (method_name == "setAudioContext") {
       result->NotImplemented();
     } else if (method_name == "emitLog") {
       result->NotImplemented();
@@ -294,6 +325,7 @@ class AudioplayersElinuxPlugin : public flutter::Plugin {
   std::map<std::string,
       std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>>
         event_sinks_;
+  std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> global_event_sink_;
   flutter::PluginRegistrar* registrar_;
 };
 
