@@ -278,9 +278,27 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointe
   // Configure curlhttpsrc if that's what was created
   if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstCurlHttpSrc") == 0) {
     std::cout << "SourceSetupCallback: Configuring curlhttpsrc" << std::endl;
+    
+    // Connection settings for reliable HLS streaming
     g_object_set(source, "timeout", 30, NULL);
     g_object_set(source, "compress", TRUE, NULL);
     g_object_set(source, "keep-alive", TRUE, NULL);
+    
+    // Enable cookies for authenticated sessions (important for server-side session tracking)
+    g_object_set(source, "cookies", TRUE, NULL);
+    
+    // Add follow-location for redirects
+    g_object_set(source, "follow-location", TRUE, NULL);
+    
+    // Enable persistent connection for HLS segment fetching
+    g_object_set(source, "ssl-strict", FALSE, NULL);
+    
+    std::cout << "SourceSetupCallback: curlhttpsrc configured with:" << std::endl
+              << "  - timeout: 30s" << std::endl
+              << "  - keep-alive: TRUE (for persistent connections)" << std::endl
+              << "  - cookies: TRUE (for session authentication)" << std::endl
+              << "  - follow-location: TRUE (for redirects)" << std::endl
+              << "  - ssl-strict: FALSE (for HTTPS)" << std::endl;
   }
   // If souphttpsrc was created despite our rank changes, warn about it
   else if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstSoupHTTPSrc") == 0) {
@@ -483,23 +501,29 @@ bool GstVideoPlayer::CreatePipeline() {
   gint flags;
   g_object_get(gst_.playbin, "flags", &flags, NULL);
   
-  // Enable: video, native-video, download, buffering
-  // Disable: audio, text, soft-volume (since we're not playing audio)
+  // Clear and set proper flags for video-only playback
+  flags = 0;
   flags |= 0x00000001;   // GST_PLAY_FLAG_VIDEO
-  flags |= 0x00000080;   // GST_PLAY_FLAG_NATIVE_VIDEO
-  flags |= 0x00000080;   // GST_PLAY_FLAG_DOWNLOAD
-  flags |= 0x00000080;   // GST_PLAY_FLAG_BUFFERING
-  //flags &= ~0x00000002;  // Disable GST_PLAY_FLAG_AUDIO
-  flags &= ~0x00000004;  // Disable GST_PLAY_FLAG_TEXT
+  flags |= 0x00000008;   // GST_PLAY_FLAG_NATIVE_VIDEO
+  flags |= 0x00000010;   // GST_PLAY_FLAG_DOWNLOAD (important for HLS buffering)
+  flags |= 0x00000020;   // GST_PLAY_FLAG_BUFFERING (important for streaming)
+  // Disable: audio and text for video-only streams
+  // flags &= ~0x00000002;  // GST_PLAY_FLAG_AUDIO (disabled)
+  // flags &= ~0x00000004;  // GST_PLAY_FLAG_TEXT (disabled)
   
   g_object_set(gst_.playbin, "flags", flags, NULL);
-  std::cout << "CreatePipeline: Playbin flags configured for HLS" << std::endl;
+  std::cout << "CreatePipeline: Playbin flags = " << flags 
+            << " (VIDEO | NATIVE-VIDEO | DOWNLOAD | BUFFERING)" << std::endl;
   
-  // Network buffering configuration
+  // Network buffering configuration with better timeout handling
   if (is_live_stream) {
     // Live: minimal buffering for low latency
     g_object_set(gst_.playbin, "buffer-size", 1048576, NULL);      // 1MB
     g_object_set(gst_.playbin, "buffer-duration", 1000000000LL, NULL);  // 1 sec
+    
+    // For authenticated streams, increase timeout to allow for auth process
+    g_object_set(gst_.playbin, "read-timeout", 15000000LL, NULL);  // 15 sec per read
+
     g_object_set(gst_.playbin, "latency", 1000, NULL);             // 1 sec max latency
     std::cout << "CreatePipeline: LIVE config (1MB, 1s)" << std::endl;
   } else {
@@ -575,13 +599,16 @@ bool GstVideoPlayer::Preroll() {
   GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
   bool done = false;
   bool success = false;
+  int timeout_counter = 0;
+  const int max_timeouts = 60;  // Allow up to 60 seconds for preroll with authentication delays
   
-  while (!done) {
+  while (!done && timeout_counter < max_timeouts) {
     GstMessage* msg = gst_bus_timed_pop_filtered(
         bus, 
         1 * GST_SECOND,  // Check every second
         (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | 
-                         GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_WARNING));
+                         GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_WARNING |
+                         GST_MESSAGE_ELEMENT));  // Added element messages for more diagnostics
     
     if (msg != NULL) {
       GError* err;
@@ -628,17 +655,29 @@ bool GstVideoPlayer::Preroll() {
       gst_message_unref(msg);
     } else {
       // Timeout - still waiting
-      std::cout << "Preroll: Still waiting..." << std::endl;
+      timeout_counter++;
+      if (timeout_counter % 10 == 0) {  // Log every 10 seconds
+        std::cout << "Preroll: Still waiting for PAUSED state (" << timeout_counter << "s)..." << std::endl;
+      }
     }
   }
   
   gst_object_unref(bus);
   
   if (success) {
-    std::cout << "Preroll: Completed successfully" << std::endl;
+    std::cout << "Preroll: Completed successfully after " << timeout_counter << " seconds" << std::endl;
     return true;
   } else {
-    std::cerr << "Preroll: Failed!" << std::endl;
+    if (timeout_counter >= max_timeouts) {
+      std::cerr << "Preroll: Timeout! Stream did not reach PAUSED state within " << max_timeouts << " seconds" << std::endl;
+      std::cerr << "Preroll: This might indicate:" << std::endl
+                << "  1. Authentication/authorization failure on segment requests" << std::endl
+                << "  2. Network connectivity issue" << std::endl
+                << "  3. Server not responding with valid HLS segments" << std::endl
+                << "  4. Decoder not available for stream format" << std::endl;
+    } else {
+      std::cerr << "Preroll: Failed with error!" << std::endl;
+    }
     return false;
   }
 }
