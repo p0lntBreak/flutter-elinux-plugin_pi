@@ -289,35 +289,25 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointe
                  "keep-alive", TRUE,  // CRITICAL for segment reuse
                  NULL);
     
-    // Apply authentication headers if present
-    // These must be applied to EVERY segment request
-    if (!self->auth_headers_.cookie.empty()) {
-      std::cout << "SourceSetupCallback: Applying auth headers to segment request" << std::endl;
+    // Apply ALL authentication headers if present
+    if (!self->auth_headers_.all_headers.empty()) {
+      std::cout << "SourceSetupCallback: Applying " << self->auth_headers_.all_headers.size() 
+                << " headers to HTTP request" << std::endl;
       
-      // Build extra-headers structure
+      // Build extra-headers structure with ALL headers
       GstStructure* headers = gst_structure_new_empty("extra-headers");
       
-      if (!self->auth_headers_.cookie.empty()) {
-        gst_structure_set(headers, "Cookie", G_TYPE_STRING, 
-                         self->auth_headers_.cookie.c_str(), NULL);
-      }
-      if (!self->auth_headers_.auth_token.empty()) {
-        gst_structure_set(headers, "Authorization", G_TYPE_STRING, 
-                         self->auth_headers_.auth_token.c_str(), NULL);
-      }
-      if (!self->auth_headers_.user_agent.empty()) {
-        gst_structure_set(headers, "User-Agent", G_TYPE_STRING, 
-                         self->auth_headers_.user_agent.c_str(), NULL);
-      }
-      if (!self->auth_headers_.referer.empty()) {
-        gst_structure_set(headers, "Referer", G_TYPE_STRING, 
-                         self->auth_headers_.referer.c_str(), NULL);
+      for (const auto& [key, value] : self->auth_headers_.all_headers) {
+        gst_structure_set(headers, key.c_str(), G_TYPE_STRING, value.c_str(), NULL);
+        std::cout << "  - Applied: " << key << " = " << value << std::endl;
       }
       
       g_object_set(source, "extra-headers", headers, NULL);
       gst_structure_free(headers);
       
-      std::cout << "SourceSetupCallback: Auth headers applied successfully" << std::endl;
+      std::cout << "SourceSetupCallback: All headers applied successfully" << std::endl;
+    } else {
+      std::cout << "SourceSetupCallback: No auth headers to apply" << std::endl;
     }
   }
   // Fallback warning
@@ -328,16 +318,14 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointe
 
 
 // Add method to set authentication headers BEFORE creating pipeline
-void GstVideoPlayer::SetAuthHeaders(const std::string& cookie,
-                                    const std::string& auth_token,
-                                    const std::string& user_agent,
-                                    const std::string& referer) {
-  auth_headers_.cookie = cookie;
-  auth_headers_.auth_token = auth_token;
-  auth_headers_.user_agent = user_agent;
-  auth_headers_.referer = referer;
+void GstVideoPlayer::SetAuthHeaders(const std::map<std::string, std::string>& headers) {
+  auth_headers_.all_headers = headers;
   
-  std::cout << "SetAuthHeaders: Stored authentication headers" << std::endl;
+  std::cout << "SetAuthHeaders: Stored " << headers.size() << " authentication headers:" << std::endl;
+  for (const auto& [key, value] : headers) {
+    std::cout << "  - " << key << ": " << value << std::endl;
+  }
+}
 }
 
 bool GstVideoPlayer::CreatePipeline() {
