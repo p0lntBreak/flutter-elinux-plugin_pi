@@ -380,43 +380,55 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         [texture_id, host = this](bool is_playing) {
           host->SendIsPlayingStateUpdate(texture_id, is_playing);
         });
+
+      
     instance->player =
         std::make_unique<GstVideoPlayer>(uri, std::move(player_handler));
 
-    // Extract and set authentication headers from httpHeaders field
-    // The Flutter video_player package sends headers in the CreateMessage
+    //Extract and apply HTTP headers dynamically
     const auto& http_headers = meta.GetHttpHeaders();
     if (!http_headers.empty()) {
+      std::cout << "Received " << http_headers.size() << " HTTP headers from Flutter" << std::endl;
+      
       std::string cookie;
       std::string auth_token;
       std::string user_agent;
       std::string referer;
       
-      // Extract headers from the map
+      // Extract specific headers we care about
       for (const auto& [key, value] : http_headers) {
-        std::string header_name = std::get<std::string>(key);
-        std::string header_value = std::get<std::string>(value);
+        std::cout << "  Header: " << key << " = " << value << std::endl;
         
-        std::cout << "HTTP Header: " << header_name << " = " << header_value << std::endl;
+        // Case-insensitive header matching
+        std::string lower_key = key;
+        std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
         
-        if (header_name == "Cookie" || header_name == "cookie") {
-          cookie = header_value;
-        } else if (header_name == "Authorization" || header_name == "authorization") {
-          auth_token = header_value;
-        } else if (header_name == "User-Agent" || header_name == "user-agent") {
-          user_agent = header_value;
-        } else if (header_name == "Referer" || header_name == "referer") {
-          referer = header_value;
+        if (lower_key == "cookie") {
+          cookie = value;
+        } else if (lower_key == "authorization") {
+          auth_token = value;
+        } else if (lower_key == "user-agent") {
+          user_agent = value;
+        } else if (lower_key == "referer") {
+          referer = value;
         }
       }
       
-      // Set the headers on the player BEFORE Init()
+      // Apply headers to the player
       if (!cookie.empty() || !auth_token.empty() || 
           !user_agent.empty() || !referer.empty()) {
-        std::cout << "Setting authentication headers on player" << std::endl;
+        std::cout << "Setting authentication headers on player:" << std::endl;
+        if (!cookie.empty()) std::cout << "  - Cookie" << std::endl;
+        if (!auth_token.empty()) std::cout << "  - Authorization" << std::endl;
+        if (!user_agent.empty()) std::cout << "  - User-Agent" << std::endl;
+        if (!referer.empty()) std::cout << "  - Referer" << std::endl;
+        
         instance->player->SetAuthHeaders(cookie, auth_token, user_agent, referer);
       }
+    } else {
+      std::cout << "No HTTP headers provided from Flutter" << std::endl;
     }
+    
       
     players_[texture_id] = std::move(instance);
   }
