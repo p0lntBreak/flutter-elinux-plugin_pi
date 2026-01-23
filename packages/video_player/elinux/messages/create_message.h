@@ -7,6 +7,7 @@
 
 #include <flutter/binary_messenger.h>
 #include <flutter/encodable_value.h>
+#include <map>
 
 class CreateMessage {
  public:
@@ -37,8 +38,16 @@ class CreateMessage {
 
   std::string GetFormatHint() const { return format_hint_; }
 
+  // ADD: HTTP Headers support
+  void SetHttpHeaders(const std::map<std::string, std::string>& headers) {
+    http_headers_ = headers;
+  }
+
+  std::map<std::string, std::string> GetHttpHeaders() const {
+    return http_headers_;
+  }
+
   flutter::EncodableValue ToMap() {
-    // todo: Add httpHeaders.
     flutter::EncodableMap map = {
         {flutter::EncodableValue("asset"), flutter::EncodableValue(asset_)},
         {flutter::EncodableValue("uri"), flutter::EncodableValue(uri_)},
@@ -46,6 +55,16 @@ class CreateMessage {
          flutter::EncodableValue(package_name_)},
         {flutter::EncodableValue("formatHint"),
          flutter::EncodableValue(format_hint_)}};
+    
+    // ADD: Include httpHeaders in the map
+    if (!http_headers_.empty()) {
+      flutter::EncodableMap headers_map;
+      for (const auto& [key, value] : http_headers_) {
+        headers_map[flutter::EncodableValue(key)] = flutter::EncodableValue(value);
+      }
+      map[flutter::EncodableValue("httpHeaders")] = flutter::EncodableValue(headers_map);
+    }
+    
     return flutter::EncodableValue(map);
   }
 
@@ -75,6 +94,25 @@ class CreateMessage {
       if (std::holds_alternative<std::string>(formatHint)) {
         message.SetFormatHint(std::get<std::string>(formatHint));
       }
+
+      // ADD: Parse httpHeaders from the map
+      auto headers_it = map.find(flutter::EncodableValue("httpHeaders"));
+      if (headers_it != map.end() && 
+          std::holds_alternative<flutter::EncodableMap>(headers_it->second)) {
+        auto headers_map = std::get<flutter::EncodableMap>(headers_it->second);
+        std::map<std::string, std::string> headers;
+        
+        for (const auto& [key, value] : headers_map) {
+          if (std::holds_alternative<std::string>(key) && 
+              std::holds_alternative<std::string>(value)) {
+            headers[std::get<std::string>(key)] = std::get<std::string>(value);
+          }
+        }
+        
+        if (!headers.empty()) {
+          message.SetHttpHeaders(headers);
+        }
+      }
     }
 
     return message;
@@ -85,6 +123,7 @@ class CreateMessage {
   std::string uri_;
   std::string package_name_;
   std::string format_hint_;
+  std::map<std::string, std::string> http_headers_;  // ADD THIS
 };
 
-#endif  // PACKAGES_VIDEO_PLAYER_VIDEO_PLAYER_ELINUX_MESSAGES_CREATE_MESSAGE_H_
+#endif 
