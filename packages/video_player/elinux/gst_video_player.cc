@@ -326,7 +326,6 @@ void GstVideoPlayer::SetAuthHeaders(const std::map<std::string, std::string>& he
     std::cout << "  - " << key << ": " << value << std::endl;
   }
 }
-}
 
 bool GstVideoPlayer::CreatePipeline() {
   std::cout << "CreatePipeline: Starting..." << std::endl;
