@@ -300,6 +300,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   }
 
   auto instance = std::make_unique<FlutterVideoPlayer>();
+  
+    
 #ifdef USE_EGL_IMAGE_DMABUF
   instance->egl_image = std::make_unique<FlutterDesktopEGLImage>();
   instance->texture =
@@ -380,6 +382,42 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         });
     instance->player =
         std::make_unique<GstVideoPlayer>(uri, std::move(player_handler));
+
+    // Extract and set authentication headers from httpHeaders field
+    // The Flutter video_player package sends headers in the CreateMessage
+    const auto& http_headers = meta.GetHttpHeaders();
+    if (!http_headers.empty()) {
+      std::string cookie;
+      std::string auth_token;
+      std::string user_agent;
+      std::string referer;
+      
+      // Extract headers from the map
+      for (const auto& [key, value] : http_headers) {
+        std::string header_name = std::get<std::string>(key);
+        std::string header_value = std::get<std::string>(value);
+        
+        std::cout << "HTTP Header: " << header_name << " = " << header_value << std::endl;
+        
+        if (header_name == "Cookie" || header_name == "cookie") {
+          cookie = header_value;
+        } else if (header_name == "Authorization" || header_name == "authorization") {
+          auth_token = header_value;
+        } else if (header_name == "User-Agent" || header_name == "user-agent") {
+          user_agent = header_value;
+        } else if (header_name == "Referer" || header_name == "referer") {
+          referer = header_value;
+        }
+      }
+      
+      // Set the headers on the player BEFORE Init()
+      if (!cookie.empty() || !auth_token.empty() || 
+          !user_agent.empty() || !referer.empty()) {
+        std::cout << "Setting authentication headers on player" << std::endl;
+        instance->player->SetAuthHeaders(cookie, auth_token, user_agent, referer);
+      }
+    }
+      
     players_[texture_id] = std::move(instance);
   }
 
