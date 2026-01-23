@@ -21,14 +21,6 @@
 
 #include "video_player_stream_handler.h"
 
-// ADD THIS STRUCT DEFINITION HERE (before the class)
-struct AuthHeaders {
-  std::string cookie;
-  std::string auth_token;
-  std::string user_agent;
-  std::string referer;
-};
-
 class GstVideoPlayer {
  public:
   GstVideoPlayer(const std::string& uri,
@@ -60,6 +52,8 @@ class GstVideoPlayer {
                      const std::string& auth_token,
                      const std::string& user_agent,
                      const std::string& referer);
+
+AuthHeaders auth_headers_;
 
  private:
   struct GstVideoElements {
@@ -100,7 +94,7 @@ class GstVideoPlayer {
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;
   
   // ADD THIS MEMBER VARIABLE
-  AuthHeaders auth_headers_;
+  //AuthHeaders auth_headers_;
 
 #ifdef USE_EGL_IMAGE_DMABUF
   GstVideoInfo gst_video_info_;
