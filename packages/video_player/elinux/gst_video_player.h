@@ -19,6 +19,13 @@
 #include <shared_mutex>
 #include <string>
 
+struct AuthHeaders {
+  std::string cookie;
+  std::string auth_token;
+  std::string user_agent;
+  std::string referer;
+};
+
 #include "video_player_stream_handler.h"
 
 class GstVideoPlayer {
