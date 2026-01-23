@@ -270,29 +270,84 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // fakesink"
 //UPDATE:
 
+// Modified SourceSetupCallback - this gets called for EVERY source element
 static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  
   std::cout << "SourceSetupCallback: Source element created: " 
             << GST_ELEMENT_NAME(source) << " (type: " 
             << G_OBJECT_TYPE_NAME(source) << ")" << std::endl;
   
-  // Configure curlhttpsrc if that's what was created
+  // Configure curlhttpsrc for BOTH manifest and segment requests
   if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstCurlHttpSrc") == 0) {
-    std::cout << "SourceSetupCallback: Configuring curlhttpsrc" << std::endl;
-    g_object_set(source, "timeout", 30, NULL);
-    g_object_set(source, "compress", TRUE, NULL);
-    g_object_set(source, "keep-alive", TRUE, NULL);
+    std::cout << "SourceSetupCallback: Configuring curlhttpsrc for segment/manifest fetch" << std::endl;
+    
+    // Connection settings
+    g_object_set(source, 
+                 "timeout", 30, 
+                 "compress", TRUE, 
+                 "keep-alive", TRUE,  // CRITICAL for segment reuse
+                 NULL);
+    
+    // Apply authentication headers if present
+    // These must be applied to EVERY segment request
+    if (!self->auth_headers_.cookie.empty()) {
+      std::cout << "SourceSetupCallback: Applying auth headers to segment request" << std::endl;
+      
+      // Build extra-headers structure
+      GstStructure* headers = gst_structure_new_empty("extra-headers");
+      
+      if (!self->auth_headers_.cookie.empty()) {
+        gst_structure_set(headers, "Cookie", G_TYPE_STRING, 
+                         self->auth_headers_.cookie.c_str(), NULL);
+      }
+      if (!self->auth_headers_.auth_token.empty()) {
+        gst_structure_set(headers, "Authorization", G_TYPE_STRING, 
+                         self->auth_headers_.auth_token.c_str(), NULL);
+      }
+      if (!self->auth_headers_.user_agent.empty()) {
+        gst_structure_set(headers, "User-Agent", G_TYPE_STRING, 
+                         self->auth_headers_.user_agent.c_str(), NULL);
+      }
+      if (!self->auth_headers_.referer.empty()) {
+        gst_structure_set(headers, "Referer", G_TYPE_STRING, 
+                         self->auth_headers_.referer.c_str(), NULL);
+      }
+      
+      g_object_set(source, "extra-headers", headers, NULL);
+      gst_structure_free(headers);
+      
+      std::cout << "SourceSetupCallback: Auth headers applied successfully" << std::endl;
+    }
   }
-  // If souphttpsrc was created despite our rank changes, warn about it
+  // Fallback warning
   else if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstSoupHTTPSrc") == 0) {
-    std::cerr << "SourceSetupCallback: WARNING - souphttpsrc was selected!" << std::endl;
-    g_object_set(source, "timeout", 30, NULL);
-    g_object_set(source, "compress", TRUE, NULL);
+    std::cerr << "SourceSetupCallback: WARNING - souphttpsrc was selected despite rank changes!" << std::endl;
   }
+}
+
+
+// Add method to set authentication headers BEFORE creating pipeline
+void GstVideoPlayer::SetAuthHeaders(const std::string& cookie,
+                                    const std::string& auth_token,
+                                    const std::string& user_agent,
+                                    const std::string& referer) {
+  auth_headers_.cookie = cookie;
+  auth_headers_.auth_token = auth_token;
+  auth_headers_.user_agent = user_agent;
+  auth_headers_.referer = referer;
+  
+  std::cout << "SetAuthHeaders: Stored authentication headers" << std::endl;
 }
 
 bool GstVideoPlayer::CreatePipeline() {
   std::cout << "CreatePipeline: Starting..." << std::endl;
   std::cout << "CreatePipeline: URI = " << uri_ << std::endl;  
+  
+  // Extract and store auth headers from URI if present
+  // Format: https://domain/path?cookie=xxx&token=yyy
+  // Or you should store these separately when creating the player
+  // For now, assuming they're passed separately
   
   GstRegistry* registry = gst_registry_get();
   
@@ -314,51 +369,20 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cout << "CreatePipeline: souphttpsrc rank set to NONE" << std::endl;
   }
   
-  // CRITICAL: Force hardware video decoders to MAX rank
+  // Hardware decoder ranks (unchanged)
   GstPluginFeature* v4l2_h264 = gst_registry_lookup_feature(registry, "v4l2h264dec");
-  GstPluginFeature* v4l2_h265 = gst_registry_lookup_feature(registry, "v4l2h265dec");
-  GstPluginFeature* avdec_h264 = gst_registry_lookup_feature(registry, "avdec_h264");
-  GstPluginFeature* avdec_h265 = gst_registry_lookup_feature(registry, "avdec_h265");
-  
   if (v4l2_h264) {
     gst_plugin_feature_set_rank(v4l2_h264, GST_RANK_PRIMARY + 300);
     gst_object_unref(v4l2_h264);
     std::cout << "CreatePipeline: v4l2h264dec rank boosted to PRIMARY+300" << std::endl;
   }
   
-  if (v4l2_h265) {
-    gst_plugin_feature_set_rank(v4l2_h265, GST_RANK_PRIMARY + 300);
-    gst_object_unref(v4l2_h265);
-    std::cout << "CreatePipeline: v4l2h265dec rank boosted to PRIMARY+300" << std::endl;
-  }
-  
-  // Demote software decoders completely
-  if (avdec_h264) {
-    gst_plugin_feature_set_rank(avdec_h264, GST_RANK_NONE);
-    gst_object_unref(avdec_h264);
-    std::cout << "CreatePipeline: avdec_h264 rank set to NONE" << std::endl;
-  }
-  
-  if (avdec_h265) {
-    gst_plugin_feature_set_rank(avdec_h265, GST_RANK_NONE);
-    gst_object_unref(avdec_h265);
-    std::cout << "CreatePipeline: avdec_h265 rank set to NONE" << std::endl;
-  }
-  
-  // Boost hlsdemux rank for HLS streams
+  // Boost hlsdemux - CRITICAL for live streams
   GstPluginFeature* hls_feature = gst_registry_lookup_feature(registry, "hlsdemux");
   if (hls_feature) {
     gst_plugin_feature_set_rank(hls_feature, GST_RANK_PRIMARY + 300);
     gst_object_unref(hls_feature);
     std::cout << "CreatePipeline: hlsdemux rank boosted to PRIMARY+300" << std::endl;
-  }
-  
-  // Boost parsebin (it's actually a typefind element type)
-  GstPluginFeature* parsebin_feature = gst_registry_lookup_feature(registry, "parsebin");
-  if (parsebin_feature) {
-    gst_plugin_feature_set_rank(parsebin_feature, GST_RANK_PRIMARY + 300);
-    gst_object_unref(parsebin_feature);
-    std::cout << "CreatePipeline: parsebin rank boosted" << std::endl;
   }
 
   gst_.pipeline = gst_pipeline_new("pipeline");
@@ -373,15 +397,13 @@ bool GstVideoPlayer::CreatePipeline() {
     return false;
   }
   
-  // Connect to source-setup signal
+  // CRITICAL: Connect source-setup to apply headers to ALL segment requests
   g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
   std::cout << "CreatePipeline: Connected source-setup signal" << std::endl;
   
-  // Try hardware color conversion first
+  // Video conversion (unchanged)
   gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
-  if (gst_.video_convert) {
-    std::cout << "CreatePipeline: Using v4l2convert (hardware)" << std::endl;
-  } else {
+  if (!gst_.video_convert) {
     std::cout << "CreatePipeline: Fallback to videoconvert (software)" << std::endl;
     gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
   }
@@ -397,7 +419,7 @@ bool GstVideoPlayer::CreatePipeline() {
     return false;
   }
   
-  // Create queue with settings matching your working CLI command
+  // Create queue
   GstElement* video_queue = gst_element_factory_make("queue", "vqueue");
   if (!video_queue) {
     std::cerr << "Failed to create video queue" << std::endl;
@@ -407,24 +429,23 @@ bool GstVideoPlayer::CreatePipeline() {
   // Detect stream type
   bool is_live_stream = (uri_.find("/live/") != std::string::npos) || 
                         (uri_.find("live.") != std::string::npos) ||
-                        (uri_.find("livestream") != std::string::npos) ||
-                        (uri_.find("cnngo") != std::string::npos);
+                        (uri_.find("livestream") != std::string::npos);
   
-  // Queue settings matching working CLI: max-size-buffers=3
+  // Queue settings - minimal for live streams
   if (is_live_stream) {
-    std::cout << "CreatePipeline: LIVE stream - minimal buffering, low latency" << std::endl;
+    std::cout << "CreatePipeline: LIVE stream - minimal buffering" << std::endl;
     g_object_set(video_queue, 
-                 "max-size-buffers", 3,        // Match CLI
-                 "max-size-time", (guint64)0,  // Match CLI
-                 "max-size-bytes", 0,          // Match CLI
-                 "leaky", 2,                   // Drop old buffers
+                 "max-size-buffers", 3,
+                 "max-size-time", (guint64)0,
+                 "max-size-bytes", 0,
+                 "leaky", 2,  // Drop old buffers on overflow
                  NULL);
   } else {
     std::cout << "CreatePipeline: VOD stream - balanced buffering" << std::endl;
     g_object_set(video_queue, 
-                 "max-size-buffers", 3,        // Match CLI
-                 "max-size-time", (guint64)0,  // Match CLI
-                 "max-size-bytes", 0,          // Match CLI
+                 "max-size-buffers", 3,
+                 "max-size-time", (guint64)0,
+                 "max-size-bytes", 0,
                  NULL);
   }
   
@@ -441,25 +462,37 @@ bool GstVideoPlayer::CreatePipeline() {
   }
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
-  // Configure fakesink
-  // Enable sync to respect video frame rate and prevent sped-up playback
-  // Sync will throttle frame delivery based on timestamps even with fakesink
-  g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
+  // Configure fakesink - CRITICAL for live streams
+  if (is_live_stream) {
+    // For live streams: disable sync to prevent blocking on clock
+    g_object_set(G_OBJECT(gst_.video_sink), 
+                 "sync", FALSE,      // Don't wait for clock - critical for live!
+                 "qos", FALSE,       // No quality-of-service
+                 "async", FALSE,     // Don't wait for preroll
+                 NULL);
+    std::cout << "CreatePipeline: Fakesink configured for LIVE (sync=FALSE)" << std::endl;
+  } else {
+    // For VOD: enable sync for proper playback speed
+    g_object_set(G_OBJECT(gst_.video_sink), 
+                 "sync", TRUE, 
+                 "qos", FALSE, 
+                 NULL);
+    std::cout << "CreatePipeline: Fakesink configured for VOD (sync=TRUE)" << std::endl;
+  }
+  
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
   
-  // Build output bin: queue -> convert -> sink
+  // Build output bin
   gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert, 
                    gst_.video_sink, NULL);
 
-  // Link queue to converter
   if (!gst_element_link(video_queue, gst_.video_convert)) {
     std::cerr << "Failed to link queue to videoconvert" << std::endl;
     return false;
   }
 
-  // Link converter to sink with RGBA caps
   auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
   auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
   gst_caps_unref(caps);
@@ -468,7 +501,6 @@ bool GstVideoPlayer::CreatePipeline() {
     return false;
   }
 
-  // Create ghost pad from queue input
   auto* sinkpad = gst_element_get_static_pad(video_queue, "sink");
   auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
   gst_pad_set_active(ghost_sinkpad, TRUE);
@@ -479,80 +511,90 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
-  // Critical playbin flags for HLS
+  // CRITICAL: Correct playbin flags for LIVE HLS
   gint flags;
   g_object_get(gst_.playbin, "flags", &flags, NULL);
   
-  // Enable: video, native-video, download, buffering
-  // Disable: audio, text, soft-volume (since we're not playing audio)
-  flags |= 0x00000001;   // GST_PLAY_FLAG_VIDEO
-  flags |= 0x00000080;   // GST_PLAY_FLAG_NATIVE_VIDEO
-  flags |= 0x00000080;   // GST_PLAY_FLAG_DOWNLOAD
-  flags |= 0x00000080;   // GST_PLAY_FLAG_BUFFERING
-  //flags &= ~0x00000002;  // Disable GST_PLAY_FLAG_AUDIO
-  flags &= ~0x00000004;  // Disable GST_PLAY_FLAG_TEXT
+  // Correct flag values (from gstplay-enum.h)
+  const gint GST_PLAY_FLAG_VIDEO           = 0x00000001;
+  const gint GST_PLAY_FLAG_AUDIO           = 0x00000002;
+  const gint GST_PLAY_FLAG_TEXT            = 0x00000004;
+  const gint GST_PLAY_FLAG_NATIVE_VIDEO    = 0x00000800;
+  const gint GST_PLAY_FLAG_BUFFERING       = 0x00000080;
+  
+  // Enable flags for live streaming
+  flags |= GST_PLAY_FLAG_VIDEO;
+  flags |= GST_PLAY_FLAG_AUDIO;
+  flags |= GST_PLAY_FLAG_NATIVE_VIDEO;
+  
+  if (is_live_stream) {
+    // For LIVE: Enable buffering but don't download
+    flags |= GST_PLAY_FLAG_BUFFERING;
+    std::cout << "CreatePipeline: Enabled BUFFERING flag for live stream" << std::endl;
+  } else {
+    // For VOD: Can enable download
+    const gint GST_PLAY_FLAG_DOWNLOAD = 0x00000080;
+    flags |= GST_PLAY_FLAG_DOWNLOAD;
+  }
+  
+  flags &= ~GST_PLAY_FLAG_TEXT;  // Disable subtitles
   
   g_object_set(gst_.playbin, "flags", flags, NULL);
-  std::cout << "CreatePipeline: Playbin flags configured for HLS" << std::endl;
+  std::cout << "CreatePipeline: Playbin flags configured (0x" << std::hex << flags << std::dec << ")" << std::endl;
   
-  // Network buffering configuration
+  // Network buffering - CRITICAL for live streams
   if (is_live_stream) {
-    // Live: minimal buffering for low latency
-    g_object_set(gst_.playbin, "buffer-size", 1048576, NULL);      // 1MB
-    g_object_set(gst_.playbin, "buffer-duration", 1000000000LL, NULL);  // 1 sec
-    g_object_set(gst_.playbin, "latency", 1000, NULL);             // 1 sec max latency
-    std::cout << "CreatePipeline: LIVE config (1MB, 1s)" << std::endl;
+    // Live: Minimal buffering for low latency
+    g_object_set(gst_.playbin, 
+                 "buffer-size", 1048576,              // 1MB
+                 "buffer-duration", 2000000000LL,     // 2 seconds (increased from 1s)
+                 "ring-buffer-max-size", 5242880,     // 5MB max
+                 NULL);
+    std::cout << "CreatePipeline: LIVE buffer config (1MB, 2s, 5MB max)" << std::endl;
   } else {
-    // VOD: larger buffer to prevent stalls
-    g_object_set(gst_.playbin, "buffer-size", 5242880, NULL);      // 5MB
-    g_object_set(gst_.playbin, "buffer-duration", 5000000000LL, NULL);  // 5 sec
-    std::cout << "CreatePipeline: VOD config (5MB, 5s)" << std::endl;
+    // VOD: Larger buffer
+    g_object_set(gst_.playbin, 
+                 "buffer-size", 5242880,              // 5MB
+                 "buffer-duration", 5000000000LL,     // 5 sec
+                 NULL);
+    std::cout << "CreatePipeline: VOD buffer config (5MB, 5s)" << std::endl;
   }
   
   // Connection speed for adaptive streaming
   g_object_set(gst_.playbin, "connection-speed", 5000, NULL);  // 5 Mbps
   
-  /*Configure audio sink (silent)
-  GstElement* audio_sink = gst_element_factory_make("fakesink", "audiosink");
-  if (audio_sink) {
-    g_object_set(audio_sink, "sync", FALSE, NULL);
-    g_object_set(gst_.playbin, "audio-sink", audio_sink, NULL);
-    std::cout << "CreatePipeline: Audio sink configured (silent)" << std::endl;
-  }*/
+  // Audio configuration
+  GstElement* audio_bin = gst_bin_new("audio_bin");
+  GstElement* conv = gst_element_factory_make("audioconvert", "audio_convert");
+  GstElement* sink = gst_element_factory_make("alsasink", "audio_alsa");
 
-
-// audio_bin: [sink pad] -> audioconvert -> alsasink
-GstElement* audio_bin = gst_bin_new("audio_bin");
-GstElement* conv = gst_element_factory_make("audioconvert", "audio_convert");
-GstElement* sink = gst_element_factory_make("alsasink", "audio_alsa");
-
-if (!audio_bin || !conv || !sink) {
-  std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
-} else {
-  g_object_set(sink, "device", "plughw:0,0", NULL);  // matches your working test
-
-  gst_bin_add_many(GST_BIN(audio_bin), conv, sink, NULL);
-  if (!gst_element_link(conv, sink)) {
-    std::cerr << "CreatePipeline: Failed to link audioconvert -> alsasink" << std::endl;
+  if (!audio_bin || !conv || !sink) {
+    std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
   } else {
-    // Create ghost sink pad on the bin
-    GstPad* sinkpad = gst_element_get_static_pad(conv, "sink");
-    GstPad* ghost = gst_ghost_pad_new("sink", sinkpad);
-    gst_pad_set_active(ghost, TRUE);
-    gst_element_add_pad(audio_bin, ghost);
-    gst_object_unref(sinkpad);
+    g_object_set(sink, "device", "plughw:0,0", NULL);
 
-    g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-    std::cout << "CreatePipeline: Audio sink configured (audioconvert ! alsasink device=plughw:0,0)" << std::endl;
+    gst_bin_add_many(GST_BIN(audio_bin), conv, sink, NULL);
+    if (!gst_element_link(conv, sink)) {
+      std::cerr << "CreatePipeline: Failed to link audioconvert -> alsasink" << std::endl;
+    } else {
+      GstPad* sinkpad = gst_element_get_static_pad(conv, "sink");
+      GstPad* ghost = gst_ghost_pad_new("sink", sinkpad);
+      gst_pad_set_active(ghost, TRUE);
+      gst_element_add_pad(audio_bin, ghost);
+      gst_object_unref(sinkpad);
+
+      g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
+      std::cout << "CreatePipeline: Audio sink configured (alsasink)" << std::endl;
+    }
   }
-}
 
-  std::cout << "CreatePipeline: SUCCESS - Hardware accelerated pipeline ready" << std::endl;
+  std::cout << "CreatePipeline: SUCCESS - Pipeline ready for live HLS" << std::endl;
 
   gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
+
 
 
 bool GstVideoPlayer::Preroll() {
@@ -783,6 +825,20 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       std::lock_guard<std::mutex> lock(self->mutex_event_completed_);
       self->is_completed_ = true;
+      break;
+    }
+    case GST_MESSAGE_BUFFERING: {
+      gint percent;
+      gst_message_parse_buffering(message, &percent);
+      std::cout << "BUFFERING: " << percent << "% from " 
+                << GST_MESSAGE_SRC_NAME(message) << std::endl;
+      break;
+    }
+    case GST_MESSAGE_ELEMENT: {
+      const GstStructure *s = gst_message_get_structure(message);
+      const gchar *name = gst_structure_get_name(s);
+      std::cout << "ELEMENT MESSAGE: " << name << " from " 
+                << GST_MESSAGE_SRC_NAME(message) << std::endl;
       break;
     }
     case GST_MESSAGE_WARNING: {
