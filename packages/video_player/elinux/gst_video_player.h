@@ -20,10 +20,7 @@
 #include <string>
 
 struct AuthHeaders {
-  std::string cookie;
-  std::string auth_token;
-  std::string user_agent;
-  std::string referer;
+  std::map<std::string, std::string> all_headers;  // Store ALL headers as a map
 };
 
 #include "video_player_stream_handler.h"
@@ -55,12 +52,9 @@ class GstVideoPlayer {
   int32_t GetHeight() const { return height_; };
   
   // ADD THIS METHOD DECLARATION
-  void SetAuthHeaders(const std::string& cookie,
-                     const std::string& auth_token,
-                     const std::string& user_agent,
-                     const std::string& referer);
+  void SetAuthHeaders(const std::map<std::string, std::string>& headers);
 
-AuthHeaders auth_headers_;
+ AuthHeaders auth_headers_;
 
  private:
   struct GstVideoElements {
