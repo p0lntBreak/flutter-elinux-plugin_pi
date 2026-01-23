@@ -18,6 +18,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <map>
 
 struct AuthHeaders {
   std::map<std::string, std::string> all_headers;  // Store ALL headers as a map
