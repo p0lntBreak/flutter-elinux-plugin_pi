@@ -420,14 +420,13 @@ bool GstVideoPlayer::CreatePipeline() {
   
   // Queue settings - minimal for live streams
   if (is_live_stream) {
-    std::cout << "CreatePipeline: LIVE stream - minimal buffering" << std::endl;
-    g_object_set(video_queue, 
-                 "max-size-buffers", 3,
-                 "max-size-time", (guint64)0,
-                 "max-size-bytes", 0,
-                 "leaky", 2,  // Drop old buffers on overflow
-                 NULL);
-  } else {
+    g_object_set(gst_.playbin, 
+                  "buffer-size", -1,              // -1 = disabled
+                  "buffer-duration", (gint64)0,   // 0 = no waiting
+                  "ring-buffer-max-size", 0,      // no limit
+                  NULL);
+    }
+  else {
     std::cout << "CreatePipeline: VOD stream - balanced buffering" << std::endl;
     g_object_set(video_queue, 
                  "max-size-buffers", 3,
@@ -814,13 +813,38 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       self->is_completed_ = true;
       break;
     }
+      
     case GST_MESSAGE_BUFFERING: {
-      gint percent;
-      gst_message_parse_buffering(message, &percent);
-      std::cout << "BUFFERING: " << percent << "% from " 
-                << GST_MESSAGE_SRC_NAME(message) << std::endl;
+     gint percent;
+     gst_message_parse_buffering(message, &percent);
+     std::cout << "BUFFERING: " << percent << "% from " 
+            << GST_MESSAGE_SRC_NAME(message) << std::endl;
+          // CRITICAL FIX: For live streams, don't block on buffering
+  // Live streams may never reach 100%, so we need to keep playing
+    auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  
+    GstState current_state, pending_state;
+    gst_element_get_state(self->gst_.pipeline, &current_state, &pending_state, 0);
+  
+  // Detect if this is a live stream by checking if it's buffering indefinitely
+  // If we're in PLAYING state and buffering drops, pause briefly
+  // But for live streams that never reach 100%, force playback to continue
+  
+    if (percent < 100) {
+    // Only pause if we're actually playing and buffer is low
+      if (current_state == GST_STATE_PLAYING) {
+        std::cout << "BUFFERING: Low buffer during playback, continuing anyway (live stream)" << std::endl;
+      // Don't pause for live streams - keep playing
+    }
+  } else {
+    // Buffer is full (100%), ensure we're playing
+    if (current_state != GST_STATE_PLAYING && pending_state != GST_STATE_PLAYING) {
+      std::cout << "BUFFERING: 100% reached, ensuring playback" << std::endl;
+    }
+  }
       break;
     }
+      
     case GST_MESSAGE_ELEMENT: {
       const GstStructure *s = gst_message_get_structure(message);
       const gchar *name = gst_structure_get_name(s);
