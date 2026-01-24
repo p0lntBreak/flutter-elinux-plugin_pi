@@ -65,19 +65,60 @@ bool GstVideoPlayer::Init() {
   
   std::cout << "Init: Completed successfully" << std::endl;
 
+  // TEMPORARY TEST: Auto-play for live streams
+  bool is_live = (uri_.find("/live/") != std::string::npos) || 
+                 (uri_.find("live.") != std::string::npos) ||
+                 (uri_.find("livestream") != std::string::npos);
+  
+  if (is_live) {
+    std::cout << "Init: AUTO-STARTING live stream (TEMPORARY TEST)" << std::endl;
+    
+    // Force to PLAYING immediately
+    GstStateChangeReturn ret = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
+    std::cout << "Init: Auto-play result: " << ret << std::endl;
+    
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+      std::cerr << "Init: Auto-play FAILED!" << std::endl;
+    } else {
+      std::cout << "Init: Auto-play initiated, pipeline should start playing" << std::endl;
+      stream_handler_->OnNotifyPlaying(true);
+    }
+  }
+
   return true;
 }
 
 bool GstVideoPlayer::Play() {
+  std::cout << "=== Play() called ===" << std::endl;
+  
+  GstState current, pending;
+  gst_element_get_state(gst_.pipeline, &current, &pending, 0);
+  std::cout << "Play: Current state=" << current << ", Pending=" << pending << std::endl;
+  
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Failed to change the state to PLAYING" << std::endl;
+    std::cerr << "Play: FAILED to change state to PLAYING" << std::endl;
     return false;
+  }
+
+  std::cout << "Play: State change to PLAYING initiated" << std::endl;
+  
+  // Wait briefly to confirm state change
+  GstStateChangeReturn ret = gst_element_get_state(gst_.pipeline, &current, &pending, 2 * GST_SECOND);
+  std::cout << "Play: After state change - Current=" << current 
+            << ", Pending=" << pending 
+            << ", Result=" << ret << std::endl;
+  
+  if (current == GST_STATE_PLAYING) {
+    std::cout << "Play: Successfully reached PLAYING state!" << std::endl;
+  } else {
+    std::cerr << "Play: WARNING - Not in PLAYING state yet!" << std::endl;
   }
 
   stream_handler_->OnNotifyPlaying(true);
   return true;
 }
+
 
 bool GstVideoPlayer::Pause() {
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED) ==
@@ -171,26 +212,28 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
     return 0;
   }
 
-  // Check pipeline state - position might not be available in NULL or READY states
   GstState state, pending;
   gst_element_get_state(gst_.pipeline, &state, &pending, 0);
   
   // Position is only available when pipeline is PAUSED or PLAYING
   if (state < GST_STATE_PAUSED) {
-    return 0;  // Return 0 instead of -1 when not ready yet
+    return 0;
   }
 
   gint64 position = 0;
 
-  // Sometimes we get an error when playing streaming videos, especially during buffering.
-  // Return 0 instead of -1 to allow progress bar to start at 0 and update when available.
-  if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
-    // Don't log error for streaming videos during initial buffering - this is normal
-    // Only log if we're actually playing (state is PLAYING)
-    if (state == GST_STATE_PLAYING) {
-      std::cerr << "Failed to get current position (pipeline is playing)" << std::endl;
+ if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
+    // For LIVE streams, position queries often fail - this is normal
+    // Don't spam errors for live streams
+    bool is_live = (uri_.find("/live/") != std::string::npos) || 
+                   (uri_.find("live.") != std::string::npos) ||
+                   (uri_.find("livestream") != std::string::npos);
+    
+    if (!is_live && state == GST_STATE_PLAYING) {
+      // Only log for VOD streams when actually playing
+      std::cerr << "Failed to get current position (VOD, state=" << state << ")" << std::endl;
     }
-    return 0;  // Return 0 instead of -1 to prevent progress bar from breaking
+    return 0;
   }
 
   // TODO: We need to handle this code in the proper plase.
@@ -497,57 +540,57 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
   
-  // CRITICAL: Correct playbin flags for LIVE HLS
+  // Get current flags
   gint flags;
   g_object_get(gst_.playbin, "flags", &flags, NULL);
   
-  // Correct flag values (from gstplay-enum.h)
+  // Define flag constants
   const gint GST_PLAY_FLAG_VIDEO           = 0x00000001;
   const gint GST_PLAY_FLAG_AUDIO           = 0x00000002;
   const gint GST_PLAY_FLAG_TEXT            = 0x00000004;
   const gint GST_PLAY_FLAG_NATIVE_VIDEO    = 0x00000800;
   const gint GST_PLAY_FLAG_BUFFERING       = 0x00000080;
   
-  // Enable flags for live streaming
+  // Reset and set base flags
+  flags = 0;  // Start fresh
   flags |= GST_PLAY_FLAG_VIDEO;
   flags |= GST_PLAY_FLAG_AUDIO;
   flags |= GST_PLAY_FLAG_NATIVE_VIDEO;
   
-  if (is_live_stream) {
-    // For LIVE: Enable buffering but don't download
+  // CRITICAL: For live streams, do NOT set buffering flag
+  if (!is_live_stream) {
+    // Only enable buffering for VOD
     flags |= GST_PLAY_FLAG_BUFFERING;
-    std::cout << "CreatePipeline: Enabled BUFFERING flag for live stream" << std::endl;
+    std::cout << "CreatePipeline: Buffering ENABLED for VOD" << std::endl;
   } else {
-    // For VOD: Can enable download
-    const gint GST_PLAY_FLAG_DOWNLOAD = 0x00000080;
-    flags |= GST_PLAY_FLAG_DOWNLOAD;
+    std::cout << "CreatePipeline: Buffering DISABLED for LIVE stream" << std::endl;
   }
   
-  flags &= ~GST_PLAY_FLAG_TEXT;  // Disable subtitles
+  // Disable text/subtitles
+  flags &= ~GST_PLAY_FLAG_TEXT;
   
   g_object_set(gst_.playbin, "flags", flags, NULL);
-  std::cout << "CreatePipeline: Playbin flags configured (0x" << std::hex << flags << std::dec << ")" << std::endl;
-  
-  // Network buffering - CRITICAL for live streams
-  if (is_live_stream) {
-    // Live: Minimal buffering for low latency
-    g_object_set(gst_.playbin, 
-                 "buffer-size", 1048576,              // 1MB
-                 "buffer-duration", 2000000000LL,     // 2 seconds (increased from 1s)
-                 "ring-buffer-max-size", 5242880,     // 5MB max
-                 NULL);
-    std::cout << "CreatePipeline: LIVE buffer config (1MB, 2s, 5MB max)" << std::endl;
-  } else {
-    // VOD: Larger buffer
-    g_object_set(gst_.playbin, 
-                 "buffer-size", 5242880,              // 5MB
-                 "buffer-duration", 5000000000LL,     // 5 sec
-                 NULL);
-    std::cout << "CreatePipeline: VOD buffer config (5MB, 5s)" << std::endl;
-  }
+  std::cout << "CreatePipeline: Playbin flags set to 0x" << std::hex << flags << std::dec << std::endl;
   
   // Connection speed for adaptive streaming
-  g_object_set(gst_.playbin, "connection-speed", 5000, NULL);  // 5 Mbps
+  g_object_set(gst_.playbin, "connection-speed", 5000, NULL);
+  
+  // Configure buffering based on stream type
+  if (is_live_stream) {
+    // For LIVE: minimal latency, no buffering thresholds
+    g_object_set(gst_.playbin, 
+                 "buffer-size", 0,                    // No buffering
+                 "buffer-duration", (gint64)0,        // No duration threshold
+                 NULL);
+    std::cout << "CreatePipeline: LIVE - No buffering thresholds" << std::endl;
+  } else {
+    // For VOD: reasonable buffering for smooth playback
+    g_object_set(gst_.playbin, 
+                 "buffer-size", 2097152,              // 2MB
+                 "buffer-duration", 3000000000LL,     // 3 seconds
+                 NULL);
+    std::cout << "CreatePipeline: VOD - 2MB/3s buffering" << std::endl;
+  }
   
   // Audio configuration
   GstElement* audio_bin = gst_bin_new("audio_bin");
