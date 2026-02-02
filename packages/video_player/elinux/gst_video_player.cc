@@ -121,6 +121,12 @@ bool GstVideoPlayer::Play() {
 
 
 bool GstVideoPlayer::Pause() {
+  if (!gst_.pipeline) {
+    return false;
+  }
+  
+  // For V4L2 decoders, ensure buffers are properly handled during pause
+  // Don't flush here as we want to resume playback smoothly
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Failed to change the state to PAUSED" << std::endl;
@@ -132,10 +138,70 @@ bool GstVideoPlayer::Pause() {
 }
 
 bool GstVideoPlayer::Stop() {
-  if (gst_element_set_state(gst_.pipeline, GST_STATE_READY) ==
-      GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Failed to change the state to READY" << std::endl;
+  if (!gst_.pipeline) {
     return false;
+  }
+
+  // CRITICAL: Flush buffers before stopping to prevent kernel buffer leaks
+  // This ensures V4L2 decoder buffers are properly returned to the kernel
+  std::cout << "Stop: Flushing pipeline buffers..." << std::endl;
+  
+  // First, ensure we're paused to stop new buffers from being queued
+  GstState current, pending;
+  gst_element_get_state(gst_.pipeline, &current, &pending, 0);
+  if (current == GST_STATE_PLAYING) {
+    gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
+    // Wait for pause to complete
+    gst_element_get_state(gst_.pipeline, &current, &pending, 1 * GST_SECOND);
+  }
+  
+  // Release any held buffer references first
+  {
+    std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
+    if (gst_.buffer) {
+      gst_buffer_unref(gst_.buffer);
+      gst_.buffer = nullptr;
+    }
+  }
+  
+  // Send FLUSH_START event to flush all buffers in the pipeline
+  // This is critical for V4L2 decoders to return buffers to the kernel
+  GstEvent* flush_start = gst_event_new_flush_start();
+  if (flush_start) {
+    gst_element_send_event(gst_.pipeline, flush_start);
+  }
+  
+  // Send FLUSH_STOP event to complete the flush
+  // FALSE = don't reset time, we're stopping anyway
+  GstEvent* flush_stop = gst_event_new_flush_stop(FALSE);
+  if (flush_stop) {
+    gst_element_send_event(gst_.pipeline, flush_stop);
+  }
+  
+  // Give time for flush events to propagate and buffers to be released
+  // This is especially important for V4L2 decoders which need to return
+  // buffers to the kernel's videobuf2 framework
+  // Note: g_usleep is available through GLib (included by GStreamer)
+  if (flush_start && flush_stop) {
+    g_usleep(100000); // 100ms delay to allow buffers to be released
+  }
+  
+  // Now change state to READY, which will stop streaming
+  // This should now be safe as buffers have been flushed
+  GstStateChangeReturn ret = gst_element_set_state(gst_.pipeline, GST_STATE_READY);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "Stop: Failed to change the state to READY" << std::endl;
+    return false;
+  }
+  
+  // Wait for state change to complete to ensure buffers are released
+  ret = gst_element_get_state(gst_.pipeline, &current, &pending, 2 * GST_SECOND);
+  
+  if (current != GST_STATE_READY && pending != GST_STATE_READY) {
+    std::cerr << "Stop: WARNING - State change may not have completed (current=" 
+              << current << ", pending=" << pending << ", ret=" << ret << ")" << std::endl;
+  } else {
+    std::cout << "Stop: Successfully stopped and flushed buffers" << std::endl;
   }
 
   stream_handler_->OnNotifyPlaying(false);
@@ -719,8 +785,44 @@ void GstVideoPlayer::DestroyPipeline() {
     g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
   }
 
+  // CRITICAL: Flush buffers before destroying pipeline to prevent kernel buffer leaks
   if (gst_.pipeline) {
+    GstState current, pending;
+    gst_element_get_state(gst_.pipeline, &current, &pending, 0);
+    
+    // If pipeline is playing or paused, flush buffers first
+    if (current >= GST_STATE_PAUSED) {
+      std::cout << "DestroyPipeline: Flushing buffers before destruction..." << std::endl;
+      
+      // Send flush events to release all buffers
+      GstEvent* flush_start = gst_event_new_flush_start();
+      if (flush_start) {
+        gst_element_send_event(gst_.pipeline, flush_start);
+      }
+      
+      GstEvent* flush_stop = gst_event_new_flush_stop(FALSE);
+      if (flush_stop) {
+        gst_element_send_event(gst_.pipeline, flush_stop);
+      }
+      
+      // Wait for flush to complete
+      g_usleep(100000); // 100ms
+    }
+    
+    // Release any held buffer references
+    {
+      std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
+      if (gst_.buffer) {
+        gst_buffer_unref(gst_.buffer);
+        gst_.buffer = nullptr;
+      }
+    }
+    
+    // Now set to NULL state
     gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
+    
+    // Wait for state change to complete
+    gst_element_get_state(gst_.pipeline, &current, &pending, 2 * GST_SECOND);
   }
 
   if (gst_.buffer) {
