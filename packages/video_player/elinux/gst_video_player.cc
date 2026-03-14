@@ -364,6 +364,11 @@ void GstVideoPlayer::UnrefEGLImage() {
 #endif  // USE_EGL_IMAGE_DMABUF
 
 const uint8_t* GstVideoPlayer::GetFrameBuffer() {
+#ifdef USE_EGL_IMAGE_DMABUF
+  // When using DMA-BUF zero-copy, CPU-side framebuffer extraction is not used.
+  // Callers should use GetEGLImage instead.
+  return nullptr;
+#else
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_);
   if (!gst_.buffer) {
     return nullptr;
@@ -372,6 +377,7 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
   const uint32_t pixel_bytes = width_ * height_ * 4;
   gst_buffer_extract(gst_.buffer, 0, pixels_.get(), pixel_bytes);
   return reinterpret_cast<const uint8_t*>(pixels_.get());
+#endif
 }
 
 // Creats a video pipeline using playbin.
@@ -497,19 +503,26 @@ bool GstVideoPlayer::CreatePipeline() {
   g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
   std::cout << "CreatePipeline: Connected source-setup signal" << std::endl;
   
-  // Video conversion (unchanged)
+  // Video path: configure differently depending on whether we want CPU copies
+  // or DMA-BUF zero-copy into EGL.
+#ifdef USE_EGL_IMAGE_DMABUF
+  // Zero-copy path: no colorspace conversion, keep native dmabuf-backed frames
+  // from v4l2h264dec and pass them directly to fakesink.
+  gst_.video_convert = nullptr;
+  gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
+#else
+  // CPU path: use v4l2convert/videoconvert and RGBA extraction.
   gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
   if (!gst_.video_convert) {
     std::cout << "CreatePipeline: Fallback to videoconvert (software)" << std::endl;
     gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
   }
-  
   if (!gst_.video_convert) {
     std::cerr << "Failed to create videoconvert" << std::endl;
     return false;
   }
-  
   gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
+#endif
   if (!gst_.video_sink) {
     std::cerr << "Failed to create videosink" << std::endl;
     return false;
@@ -580,6 +593,19 @@ bool GstVideoPlayer::CreatePipeline() {
                    G_CALLBACK(HandoffHandler), this);
   
   // Build output bin
+#ifdef USE_EGL_IMAGE_DMABUF
+  // Zero-copy: queue -> fakesink with dmabuf-backed video/x-raw
+  gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_sink, NULL);
+
+  GstCaps* caps = gst_caps_from_string("video/x-raw(memory:DMABuf)");
+  gboolean link_ok = gst_element_link_filtered(video_queue, gst_.video_sink, caps);
+  gst_caps_unref(caps);
+  if (!link_ok) {
+    std::cerr << "Failed to link queue to sink with dmabuf caps" << std::endl;
+    return false;
+  }
+#else
+  // CPU path: queue -> videoconvert -> fakesink (RGBA)
   gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert, 
                    gst_.video_sink, NULL);
 
@@ -595,6 +621,7 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to link videoconvert to sink" << std::endl;
     return false;
   }
+#endif
 
   auto* sinkpad = gst_element_get_static_pad(video_queue, "sink");
   auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
