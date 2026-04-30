@@ -4,7 +4,12 @@
 
 #include "gst_video_player.h"
 
+#include <glob.h>
+
+#include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <string>
 
 GstVideoPlayer::GstVideoPlayer(
     const std::string& uri, std::unique_ptr<VideoPlayerStreamHandler> handler)
@@ -385,6 +390,57 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // fakesink"
 //UPDATE:
 
+// Pick an ALSA device for audio output by detecting which HDMI connector is
+// physically connected via DRM, then mapping back to the matching ALSA card.
+// DRM connector "HDMI-A-N" pairs with ALSA card id "vc4hdmi{N-1}".
+// Falls back to plughw:0,0 (3.5mm jack on Pi) if no HDMI is connected.
+static std::string PickAudioDevice() {
+  for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
+    char pattern[64];
+    std::snprintf(pattern, sizeof(pattern),
+                  "/sys/class/drm/card*-HDMI-A-%d/status", hdmi_idx);
+    glob_t g{};
+    if (glob(pattern, 0, nullptr, &g) != 0) {
+      globfree(&g);
+      continue;
+    }
+    bool connected = false;
+    for (size_t i = 0; i < g.gl_pathc; ++i) {
+      std::ifstream f(g.gl_pathv[i]);
+      std::string status;
+      if (f && std::getline(f, status) && status == "connected") {
+        connected = true;
+        break;
+      }
+    }
+    globfree(&g);
+    if (!connected) continue;
+
+    char target[16];
+    std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
+    for (int card = 0; card < 32; ++card) {
+      char id_path[64];
+      std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+      std::ifstream f(id_path);
+      std::string id;
+      if (f && std::getline(f, id) && id == target) {
+        char dev[32];
+        std::snprintf(dev, sizeof(dev), "plughw:%d,0", card);
+        std::cout << "PickAudioDevice: HDMI-A-" << hdmi_idx
+                  << " connected, ALSA card " << card << " (" << id
+                  << ") -> " << dev << std::endl;
+        return dev;
+      }
+    }
+    std::cerr << "PickAudioDevice: HDMI-A-" << hdmi_idx
+              << " connected but no ALSA card matching '" << target
+              << "' found" << std::endl;
+  }
+  std::cout << "PickAudioDevice: No connected HDMI, falling back to plughw:0,0"
+            << std::endl;
+  return "plughw:0,0";
+}
+
 // Modified SourceSetupCallback - this gets called for EVERY source element
 static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointer user_data) {
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
@@ -693,7 +749,8 @@ bool GstVideoPlayer::CreatePipeline() {
   if (!audio_bin || !conv || !sink) {
     std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
   } else {
-    g_object_set(sink, "device", "plughw:0,0", NULL);
+    std::string audio_device = PickAudioDevice();
+    g_object_set(sink, "device", audio_device.c_str(), NULL);
 
     gst_bin_add_many(GST_BIN(audio_bin), conv, sink, NULL);
     if (!gst_element_link(conv, sink)) {
