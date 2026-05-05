@@ -737,24 +737,29 @@ bool GstVideoPlayer::CreatePipeline() {
   // Audio configuration
   GstElement* audio_bin = gst_bin_new("audio_bin");
   GstElement* conv = gst_element_factory_make("audioconvert", "audio_convert");
+  GstElement* resample = gst_element_factory_make("audioresample", "audio_resample");
   GstElement* sink = gst_element_factory_make("alsasink", "audio_alsa");
 
-  if (!audio_bin || !conv || !sink) {
+  if (!audio_bin || !conv || !resample || !sink) {
     std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
   } else {
     std::string audio_device = PickAudioDevice();
     g_object_set(sink, "device", audio_device.c_str(), NULL);
 
-    // Low-latency ALSA buffer: default is ~500ms which pushes audio well behind
-    // the sync=FALSE video path. 20ms/40ms keeps the gap under human perception.
+    // 50ms/100ms: safe under HLS+decode scheduling jitter on RPi4.
+    // The previous 20ms/40ms caused underruns because segment fetches
+    // (HTTP+TLS+AES) could preempt the audio thread for longer than 20ms.
     g_object_set(sink,
-                 "latency-time", (gint64)20000,   // 20 ms (in µs)
-                 "buffer-time",  (gint64)40000,   // 40 ms (in µs)
+                 "latency-time", (gint64)50000,    // 50 ms (in µs)
+                 "buffer-time",  (gint64)100000,   // 100 ms (in µs)
                  NULL);
 
-    gst_bin_add_many(GST_BIN(audio_bin), conv, sink, NULL);
-    if (!gst_element_link(conv, sink)) {
-      std::cerr << "CreatePipeline: Failed to link audioconvert -> alsasink" << std::endl;
+    // audioconvert -> audioresample -> alsasink
+    // audioresample handles sample rate mismatches in GStreamer so plughw
+    // doesn't fall back to software SRC, which glitches under load.
+    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, sink, NULL);
+    if (!gst_element_link(conv, resample) || !gst_element_link(resample, sink)) {
+      std::cerr << "CreatePipeline: Failed to link audio chain" << std::endl;
     } else {
       GstPad* sinkpad = gst_element_get_static_pad(conv, "sink");
       GstPad* ghost = gst_ghost_pad_new("sink", sinkpad);
@@ -763,7 +768,7 @@ bool GstVideoPlayer::CreatePipeline() {
       gst_object_unref(sinkpad);
 
       g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-      std::cout << "CreatePipeline: Audio sink configured (alsasink)" << std::endl;
+      std::cout << "CreatePipeline: Audio sink configured (audioconvert -> audioresample -> alsasink)" << std::endl;
     }
   }
 
