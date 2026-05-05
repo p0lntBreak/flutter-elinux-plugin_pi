@@ -596,17 +596,10 @@ bool GstVideoPlayer::CreatePipeline() {
                         (uri_.find("live.") != std::string::npos) ||
                         (uri_.find("livestream") != std::string::npos);
   
-  // Queue settings - minimal for live streams
-  if (is_live_stream) {
-    g_object_set(gst_.playbin, 
-                  "buffer-size", -1,              // -1 = disabled
-                  "buffer-duration", (gint64)0,   // 0 = no waiting
-                  "ring-buffer-max-size", 0,      // no limit
-                  NULL);
-    }
-  else {
+  // Queue settings for VOD only
+  if (!is_live_stream) {
     std::cout << "CreatePipeline: VOD stream - balanced buffering" << std::endl;
-    g_object_set(video_queue, 
+    g_object_set(video_queue,
                  "max-size-buffers", 3,
                  "max-size-time", (guint64)0,
                  "max-size-bytes", 0,
@@ -724,19 +717,19 @@ bool GstVideoPlayer::CreatePipeline() {
   // Connection speed for adaptive streaming
   g_object_set(gst_.playbin, "connection-speed", 5000, NULL);
   
-  // Configure buffering based on stream type
+  // Buffer cushion: gives the sync=FALSE decoder something to consume during
+  // network jitter so multiqueue doesn't oscillate between 0% and 100%.
+  // LIVE uses a small budget to keep glass-to-glass latency low.
   if (is_live_stream) {
-    // For LIVE: minimal latency, no buffering thresholds
-    g_object_set(gst_.playbin, 
-                 "buffer-size", 0,                    // No buffering
-                 "buffer-duration", (gint64)0,        // No duration threshold
+    g_object_set(gst_.playbin,
+                 "buffer-size", 524288,               // 512 KB
+                 "buffer-duration", 1500000000LL,     // 1.5 s
                  NULL);
-    std::cout << "CreatePipeline: LIVE - No buffering thresholds" << std::endl;
+    std::cout << "CreatePipeline: LIVE - 512KB/1.5s buffer cushion" << std::endl;
   } else {
-    // For VOD: reasonable buffering for smooth playback
-    g_object_set(gst_.playbin, 
-                 "buffer-size", 2097152,              // 2MB
-                 "buffer-duration", 3000000000LL,     // 3 seconds
+    g_object_set(gst_.playbin,
+                 "buffer-size", 2097152,              // 2 MB
+                 "buffer-duration", 3000000000LL,     // 3 s
                  NULL);
     std::cout << "CreatePipeline: VOD - 2MB/3s buffering" << std::endl;
   }
@@ -751,6 +744,13 @@ bool GstVideoPlayer::CreatePipeline() {
   } else {
     std::string audio_device = PickAudioDevice();
     g_object_set(sink, "device", audio_device.c_str(), NULL);
+
+    // Low-latency ALSA buffer: default is ~500ms which pushes audio well behind
+    // the sync=FALSE video path. 20ms/40ms keeps the gap under human perception.
+    g_object_set(sink,
+                 "latency-time", (gint64)20000,   // 20 ms (in µs)
+                 "buffer-time",  (gint64)40000,   // 40 ms (in µs)
+                 NULL);
 
     gst_bin_add_many(GST_BIN(audio_bin), conv, sink, NULL);
     if (!gst_element_link(conv, sink)) {
@@ -1044,33 +1044,16 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
     }
       
     case GST_MESSAGE_BUFFERING: {
-     gint percent;
-     gst_message_parse_buffering(message, &percent);
-     std::cout << "BUFFERING: " << percent << "% from " 
-            << GST_MESSAGE_SRC_NAME(message) << std::endl;
-          // CRITICAL FIX: For live streams, don't block on buffering
-  // Live streams may never reach 100%, so we need to keep playing
-    auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
-  
-    GstState current_state, pending_state;
-    gst_element_get_state(self->gst_.pipeline, &current_state, &pending_state, 0);
-  
-  // Detect if this is a live stream by checking if it's buffering indefinitely
-  // If we're in PLAYING state and buffering drops, pause briefly
-  // But for live streams that never reach 100%, force playback to continue
-  
-    if (percent < 100) {
-    // Only pause if we're actually playing and buffer is low
-      if (current_state == GST_STATE_PLAYING) {
-        std::cout << "BUFFERING: Low buffer during playback, continuing anyway (live stream)" << std::endl;
-      // Don't pause for live streams - keep playing
-    }
-  } else {
-    // Buffer is full (100%), ensure we're playing
-    if (current_state != GST_STATE_PLAYING && pending_state != GST_STATE_PLAYING) {
-      std::cout << "BUFFERING: 100% reached, ensuring playback" << std::endl;
-    }
-  }
+      gint percent;
+      gst_message_parse_buffering(message, &percent);
+      // Only log transitions to 0% and 100% to avoid spamming the bus handler
+      // thread with hundreds of intermediate-percent messages per minute.
+      if (percent == 0 || percent == 100) {
+        std::cout << "BUFFERING: " << percent << "% from "
+                  << GST_MESSAGE_SRC_NAME(message) << std::endl;
+      }
+      // Never pause for live streams — the pipeline keeps playing through
+      // low-buffer events; the 512KB cushion absorbs normal jitter.
       break;
     }
       
