@@ -45,93 +45,57 @@ void GstVideoPlayer::GstLibraryLoad() { gst_init(NULL, NULL); }
 void GstVideoPlayer::GstLibraryUnload() { gst_deinit(); }
 
 bool GstVideoPlayer::Init() {
-  std::cout << "Init: Starting..." << std::endl;
-  
   if (!gst_.pipeline) {
-    std::cerr << "Init: Pipeline is null!" << std::endl;
     return false;
   }
 
-  // Prerolls before getting information from the pipeline.
   if (!Preroll()) {
-    std::cerr << "Init: Preroll failed!" << std::endl;
     DestroyPipeline();
     return false;
   }
 
+  // With sync=TRUE, fakesink only delivers frames once the pipeline clock is
+  // running (PLAYING state). Live HLS prerolls with NO_PREROLL so sinks never
+  // receive a buffer in PAUSED. Advance to PLAYING now so the V4L2 hardware
+  // decoder starts producing frames and HandoffHandler can capture real
+  // dimensions before OnNotifyInitialized() is sent to Flutter.
+  if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "Init: Failed to reach PLAYING state" << std::endl;
+    DestroyPipeline();
+    return false;
+  }
 
-  // Sets internal video size and buffier.
-  GetVideoSize(width_, height_);
-  std::cout << "Init: Video size: " << width_ << "x" << height_ << std::endl;
-  
-  pixels_.reset(new uint32_t[width_ * height_]);
+  // Wait up to 5 s for HandoffHandler to deliver the first decoded frame.
+  {
+    std::unique_lock<std::mutex> lock(mutex_first_frame_);
+    first_frame_cv_.wait_for(lock, std::chrono::seconds(5),
+                             [this] { return first_frame_ready_.load(); });
+  }
 
-  stream_handler_->OnNotifyInitialized();
-  
-  std::cout << "Init: Completed successfully" << std::endl;
-
-  // TEMPORARY TEST: Auto-play for live streams
-  bool is_live = (uri_.find("/live/") != std::string::npos) || 
-                 (uri_.find("live.") != std::string::npos) ||
-                 (uri_.find("livestream") != std::string::npos);
-  
-  if (is_live) {
-    std::cout << "Init: AUTO-STARTING live stream (TEMPORARY TEST)" << std::endl;
-    
-    // Force to PLAYING immediately
-    GstStateChangeReturn ret = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
-    std::cout << "Init: Auto-play result: " << ret << std::endl;
-    
-    if (ret == GST_STATE_CHANGE_FAILURE) {
-      std::cerr << "Init: Auto-play FAILED!" << std::endl;
-    } else {
-      std::cout << "Init: Auto-play initiated, pipeline should start playing" << std::endl;
-      stream_handler_->OnNotifyPlaying(true);
-    }
+  // Complete init here (platform thread) if a frame arrived during the wait.
+  // If we timed out, HandoffHandler will call OnNotifyInitialized() on the
+  // first frame it delivers (deferred-init path).
+  if (first_frame_ready_.load() && !initialized_.exchange(true)) {
+    stream_handler_->OnNotifyInitialized();
+    stream_handler_->OnNotifyPlaying(true);
   }
 
   return true;
 }
 
 bool GstVideoPlayer::Play() {
-  std::cout << "=== Play() called ===" << std::endl;
-  
-  GstState current, pending;
-  gst_element_get_state(gst_.pipeline, &current, &pending, 0);
-  std::cout << "Play: Current state=" << current << ", Pending=" << pending << std::endl;
-  
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Play: FAILED to change state to PLAYING" << std::endl;
+    std::cerr << "Failed to change the state to PLAYING" << std::endl;
     return false;
-  }
-
-  std::cout << "Play: State change to PLAYING initiated" << std::endl;
-  
-  // Wait briefly to confirm state change
-  GstStateChangeReturn ret = gst_element_get_state(gst_.pipeline, &current, &pending, 2 * GST_SECOND);
-  std::cout << "Play: After state change - Current=" << current 
-            << ", Pending=" << pending 
-            << ", Result=" << ret << std::endl;
-  
-  if (current == GST_STATE_PLAYING) {
-    std::cout << "Play: Successfully reached PLAYING state!" << std::endl;
-  } else {
-    std::cerr << "Play: WARNING - Not in PLAYING state yet!" << std::endl;
   }
 
   stream_handler_->OnNotifyPlaying(true);
   return true;
 }
 
-
 bool GstVideoPlayer::Pause() {
-  if (!gst_.pipeline) {
-    return false;
-  }
-  
-  // For V4L2 decoders, ensure buffers are properly handled during pause
-  // Don't flush here as we want to resume playback smoothly
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Failed to change the state to PAUSED" << std::endl;
@@ -143,70 +107,10 @@ bool GstVideoPlayer::Pause() {
 }
 
 bool GstVideoPlayer::Stop() {
-  if (!gst_.pipeline) {
+  if (gst_element_set_state(gst_.pipeline, GST_STATE_READY) ==
+      GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "Failed to change the state to READY" << std::endl;
     return false;
-  }
-
-  // CRITICAL: Flush buffers before stopping to prevent kernel buffer leaks
-  // This ensures V4L2 decoder buffers are properly returned to the kernel
-  std::cout << "Stop: Flushing pipeline buffers..." << std::endl;
-  
-  // First, ensure we're paused to stop new buffers from being queued
-  GstState current, pending;
-  gst_element_get_state(gst_.pipeline, &current, &pending, 0);
-  if (current == GST_STATE_PLAYING) {
-    gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
-    // Wait for pause to complete
-    gst_element_get_state(gst_.pipeline, &current, &pending, 1 * GST_SECOND);
-  }
-  
-  // Release any held buffer references first
-  {
-    std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
-    if (gst_.buffer) {
-      gst_buffer_unref(gst_.buffer);
-      gst_.buffer = nullptr;
-    }
-  }
-  
-  // Send FLUSH_START event to flush all buffers in the pipeline
-  // This is critical for V4L2 decoders to return buffers to the kernel
-  GstEvent* flush_start = gst_event_new_flush_start();
-  if (flush_start) {
-    gst_element_send_event(gst_.pipeline, flush_start);
-  }
-  
-  // Send FLUSH_STOP event to complete the flush
-  // FALSE = don't reset time, we're stopping anyway
-  GstEvent* flush_stop = gst_event_new_flush_stop(FALSE);
-  if (flush_stop) {
-    gst_element_send_event(gst_.pipeline, flush_stop);
-  }
-  
-  // Give time for flush events to propagate and buffers to be released
-  // This is especially important for V4L2 decoders which need to return
-  // buffers to the kernel's videobuf2 framework
-  // Note: g_usleep is available through GLib (included by GStreamer)
-  if (flush_start && flush_stop) {
-    g_usleep(100000); // 100ms delay to allow buffers to be released
-  }
-  
-  // Now change state to READY, which will stop streaming
-  // This should now be safe as buffers have been flushed
-  GstStateChangeReturn ret = gst_element_set_state(gst_.pipeline, GST_STATE_READY);
-  if (ret == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Stop: Failed to change the state to READY" << std::endl;
-    return false;
-  }
-  
-  // Wait for state change to complete to ensure buffers are released
-  ret = gst_element_get_state(gst_.pipeline, &current, &pending, 2 * GST_SECOND);
-  
-  if (current != GST_STATE_READY && pending != GST_STATE_READY) {
-    std::cerr << "Stop: WARNING - State change may not have completed (current=" 
-              << current << ", pending=" << pending << ", ret=" << ret << ")" << std::endl;
-  } else {
-    std::cout << "Stop: Successfully stopped and flushed buffers" << std::endl;
   }
 
   stream_handler_->OnNotifyPlaying(false);
@@ -279,31 +183,10 @@ int64_t GstVideoPlayer::GetDuration() {
 }
 
 int64_t GstVideoPlayer::GetCurrentPosition() {
-  if (!gst_.pipeline) {
-    return 0;
-  }
-
-  GstState state, pending;
-  gst_element_get_state(gst_.pipeline, &state, &pending, 0);
-  
-  // Position is only available when pipeline is PAUSED or PLAYING
-  if (state < GST_STATE_PAUSED) {
-    return 0;
-  }
-
   gint64 position = 0;
 
- if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
-    // For LIVE streams, position queries often fail - this is normal
-    // Don't spam errors for live streams
-    bool is_live = (uri_.find("/live/") != std::string::npos) || 
-                   (uri_.find("live.") != std::string::npos) ||
-                   (uri_.find("livestream") != std::string::npos);
-    
-    if (!is_live && state == GST_STATE_PLAYING) {
-      // Only log for VOD streams when actually playing
-      std::cerr << "Failed to get current position (VOD, state=" << state << ")" << std::endl;
-    }
+  // Sometimes we get an error when playing streaming videos.
+  if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
     return 0;
   }
 
@@ -385,11 +268,6 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 #endif
 }
 
-// Creats a video pipeline using playbin.
-// $ playbin uri=<file> video-sink="videoconvert ! video/x-raw,format=RGBA !
-// fakesink"
-//UPDATE:
-
 // Pick an ALSA device for audio output by detecting which HDMI connector is
 // physically connected via DRM, then mapping back to the matching ALSA card.
 // DRM connector "HDMI-A-N" pairs with ALSA card id "vc4hdmi{N-1}".
@@ -441,106 +319,57 @@ static std::string PickAudioDevice() {
   return "plughw:0,0";
 }
 
-// Modified SourceSetupCallback - this gets called for EVERY source element
-static void SourceSetupCallback(GstElement* playbin, GstElement* source, gpointer user_data) {
+static void SourceSetupCallback(GstElement* playbin, GstElement* source,
+                                gpointer user_data) {
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
-  
-  std::cout << "SourceSetupCallback: Source element created: " 
-            << GST_ELEMENT_NAME(source) << " (type: " 
-            << G_OBJECT_TYPE_NAME(source) << ")" << std::endl;
-  
-  // Configure curlhttpsrc for BOTH manifest and segment requests
+
   if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstCurlHttpSrc") == 0) {
-    std::cout << "SourceSetupCallback: Configuring curlhttpsrc for segment/manifest fetch" << std::endl;
-    
-    // Connection settings
-    g_object_set(source, 
-                 "timeout", 30, 
-                 "compress", TRUE, 
-                 "keep-alive", TRUE,  // CRITICAL for segment reuse
+    g_object_set(source,
+                 "timeout",    30,
+                 "compress",   TRUE,
+                 "keep-alive", TRUE,
                  NULL);
-    
-    // Apply ALL authentication headers if present
     if (!self->auth_headers_.all_headers.empty()) {
-      std::cout << "SourceSetupCallback: Applying " << self->auth_headers_.all_headers.size() 
-                << " headers to HTTP request" << std::endl;
-      
-      // Build extra-headers structure with ALL headers
       GstStructure* headers = gst_structure_new_empty("extra-headers");
-      
       for (const auto& [key, value] : self->auth_headers_.all_headers) {
-        gst_structure_set(headers, key.c_str(), G_TYPE_STRING, value.c_str(), NULL);
-        std::cout << "  - Applied: " << key << " = " << value << std::endl;
+        gst_structure_set(headers, key.c_str(), G_TYPE_STRING, value.c_str(),
+                          NULL);
       }
-      
       g_object_set(source, "extra-headers", headers, NULL);
       gst_structure_free(headers);
-      
-      std::cout << "SourceSetupCallback: All headers applied successfully" << std::endl;
-    } else {
-      std::cout << "SourceSetupCallback: No auth headers to apply" << std::endl;
     }
-  }
-  // Fallback warning
-  else if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstSoupHTTPSrc") == 0) {
-    std::cerr << "SourceSetupCallback: WARNING - souphttpsrc was selected despite rank changes!" << std::endl;
+  } else if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstSoupHTTPSrc") == 0) {
+    std::cerr << "WARNING: souphttpsrc selected despite rank override" << std::endl;
   }
 }
 
-
-// Add method to set authentication headers BEFORE creating pipeline
-void GstVideoPlayer::SetAuthHeaders(const std::map<std::string, std::string>& headers) {
+void GstVideoPlayer::SetAuthHeaders(
+    const std::map<std::string, std::string>& headers) {
   auth_headers_.all_headers = headers;
-  
-  std::cout << "SetAuthHeaders: Stored " << headers.size() << " authentication headers:" << std::endl;
-  for (const auto& [key, value] : headers) {
-    std::cout << "  - " << key << ": " << value << std::endl;
-  }
 }
 
 bool GstVideoPlayer::CreatePipeline() {
-  std::cout << "CreatePipeline: Starting..." << std::endl;
-  std::cout << "CreatePipeline: URI = " << uri_ << std::endl;  
-  
-  // Extract and store auth headers from URI if present
-  // Format: https://domain/path?cookie=xxx&token=yyy
-  // Or you should store these separately when creating the player
-  // For now, assuming they're passed separately
-  
   GstRegistry* registry = gst_registry_get();
-  
-  // Force curlhttpsrc for HTTPS streams
+
+  // curlhttpsrc handles HTTPS streams reliably; souphttpsrc has TLS issues.
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
-  
   if (curl_feature) {
     gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 300);
     gst_object_unref(curl_feature);
-    std::cout << "CreatePipeline: curlhttpsrc rank boosted to PRIMARY+300" << std::endl;
   } else {
-    std::cerr << "CreatePipeline: WARNING - curlhttpsrc not found!" << std::endl;
+    std::cerr << "CreatePipeline: WARNING - curlhttpsrc not found" << std::endl;
   }
-  
   if (soup_feature) {
     gst_plugin_feature_set_rank(soup_feature, GST_RANK_NONE);
     gst_object_unref(soup_feature);
-    std::cout << "CreatePipeline: souphttpsrc rank set to NONE" << std::endl;
   }
-  
-  // Hardware decoder ranks (unchanged)
+
+  // Prefer hardware H.264 decode on the Pi.
   GstPluginFeature* v4l2_h264 = gst_registry_lookup_feature(registry, "v4l2h264dec");
   if (v4l2_h264) {
     gst_plugin_feature_set_rank(v4l2_h264, GST_RANK_PRIMARY + 300);
     gst_object_unref(v4l2_h264);
-    std::cout << "CreatePipeline: v4l2h264dec rank boosted to PRIMARY+300" << std::endl;
-  }
-  
-  // Boost hlsdemux - CRITICAL for live streams
-  GstPluginFeature* hls_feature = gst_registry_lookup_feature(registry, "hlsdemux");
-  if (hls_feature) {
-    gst_plugin_feature_set_rank(hls_feature, GST_RANK_PRIMARY + 300);
-    gst_object_unref(hls_feature);
-    std::cout << "CreatePipeline: hlsdemux rank boosted to PRIMARY+300" << std::endl;
   }
 
   gst_.pipeline = gst_pipeline_new("pipeline");
@@ -548,70 +377,44 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to create a pipeline" << std::endl;
     return false;
   }
-  
+
   gst_.playbin = gst_element_factory_make("playbin", "playbin");
   if (!gst_.playbin) {
     std::cerr << "Failed to create playbin" << std::endl;
     return false;
   }
-  
-  // CRITICAL: Connect source-setup to apply headers to ALL segment requests
+
   g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
-  std::cout << "CreatePipeline: Connected source-setup signal" << std::endl;
-  
-  // Video path: configure differently depending on whether we want CPU copies
-  // or DMA-BUF zero-copy into EGL.
-#ifdef USE_EGL_IMAGE_DMABUF
-  // Zero-copy path: no colorspace conversion, keep native dmabuf-backed frames
-  // from v4l2h264dec and pass them directly to fakesink.
-  gst_.video_convert = nullptr;
-  gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
-#else
-  // CPU path: use v4l2convert/videoconvert and RGBA extraction.
+
+  // Video converter: prefer v4l2convert (hardware-accelerated) with RGBA output,
+  // fall back to software videoconvert if unavailable.
   gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
   if (!gst_.video_convert) {
-    std::cout << "CreatePipeline: Fallback to videoconvert (software)" << std::endl;
     gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
   }
   if (!gst_.video_convert) {
     std::cerr << "Failed to create videoconvert" << std::endl;
     return false;
   }
+
   gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
-#endif
   if (!gst_.video_sink) {
     std::cerr << "Failed to create videosink" << std::endl;
     return false;
   }
-  
-  // Create queue
+
   GstElement* video_queue = gst_element_factory_make("queue", "vqueue");
   if (!video_queue) {
     std::cerr << "Failed to create video queue" << std::endl;
     return false;
   }
-  
-  // Detect stream type
-  bool is_live_stream = (uri_.find("/live/") != std::string::npos) || 
-                        (uri_.find("live.") != std::string::npos) ||
-                        (uri_.find("livestream") != std::string::npos);
-  
-  // Queue settings for VOD only
-  if (!is_live_stream) {
-    std::cout << "CreatePipeline: VOD stream - balanced buffering" << std::endl;
-    g_object_set(video_queue,
-                 "max-size-buffers", 3,
-                 "max-size-time", (guint64)0,
-                 "max-size-bytes", 0,
-                 NULL);
-  }
-  
+
   gst_.output = gst_bin_new("output");
   if (!gst_.output) {
     std::cerr << "Failed to create output bin" << std::endl;
     return false;
   }
-  
+
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
   if (!gst_.bus) {
     std::cerr << "Failed to get bus" << std::endl;
@@ -619,58 +422,29 @@ bool GstVideoPlayer::CreatePipeline() {
   }
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
-  // Configure fakesink - CRITICAL for live streams
-  if (is_live_stream) {
-    // For live streams: disable sync to prevent blocking on clock
-    g_object_set(G_OBJECT(gst_.video_sink), 
-                 "sync", FALSE,      // Don't wait for clock - critical for live!
-                 "qos", FALSE,       // No quality-of-service
-                 "async", FALSE,     // Don't wait for preroll
-                 NULL);
-    std::cout << "CreatePipeline: Fakesink configured for LIVE (sync=FALSE)" << std::endl;
-  } else {
-    // For VOD: enable sync for proper playback speed
-    g_object_set(G_OBJECT(gst_.video_sink), 
-                 "sync", TRUE, 
-                 "qos", FALSE, 
-                 NULL);
-    std::cout << "CreatePipeline: Fakesink configured for VOD (sync=TRUE)" << std::endl;
-  }
-  
+  // sync=TRUE: fakesink paces video frames to the GStreamer clock, keeping
+  // A/V in sync. async=TRUE (default): fakesink participates in preroll,
+  // which is what we want — Init() waits for the first decoded frame before
+  // calling OnNotifyInitialized().
+  g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
-  
-  // Build output bin
-#ifdef USE_EGL_IMAGE_DMABUF
-  // Zero-copy: queue -> fakesink with dmabuf-backed video/x-raw
-  gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_sink, NULL);
 
-  GstCaps* caps = gst_caps_from_string("video/x-raw(memory:DMABuf)");
-  gboolean link_ok = gst_element_link_filtered(video_queue, gst_.video_sink, caps);
-  gst_caps_unref(caps);
-  if (!link_ok) {
-    std::cerr << "Failed to link queue to sink with dmabuf caps" << std::endl;
-    return false;
-  }
-#else
-  // CPU path: queue -> videoconvert -> fakesink (RGBA)
-  gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert, 
+  // queue -> v4l2convert -> video/x-raw,format=RGBA -> fakesink
+  gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert,
                    gst_.video_sink, NULL);
-
   if (!gst_element_link(video_queue, gst_.video_convert)) {
     std::cerr << "Failed to link queue to videoconvert" << std::endl;
     return false;
   }
-
   auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
   auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
   gst_caps_unref(caps);
   if (!link_ok) {
-    std::cerr << "Failed to link videoconvert to sink" << std::endl;
+    std::cerr << "Failed to link videoconvert to fakesink" << std::endl;
     return false;
   }
-#endif
 
   auto* sinkpad = gst_element_get_static_pad(video_queue, "sink");
   auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
@@ -678,195 +452,75 @@ bool GstVideoPlayer::CreatePipeline() {
   gst_element_add_pad(gst_.output, ghost_sinkpad);
   gst_object_unref(sinkpad);
 
-  // Configure playbin
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
-  
-  // Get current flags
-  gint flags;
-  g_object_get(gst_.playbin, "flags", &flags, NULL);
-  
-  // Define flag constants
-  const gint GST_PLAY_FLAG_VIDEO           = 0x00000001;
-  const gint GST_PLAY_FLAG_AUDIO           = 0x00000002;
-  const gint GST_PLAY_FLAG_TEXT            = 0x00000004;
-  const gint GST_PLAY_FLAG_NATIVE_VIDEO    = 0x00000800;
-  const gint GST_PLAY_FLAG_BUFFERING       = 0x00000080;
-  
-  // Reset and set base flags
-  flags = 0;  // Start fresh
-  flags |= GST_PLAY_FLAG_VIDEO;
-  flags |= GST_PLAY_FLAG_AUDIO;
-  flags |= GST_PLAY_FLAG_NATIVE_VIDEO;
-  
-  // CRITICAL: For live streams, do NOT set buffering flag
-  if (!is_live_stream) {
-    // Only enable buffering for VOD
-    flags |= GST_PLAY_FLAG_BUFFERING;
-    std::cout << "CreatePipeline: Buffering ENABLED for VOD" << std::endl;
-  } else {
-    std::cout << "CreatePipeline: Buffering DISABLED for LIVE stream" << std::endl;
-  }
-  
-  // Disable text/subtitles
-  flags &= ~GST_PLAY_FLAG_TEXT;
-  
-  g_object_set(gst_.playbin, "flags", flags, NULL);
-  std::cout << "CreatePipeline: Playbin flags set to 0x" << std::hex << flags << std::dec << std::endl;
-  
-  // Connection speed for adaptive streaming
-  g_object_set(gst_.playbin, "connection-speed", 5000, NULL);
-  
-  // Buffer cushion: gives the sync=FALSE decoder something to consume during
-  // network jitter so multiqueue doesn't oscillate between 0% and 100%.
-  // LIVE uses a small budget to keep glass-to-glass latency low.
-  if (is_live_stream) {
-    g_object_set(gst_.playbin,
-                 "buffer-size", 524288,               // 512 KB
-                 "buffer-duration", 1500000000LL,     // 1.5 s
-                 NULL);
-    std::cout << "CreatePipeline: LIVE - 512KB/1.5s buffer cushion" << std::endl;
-  } else {
-    g_object_set(gst_.playbin,
-                 "buffer-size", 2097152,              // 2 MB
-                 "buffer-duration", 3000000000LL,     // 3 s
-                 NULL);
-    std::cout << "CreatePipeline: VOD - 2MB/3s buffering" << std::endl;
-  }
-  
-  // Audio configuration
-  GstElement* audio_bin = gst_bin_new("audio_bin");
-  GstElement* conv = gst_element_factory_make("audioconvert", "audio_convert");
-  GstElement* resample = gst_element_factory_make("audioresample", "audio_resample");
-  GstElement* sink = gst_element_factory_make("alsasink", "audio_alsa");
 
-  if (!audio_bin || !conv || !resample || !sink) {
+  const gint GST_PLAY_FLAG_VIDEO        = 0x00000001;
+  const gint GST_PLAY_FLAG_AUDIO        = 0x00000002;
+  const gint GST_PLAY_FLAG_TEXT         = 0x00000004;
+  const gint GST_PLAY_FLAG_NATIVE_VIDEO = 0x00000800;
+  const gint GST_PLAY_FLAG_BUFFERING    = 0x00000080;
+
+  gint flags = GST_PLAY_FLAG_VIDEO | GST_PLAY_FLAG_AUDIO |
+               GST_PLAY_FLAG_NATIVE_VIDEO | GST_PLAY_FLAG_BUFFERING;
+  flags &= ~GST_PLAY_FLAG_TEXT;
+  g_object_set(gst_.playbin, "flags", flags, NULL);
+
+  // 5 MB / 8 s matches mpv's --demuxer-max-bytes=30MiB / --demuxer-readahead-secs=5
+  // and is large enough to absorb a missed HLS segment fetch without stalling.
+  g_object_set(gst_.playbin,
+               "buffer-size",     (gint)5242880,         // 5 MB
+               "buffer-duration", (gint64)8000000000LL,  // 8 s
+               "connection-speed", (guint64)5000,
+               NULL);
+
+  // Audio: audioconvert -> audioresample -> alsasink (HDMI auto-detected).
+  // Explicit alsasink is required because Buildroot omits autoaudiosink.
+  // audioresample prevents ALSA sample-rate-mismatch underruns under load.
+  GstElement* audio_bin  = gst_bin_new("audio_bin");
+  GstElement* conv       = gst_element_factory_make("audioconvert",  "audio_convert");
+  GstElement* resample   = gst_element_factory_make("audioresample", "audio_resample");
+  GstElement* audio_sink = gst_element_factory_make("alsasink",      "audio_alsa");
+
+  if (!audio_bin || !conv || !resample || !audio_sink) {
     std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
   } else {
     std::string audio_device = PickAudioDevice();
-    g_object_set(sink, "device", audio_device.c_str(), NULL);
-
-    // 50ms/100ms: safe under HLS+decode scheduling jitter on RPi4.
-    // The previous 20ms/40ms caused underruns because segment fetches
-    // (HTTP+TLS+AES) could preempt the audio thread for longer than 20ms.
-    g_object_set(sink,
-                 "latency-time", (gint64)50000,    // 50 ms (in µs)
-                 "buffer-time",  (gint64)100000,   // 100 ms (in µs)
+    g_object_set(audio_sink, "device", audio_device.c_str(), NULL);
+    g_object_set(audio_sink,
+                 "latency-time", (gint64)50000,   // 50 ms
+                 "buffer-time",  (gint64)100000,  // 100 ms
                  NULL);
 
-    // audioconvert -> audioresample -> alsasink
-    // audioresample handles sample rate mismatches in GStreamer so plughw
-    // doesn't fall back to software SRC, which glitches under load.
-    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, sink, NULL);
-    if (!gst_element_link(conv, resample) || !gst_element_link(resample, sink)) {
+    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, audio_sink, NULL);
+    if (!gst_element_link(conv, resample) || !gst_element_link(resample, audio_sink)) {
       std::cerr << "CreatePipeline: Failed to link audio chain" << std::endl;
     } else {
-      GstPad* sinkpad = gst_element_get_static_pad(conv, "sink");
-      GstPad* ghost = gst_ghost_pad_new("sink", sinkpad);
-      gst_pad_set_active(ghost, TRUE);
-      gst_element_add_pad(audio_bin, ghost);
-      gst_object_unref(sinkpad);
-
+      GstPad* apad = gst_element_get_static_pad(conv, "sink");
+      GstPad* ghost_apad = gst_ghost_pad_new("sink", apad);
+      gst_pad_set_active(ghost_apad, TRUE);
+      gst_element_add_pad(audio_bin, ghost_apad);
+      gst_object_unref(apad);
       g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-      std::cout << "CreatePipeline: Audio sink configured (audioconvert -> audioresample -> alsasink)" << std::endl;
     }
   }
-
-  std::cout << "CreatePipeline: SUCCESS - Pipeline ready for live HLS" << std::endl;
 
   gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
 
   return true;
 }
 
-
-
 bool GstVideoPlayer::Preroll() {
-  std::cout << "Preroll: Starting..." << std::endl;
-  
-  if (!gst_.playbin) {
-    std::cerr << "Preroll: playbin is null!" << std::endl;
-    return false;
-  }
-
   auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
   if (result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Failed to change the state to PAUSED" << std::endl;
+    std::cerr << "Preroll: Failed to change state to PAUSED" << std::endl;
     return false;
   }
-
-  std::cout << "Preroll: State change result: " << result << std::endl;
-
-  // Check bus for messages while waiting
-  GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
-  bool done = false;
-  bool success = false;
-  
-  while (!done) {
-    GstMessage* msg = gst_bus_timed_pop_filtered(
-        bus, 
-        1 * GST_SECOND,  // Check every second
-        (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | 
-                         GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_WARNING));
-    
-    if (msg != NULL) {
-      GError* err;
-      gchar* debug_info;
-      
-      switch (GST_MESSAGE_TYPE(msg)) {
-        case GST_MESSAGE_ERROR:
-          gst_message_parse_error(msg, &err, &debug_info);
-          std::cerr << "Preroll ERROR from " << GST_OBJECT_NAME(msg->src) 
-                    << ": " << err->message << std::endl;
-          std::cerr << "Debug: " << (debug_info ? debug_info : "none") << std::endl;
-          g_clear_error(&err);
-          g_free(debug_info);
-          done = true;
-          success = false;
-          break;
-          
-        case GST_MESSAGE_WARNING:
-          gst_message_parse_warning(msg, &err, &debug_info);
-          std::cerr << "Preroll WARNING from " << GST_OBJECT_NAME(msg->src) 
-                    << ": " << err->message << std::endl;
-          g_clear_error(&err);
-          g_free(debug_info);
-          break;
-          
-        case GST_MESSAGE_STATE_CHANGED:
-          if (GST_MESSAGE_SRC(msg) == GST_OBJECT(gst_.pipeline)) {
-            GstState old_state, new_state, pending_state;
-            gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
-            std::cout << "Preroll: Pipeline state changed from " << old_state 
-                      << " to " << new_state << " (pending: " << pending_state << ")" << std::endl;
-            
-            if (new_state == GST_STATE_PAUSED) {
-              std::cout << "Preroll: Reached PAUSED state!" << std::endl;
-              done = true;
-              success = true;
-            }
-          }
-          break;
-          
-        default:
-          break;
-      }
-      gst_message_unref(msg);
-    } else {
-      // Timeout - still waiting
-      std::cout << "Preroll: Still waiting..." << std::endl;
-    }
-  }
-  
-  gst_object_unref(bus);
-  
-  if (success) {
-    std::cout << "Preroll: Completed successfully" << std::endl;
-    return true;
-  } else {
-    std::cerr << "Preroll: Failed!" << std::endl;
-    return false;
-  }
+  // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
+  // Give GStreamer up to 5 s to settle before Init() advances to PLAYING.
+  GstState state;
+  gst_element_get_state(gst_.pipeline, &state, NULL, 5 * GST_SECOND);
+  return true;
 }
 
 void GstVideoPlayer::DestroyPipeline() {
@@ -874,49 +528,16 @@ void GstVideoPlayer::DestroyPipeline() {
     g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
   }
 
-  // CRITICAL: Flush buffers before destroying pipeline to prevent kernel buffer leaks
   if (gst_.pipeline) {
-    GstState current, pending;
-    gst_element_get_state(gst_.pipeline, &current, &pending, 0);
-    
-    // If pipeline is playing or paused, flush buffers first
-    if (current >= GST_STATE_PAUSED) {
-      std::cout << "DestroyPipeline: Flushing buffers before destruction..." << std::endl;
-      
-      // Send flush events to release all buffers
-      GstEvent* flush_start = gst_event_new_flush_start();
-      if (flush_start) {
-        gst_element_send_event(gst_.pipeline, flush_start);
-      }
-      
-      GstEvent* flush_stop = gst_event_new_flush_stop(FALSE);
-      if (flush_stop) {
-        gst_element_send_event(gst_.pipeline, flush_stop);
-      }
-      
-      // Wait for flush to complete
-      g_usleep(100000); // 100ms
-    }
-    
-    // Release any held buffer references
-    {
-      std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
-      if (gst_.buffer) {
-        gst_buffer_unref(gst_.buffer);
-        gst_.buffer = nullptr;
-      }
-    }
-    
-    // Now set to NULL state
     gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
-    
-    // Wait for state change to complete
-    gst_element_get_state(gst_.pipeline, &current, &pending, 2 * GST_SECOND);
   }
 
-  if (gst_.buffer) {
-    gst_buffer_unref(gst_.buffer);
-    gst_.buffer = nullptr;
+  {
+    std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
+    if (gst_.buffer) {
+      gst_buffer_unref(gst_.buffer);
+      gst_.buffer = nullptr;
+    }
   }
 
   if (gst_.bus) {
@@ -929,21 +550,10 @@ void GstVideoPlayer::DestroyPipeline() {
     gst_.pipeline = nullptr;
   }
 
-  if (gst_.playbin) {
-    gst_.playbin = nullptr;
-  }
-
-  if (gst_.output) {
-    gst_.output = nullptr;
-  }
-
-  if (gst_.video_sink) {
-    gst_.video_sink = nullptr;
-  }
-
-  if (gst_.video_convert) {
-    gst_.video_convert = nullptr;
-  }
+  gst_.playbin = nullptr;
+  gst_.output = nullptr;
+  gst_.video_sink = nullptr;
+  gst_.video_convert = nullptr;
 }
 
 std::string GstVideoPlayer::ParseUri(const std::string& uri) {
@@ -1014,25 +624,37 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   auto* caps = gst_pad_get_current_caps(new_pad);
   auto* structure = gst_caps_get_structure(caps, 0);
 
-  int width;
-  int height;
+  int width = 0, height = 0;
   gst_structure_get_int(structure, "width", &width);
   gst_structure_get_int(structure, "height", &height);
   gst_caps_unref(caps);
-  if (width != self->width_ || height != self->height_) {
-    self->width_ = width;
-    self->height_ = height;
-    self->pixels_.reset(new uint32_t[width * height]);
-    std::cout << "Pixel buffer size: width = " << width
-              << ", height = " << height << std::endl;
+
+  {
+    std::lock_guard<std::shared_mutex> lock(self->mutex_buffer_);
+    if (width != self->width_ || height != self->height_) {
+      self->width_ = width;
+      self->height_ = height;
+      if (width > 0 && height > 0)
+        self->pixels_.reset(new uint32_t[width * height]);
+    }
+    if (self->gst_.buffer)
+      gst_buffer_unref(self->gst_.buffer);
+    self->gst_.buffer = gst_buffer_ref(buf);
   }
 
-  std::lock_guard<std::shared_mutex> lock(self->mutex_buffer_);
-  if (self->gst_.buffer) {
-    gst_buffer_unref(self->gst_.buffer);
-    self->gst_.buffer = nullptr;
+  // Wake Init()'s condition variable on the very first frame.
+  if (!self->first_frame_ready_.exchange(true)) {
+    self->first_frame_cv_.notify_all();
   }
-  self->gst_.buffer = gst_buffer_ref(buf);
+
+  // Deferred-init path: only fires if Init() timed out before this frame
+  // arrived and left initialized_ = false. In the normal case Init() wins
+  // the exchange and calls OnNotifyInitialized() itself.
+  if (!self->initialized_.exchange(true)) {
+    self->stream_handler_->OnNotifyInitialized();
+    self->stream_handler_->OnNotifyPlaying(true);
+  }
+
   self->stream_handler_->OnNotifyFrameDecoded();
 }
 
@@ -1047,35 +669,21 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       self->is_completed_ = true;
       break;
     }
-      
     case GST_MESSAGE_BUFFERING: {
       gint percent;
       gst_message_parse_buffering(message, &percent);
-      // Only log transitions to 0% and 100% to avoid spamming the bus handler
-      // thread with hundreds of intermediate-percent messages per minute.
       if (percent == 0 || percent == 100) {
         std::cout << "BUFFERING: " << percent << "% from "
                   << GST_MESSAGE_SRC_NAME(message) << std::endl;
       }
-      // Never pause for live streams — the pipeline keeps playing through
-      // low-buffer events; the 512KB cushion absorbs normal jitter.
-      break;
-    }
-      
-    case GST_MESSAGE_ELEMENT: {
-      const GstStructure *s = gst_message_get_structure(message);
-      const gchar *name = gst_structure_get_name(s);
-      std::cout << "ELEMENT MESSAGE: " << name << " from " 
-                << GST_MESSAGE_SRC_NAME(message) << std::endl;
       break;
     }
     case GST_MESSAGE_WARNING: {
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
-      g_printerr("WARNING from element %s: %s\n", GST_OBJECT_NAME(message->src),
+      g_printerr("WARNING from %s: %s\n", GST_OBJECT_NAME(message->src),
                  error->message);
-      g_printerr("Warning details: %s\n", debug);
       g_free(debug);
       g_error_free(error);
       break;
@@ -1084,9 +692,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_error(message, &error, &debug);
-      g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(message->src),
+      g_printerr("ERROR from %s: %s\n", GST_OBJECT_NAME(message->src),
                  error->message);
-      g_printerr("Error details: %s\n", debug);
       g_free(debug);
       g_error_free(error);
       break;
@@ -1094,10 +701,5 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
     default:
       break;
   }
-
-  // Return GST_BUS_PASS so the message is still posted to the default
-  // bus handlers/watchers. Previously returning GST_BUS_DROP prevented
-  // other consumers (like timed_pop_filtered in Preroll) from ever
-  // seeing STATE_CHANGED messages.
-  return GST_BUS_PASS;
+  return GST_BUS_DROP;
 }

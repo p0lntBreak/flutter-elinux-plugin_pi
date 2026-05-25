@@ -14,6 +14,9 @@
 #include <gst/video/video.h>
 #endif  // USE_EGL_IMAGE_DMABUF
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -94,9 +97,17 @@ class GstVideoPlayer {
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;
-  
-  // ADD THIS MEMBER VARIABLE
-  //AuthHeaders auth_headers_;
+
+  // First-frame synchronisation: Init() advances to PLAYING then waits here
+  // until HandoffHandler delivers the first decoded frame so that video
+  // dimensions are known before OnNotifyInitialized() is called.
+  std::atomic<bool> first_frame_ready_{false};
+  std::mutex mutex_first_frame_;
+  std::condition_variable first_frame_cv_;
+
+  // Guards against calling OnNotifyInitialized() more than once (Init() and
+  // HandoffHandler can race on the deferred-init path).
+  std::atomic<bool> initialized_{false};
 
 #ifdef USE_EGL_IMAGE_DMABUF
   GstVideoInfo gst_video_info_;
