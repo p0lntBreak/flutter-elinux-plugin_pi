@@ -87,8 +87,8 @@ class GstVideoPlayer {
   GstVideoElements gst_;
   std::string uri_;
   std::unique_ptr<uint32_t[]> pixels_;
-  int32_t width_;
-  int32_t height_;
+  int32_t width_ = 0;
+  int32_t height_ = 0;
   double volume_ = 1.0;
   double playback_rate_ = 1.0;
   bool mute_ = false;
@@ -97,6 +97,9 @@ class GstVideoPlayer {
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;
+  int last_buffering_percent_ = -1;
+  std::chrono::steady_clock::time_point buffering_log_start_time_ =
+      std::chrono::steady_clock::now();
 
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video

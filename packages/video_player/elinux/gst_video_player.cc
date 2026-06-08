@@ -466,11 +466,11 @@ bool GstVideoPlayer::CreatePipeline() {
   flags &= ~GST_PLAY_FLAG_TEXT;
   g_object_set(gst_.playbin, "flags", flags, NULL);
 
-  // 5 MB / 8 s matches mpv's --demuxer-max-bytes=30MiB / --demuxer-readahead-secs=5
-  // and is large enough to absorb a missed HLS segment fetch without stalling.
+  // The origin emits 10 s HLS segments, so keep roughly three segments of
+  // time-depth. This gives the player enough cushion for a late segment fetch.
   g_object_set(gst_.playbin,
-               "buffer-size",     (gint)5242880,         // 5 MB
-               "buffer-duration", (gint64)8000000000LL,  // 8 s
+               "buffer-size",     (gint)10485760,         // 10 MiB
+               "buffer-duration", (gint64)30000000000LL,  // 30 s
                "connection-speed", (guint64)5000,
                NULL);
 
@@ -670,10 +670,25 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       break;
     }
     case GST_MESSAGE_BUFFERING: {
+      auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       gint percent;
       gst_message_parse_buffering(message, &percent);
-      if (percent == 0 || percent == 100) {
-        std::cout << "BUFFERING: " << percent << "% from "
+
+      if (percent != self->last_buffering_percent_) {
+        self->last_buffering_percent_ = percent;
+
+        gint64 position = 0;
+        const bool has_position = gst_element_query_position(
+            self->gst_.pipeline, GST_FORMAT_TIME, &position);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - self->buffering_log_start_time_);
+
+        std::cout << "BUFFERING: " << percent << "% elapsed="
+                  << elapsed.count() << "s";
+        if (has_position) {
+          std::cout << " pos=" << (position / GST_SECOND) << "s";
+        }
+        std::cout << " cache-target=30s/10MiB from "
                   << GST_MESSAGE_SRC_NAME(message) << std::endl;
       }
       break;

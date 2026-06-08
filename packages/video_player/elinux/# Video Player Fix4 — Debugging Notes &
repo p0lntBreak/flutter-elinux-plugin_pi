@@ -1,0 +1,189 @@
+# Video Player Fix4 — Debugging Notes & Resolution
+
+**Date:** 2026-05-25
+**Branch:** `fix4` (commit `a1fad39`)
+**Status:** Smooth playback confirmed on Raspberry Pi 4 (eLinux)
+
+---
+
+## Problem Statement
+
+Live HLS playback on a Raspberry Pi 4 running Flutter eLinux was producing:
+- Choppy / freeze-then-jump video
+- Audio/video desync
+- (Previously) blank video output after switching to hardware decode
+
+The app is a Flutter-based live TV STB (soatv) consuming HLS streams.
+
+---
+
+## Branches Timeline
+
+| Branch | What changed | Outcome |
+|--------|-------------|---------|
+| upstream Sony | Software decode, `autoaudiosink`, `sync=TRUE` | No audio (Buildroot), no video (software decode too slow) |
+| fix3.1 | Added `curlhttpsrc` rank boost | HTTPS streams work |
+| fix3.2 | Added explicit `alsasink` audio bin | Audio works on Buildroot |
+| fix3.3 | Added `v4l2h264dec` rank boost, `sync=FALSE` | Hardware decode works, but sync=FALSE introduced |
+| fix3.4 | HDMI auto-detection, HTTP auth headers | Working baseline, but choppy + A/V desync |
+| feature/egl-dmabuf | EGL DMABuf zero-copy attempt | v4l2convert can't output DMABuf RGBA on this system; deleted |
+| **fix4** | `sync=TRUE` + deferred init via condition variable | **Smooth playback, A/V sync correct** |
+
+---
+
+## Root Cause Analysis
+
+### 1. A/V Desync — sync=FALSE on fakesink
+
+`sync=FALSE` was introduced in the very first fork commit (`930b480`) alongside the `curlhttpsrc` fix. It was **not needed** — it was an accidental change that stuck because no one noticed the desync immediately.
+
+With `sync=FALSE`: fakesink delivers video frames as fast as the decoder produces them, with no clock pacing. Audio runs on the GStreamer pipeline clock. Result: video races ahead or lags behind audio depending on decoder throughput.
+
+With `sync=TRUE`: fakesink paces each frame to the GStreamer clock timestamp, keeping A/V in sync.
+
+### 2. Why sync=TRUE Previously Caused No Video
+
+Two compounding factors:
+
+**Factor A — V4L2 M2M hardware decoder only decodes in PLAYING state.**
+`v4l2h264dec` is an M2M (memory-to-memory) kernel driver. It will not submit decode jobs when the pipeline is in PAUSED state. The element returns `GST_STATE_CHANGE_NO_PREROLL` or refuses to produce output buffers until PLAYING.
+
+**Factor B — Live HLS never prerolls.**
+`hlsdemux` marks itself as a live source because the manifest has no `EXT-X-ENDLIST`. This means `playbin` returns `GST_STATE_CHANGE_NO_PREROLL` when transitioning to PAUSED — sinks never receive a preroll buffer.
+
+**Combined effect:** The old code called `GetVideoSize()` during PAUSED state (inside `Preroll()`). With a live HLS source, the fakesink's sink pad had no current caps in PAUSED (no frame had been delivered). `GetVideoSize()` returned 0×0. Flutter then created a 0×0 texture → blank video output. When `sync=FALSE` was set, this was masked because fakesink didn't participate in preroll (async=FALSE was also set in some variants), and frames came through anyway — just unsynchronised.
+
+### 3. Choppy Video — Buffer Too Small
+
+The original 512 KB / 1.5 s buffer in `playbin` was smaller than a single HLS segment at 1.5 Mbps (≈ 750 KB). When the network was momentarily slow fetching a segment, the buffer drained and the pipeline stalled. mpv uses `--demuxer-max-bytes=30MiB --demuxer-readahead-secs=5` — 60× more buffer. Fix4 uses 5 MB / 8 s.
+
+### 4. EGL DMABuf Zero-Copy — Why It Failed
+
+The CPU pixel copy in `GetFrameBuffer()` (`gst_buffer_extract` copying ~3.7 MB/frame at 720p25) is still the ultimate performance ceiling. An EGL DMABuf zero-copy path was attempted on the `feature/egl-dmabuf` branch but:
+
+- `v4l2convert` on this Buildroot system cannot negotiate `video/x-raw(memory:DMABuf),format=RGBA` output — it can only produce system-memory RGBA.
+- The GL pipeline approach (`glupload → glcolorconvert → gldownload`) does not reliably export DMABuf on Pi's VideoCore VI GPU.
+- **Critical bug discovered:** `gst_element_link_filtered` was used to probe DMABuf capability. This inserts a real `GstCapsFilter` element into the parent bin. If the link returns FALSE, cleanup is unreliable on the Pi's GStreamer build — the capsfilter may remain in the bin, silently dropping all video frames while audio continues. **Never use `gst_element_link_filtered` as a capability probe.**
+
+Branch deleted. Correct approach for a future attempt: use `gst_element_factory_get_static_pad_templates` + `gst_caps_can_intersect` to probe DMABuf support non-destructively before building the pipeline.
+
+---
+
+## fix4 Solution
+
+### Core idea: Deferred initialization via condition variable
+
+Since the V4L2 hardware decoder only produces frames in PLAYING state, and live HLS prevents preroll from delivering frames in PAUSED state, `Init()` must advance the pipeline to PLAYING before it can know the video dimensions. A `std::condition_variable` synchronises the platform thread (running `Init()`) with the GStreamer streaming thread (running `HandoffHandler`).
+
+### Init() flow
+
+```
+Init()
+  → Preroll()          [set PAUSED, wait up to 5 s for state to settle]
+  → set PLAYING        [V4L2 M2M decoder starts producing frames]
+  → wait_for(5s, first_frame_ready_)
+       |
+       |  HandoffHandler (GStreamer streaming thread):
+       |    update width/height/pixels inside mutex_buffer_
+       |    first_frame_ready_.exchange(true) → notify_all()
+       |    initialized_.exchange(true) → OnNotifyInitialized() [if Init timed out]
+       |
+  → first_frame_ready_.load() && !initialized_.exchange(true)
+  → OnNotifyInitialized() + OnNotifyPlaying(true)   [platform thread, normal case]
+```
+
+### Key design decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| `sync=TRUE, qos=FALSE` on fakesink | Clock-paced video = A/V sync. `qos=FALSE` suppresses quality-of-service frame drops. |
+| No `async=FALSE` on fakesink | `async=TRUE` (default) means fakesink participates in preroll and the pipeline won't report PAUSED-complete until fakesink is ready — this is what we want. |
+| `initialized_` is `std::atomic<bool>` | Guards `OnNotifyInitialized()` from being called twice in the race between Init() (platform thread) and HandoffHandler (streaming thread). `exchange(true)` returns the old value; only the first caller (old value = false) calls OnNotifyInitialized(). |
+| `first_frame_ready_` is separate from `initialized_` | Lets Init() distinguish "frame arrived, I should do init" from "frame didn't arrive in 5s, HandoffHandler will do init later" without needing an extra lock. |
+| width/height/pixels updated inside `mutex_buffer_` in HandoffHandler | `GetFrameBuffer()` holds a shared lock on `mutex_buffer_` — write lock in HandoffHandler ensures no torn read of the pixel buffer pointer. |
+| `Preroll()` uses `gst_element_get_state(5s)` not bus poll loop | Simpler; `GST_STATE_CHANGE_NO_PREROLL` from live source is not an error. Bus poll loop required `GST_BUS_PASS` which conflicted with the sync handler. |
+| `HandleGstMessage` returns `GST_BUS_DROP` | Sync handler — messages are consumed here and do not need to reach the async bus queue. |
+| Buffer: 5 MB / 8 s | Large enough for ≥6 HLS segments at 1.5 Mbps; absorbs segment fetch jitter without stalling. |
+
+---
+
+## Pipeline Architecture (fix4)
+
+```
+playbin (uri=..., flags=VIDEO|AUDIO|NATIVE_VIDEO|BUFFERING, buffer-size=5MB, buffer-duration=8s)
+  |
+  +-- video-sink = output (GstBin)
+  |     queue → v4l2convert → [video/x-raw,format=RGBA] → fakesink(sync=TRUE,qos=FALSE)
+  |                                                          ↑ HandoffHandler
+  |
+  +-- audio-sink = audio_bin (GstBin)
+        audioconvert → audioresample → alsasink(device=PickAudioDevice())
+```
+
+### Element rank overrides (applied in CreatePipeline)
+
+| Element | Action | Reason |
+|---------|--------|--------|
+| `curlhttpsrc` | `GST_RANK_PRIMARY + 300` | Handles HTTPS/TLS correctly; `souphttpsrc` had SSL failures |
+| `souphttpsrc` | `GST_RANK_NONE` | Disabled to prevent selection |
+| `v4l2h264dec` | `GST_RANK_PRIMARY + 300` | Hardware H.264 decode (V4L2 M2M); software decode was too slow on Pi |
+
+### Changes from upstream Sony that are preserved
+
+1. **`curlhttpsrc` boost / `souphttpsrc` disabled** — HTTPS HLS streams
+2. **`v4l2h264dec` rank boost** — hardware H.264 decode
+3. **Explicit `alsasink` audio bin** — Buildroot does not include `autoaudiosink`
+4. **HDMI auto-detection** (`PickAudioDevice`) — reads `/sys/class/drm/card*-HDMI-A-N/status`, maps to ALSA card via `/proc/asound/cardN/id`; falls back to `plughw:0,0` (3.5mm jack)
+5. **HTTP auth headers** — applied via `source-setup` signal on `curlhttpsrc` using `extra-headers` GstStructure
+
+---
+
+## Files Changed
+
+### `packages/video_player/elinux/gst_video_player.h`
+
+Added includes:
+```cpp
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+```
+
+Added members:
+```cpp
+std::atomic<bool> first_frame_ready_{false};
+std::mutex mutex_first_frame_;
+std::condition_variable first_frame_cv_;
+std::atomic<bool> initialized_{false};
+```
+
+### `packages/video_player/elinux/gst_video_player.cc`
+
+Net change: **−548 / +161 lines** (large reduction from removing cruft).
+
+Key rewrites:
+- `Init()` — starts PLAYING, waits on condition variable
+- `HandoffHandler()` — signals CV, contains deferred-init path
+- `Preroll()` — 3-line upstream simple version (was 80-line bus-poll loop)
+- `HandleGstMessage()` — returns `GST_BUS_DROP` (was `GST_BUS_PASS`)
+- `DestroyPipeline()` — removed flush events and `g_usleep`
+- `CreatePipeline()` — `sync=TRUE`, 5 MB/8 s buffer, `GST_PLAY_FLAG_BUFFERING`
+
+Removed:
+- Live/VOD URI heuristic in `GetCurrentPosition()` and `CreatePipeline()`
+- `hlsdemux` rank boost (not needed; `curlhttpsrc` handles manifest + segments)
+- Queue size limits
+- All `TEMPORARY TEST` auto-play code
+- Verbose debug `std::cout` in hot paths
+
+---
+
+## Outstanding Limitation
+
+**CPU pixel copy** — `GetFrameBuffer()` still calls `gst_buffer_extract()` which copies ~3.7 MB per frame (~92 MB/s at 720p25) on the Flutter platform thread. Playback is now smooth, but this is the next performance ceiling. Resolving it requires zero-copy DMABuf texture upload.
+
+**Future DMABuf approach (not yet working):**
+- Probe capability non-destructively: `gst_element_factory_get_static_pad_templates` + `gst_caps_can_intersect` on `v4l2convert`'s src pad templates.
+- If supported, build a manual pipeline (not `playbin`/`decodebin`) that negotiates `video/x-raw(memory:DMABuf),format=RGBA` from `v4l2h264dec → v4l2convert → fakesink`.
+- Use `EGLImageTexture` instead of `PixelBufferTexture` in the plugin.
+- **Never** use `gst_element_link_filtered` as a probe — it inserts a real capsfilter into the bin, and cleanup on failure is unreliable on this GStreamer build.
