@@ -408,6 +408,15 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to create video queue" << std::endl;
     return false;
   }
+  // Limit the queue size to prevent buffer accumulation after the hardware decoder,
+  // which otherwise exhausts the Raspberry Pi's CMA (Contiguous Memory Allocator)
+  // and floods the kernel with 'swiotlb buffer is full' errors.
+  g_object_set(G_OBJECT(video_queue),
+               "max-size-buffers", (guint)5,
+               "max-size-bytes",   (guint)0,
+               "max-size-time",    (guint64)0,
+               NULL);
+
 
   gst_.output = gst_bin_new("output");
   if (!gst_.output) {
