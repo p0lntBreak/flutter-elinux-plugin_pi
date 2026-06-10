@@ -108,6 +108,7 @@ class GstVideoPlayer {
   // while below 100% for longer than kWatchdogStallTimeoutSecs.
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_running_{false};
+  std::atomic<bool> error_notified_{false};  // single-fire guard for OnNotifyError
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
   std::mutex watchdog_mutex_;

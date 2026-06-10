@@ -327,34 +327,31 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
   std::cout << "SOURCE-SETUP: element=" << type_name << std::endl;
 
   if (g_strcmp0(type_name, "GstCurlHttpSrc") == 0) {
-    // timeout   = CURLOPT_TIMEOUT: total transfer time per segment request.
-    //             Prevents a hung body read from stalling forever.
-    // connect-timeout = CURLOPT_CONNECTTIMEOUT: TCP handshake timeout.
-    g_object_set(source,
-                 "timeout",         (gint)30,
-                 "connect-timeout", (gint)10,
-                 "compress",        TRUE,
-                 "keep-alive",      TRUE,
-                 NULL);
-
-    // low-speed-limit / low-speed-time: abort if transfer rate stays below
-    // 200 bytes/s for 15 s (catches partial-body hangs CURLOPT_TIMEOUT misses).
     GObjectClass* klass = G_OBJECT_GET_CLASS(source);
-    if (g_object_class_find_property(klass, "low-speed-time")) {
-      g_object_set(source,
-                   "low-speed-time",  (gint)15,
-                   "low-speed-limit", (glong)200,
-                   NULL);
-      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed: <200B/s for 15s = abort" << std::endl;
+
+    // timeout = CURLOPT_TIMEOUT: total transfer time per segment request.
+    g_object_set(source, "timeout", (gint)30, "compress", TRUE, "keep-alive", TRUE, NULL);
+
+    // connect-timeout = CURLOPT_CONNECTTIMEOUT: not present in all GStreamer builds.
+    if (g_object_class_find_property(klass, "connect-timeout")) {
+      g_object_set(source, "connect-timeout", (gint)10, NULL);
+      std::cout << "SOURCE-SETUP: curlhttpsrc connect-timeout=10s" << std::endl;
     } else {
-      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed properties unavailable (old version)" << std::endl;
+      std::cout << "SOURCE-SETUP: curlhttpsrc connect-timeout unavailable (old version)" << std::endl;
     }
 
-    // Log the effective timeout values we just set.
-    gint t = 0, ct = 0;
-    g_object_get(source, "timeout", &t, "connect-timeout", &ct, NULL);
-    std::cout << "SOURCE-SETUP: curlhttpsrc timeout=" << t
-              << "s connect-timeout=" << ct << "s" << std::endl;
+    // low-speed-limit / low-speed-time: abort if rate stays below 200 B/s for
+    // 15 s — catches partial-body hangs that CURLOPT_TIMEOUT alone misses.
+    if (g_object_class_find_property(klass, "low-speed-time")) {
+      g_object_set(source, "low-speed-time", (gint)15, "low-speed-limit", (glong)200, NULL);
+      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed: <200B/s for 15s = abort" << std::endl;
+    } else {
+      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed unavailable (old version)" << std::endl;
+    }
+
+    gint t = 0;
+    g_object_get(source, "timeout", &t, NULL);
+    std::cout << "SOURCE-SETUP: curlhttpsrc timeout=" << t << "s" << std::endl;
 
     if (!self->auth_headers_.all_headers.empty()) {
       GstStructure* headers = gst_structure_new_empty("extra-headers");
@@ -722,17 +719,23 @@ void GstVideoPlayer::StartWatchdog() {
       auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
           now - progress_snap).count();
 
-      std::cout << "WATCHDOG: buffer=" << pct << "% no-progress-for="
-                << stalled_secs << "s" << std::endl;
+      // Only log when genuinely stalled — suppress the noise from notify_one()
+      // wakeups during normal buffer fill (stalled_secs == 0 in that case).
+      if (stalled_secs > 0) {
+        std::cout << "WATCHDOG: buffer=" << pct << "% no-progress-for="
+                  << stalled_secs << "s" << std::endl;
+      }
 
       if (stalled_secs >= kStallTimeoutSecs) {
         std::string msg = "Network stall: buffer stuck at " +
                           std::to_string(pct) + "% for " +
                           std::to_string(stalled_secs) + "s";
         std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init" << std::endl;
-        // Disarm before calling back so a re-created player starts fresh.
         watchdog_running_.store(false);
-        stream_handler_->OnNotifyError(msg);
+        bool expected = false;
+        if (error_notified_.compare_exchange_strong(expected, true)) {
+          stream_handler_->OnNotifyError(msg);
+        }
         break;
       }
     }
@@ -842,11 +845,14 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       std::cout << std::endl;
       g_free(debug);
       g_error_free(error);
-      // Stop the watchdog (it would otherwise fire again after re-init).
+      // Stop the watchdog then fire OnNotifyError exactly once, even if the
+      // watchdog and GST_MESSAGE_ERROR race at the same 30s boundary.
       self->watchdog_running_.store(false);
       self->watchdog_cv_.notify_all();
-      // Notify Flutter so it can re-authenticate and re-initialize the player.
-      self->stream_handler_->OnNotifyError(error_msg);
+      bool expected = false;
+      if (self->error_notified_.compare_exchange_strong(expected, true)) {
+        self->stream_handler_->OnNotifyError(error_msg);
+      }
       break;
     }
     default:
