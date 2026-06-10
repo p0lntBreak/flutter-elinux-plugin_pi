@@ -667,7 +667,7 @@ void VideoPlayerPlugin::SendErrorEventMessage(int64_t texture_id,
       !players_[texture_id]->event_sink) {
     return;
   }
-  players_[texture_id]->event_sink->Error("VideoError", message, nullptr);
+  players_[texture_id]->event_sink->Error("VideoError", message);
 }
 
 void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {

@@ -36,27 +36,27 @@ class VideoPlayerStreamHandlerImpl : public VideoPlayerStreamHandler {
 
  protected:
   // |VideoPlayerStreamHandler|
-  void OnNotifyInitializedInternal() {
+  void OnNotifyInitializedInternal() override {
     if (on_notify_initialized_) {
       on_notify_initialized_();
     }
   }
 
   // |VideoPlayerStreamHandler|
-  void OnNotifyFrameDecodedInternal() {
+  void OnNotifyFrameDecodedInternal() override {
     if (on_notify_frame_decoded_) {
       on_notify_frame_decoded_();
     }
   }
 
   // |VideoPlayerStreamHandler|
-  void OnNotifyCompletedInternal() {
+  void OnNotifyCompletedInternal() override {
     if (on_notify_completed_) {
       on_notify_completed_();
     }
   }
 
-  void OnNotifyPlayingInternal(bool is_playing) {
+  void OnNotifyPlayingInternal(bool is_playing) override {
     if (on_notify_playing_) {
       on_notify_playing_(is_playing);
     }
