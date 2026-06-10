@@ -123,6 +123,7 @@ class VideoPlayerPlugin : public flutter::Plugin {
   void SendInitializedEventMessage(int64_t texture_id);
   void SendPlayCompletedEventMessage(int64_t texture_id);
   void SendIsPlayingStateUpdate(int64_t texture_id, bool is_playing);
+  void SendErrorEventMessage(int64_t texture_id, const std::string& message);
 
   void DisposePlayer(int64_t texture_id);
 
@@ -377,8 +378,13 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         [texture_id, host = this]() {
           host->SendPlayCompletedEventMessage(texture_id);
         },
+        // OnNotifyPlaying
         [texture_id, host = this](bool is_playing) {
           host->SendIsPlayingStateUpdate(texture_id, is_playing);
+        },
+        // OnNotifyError
+        [texture_id, host = this](const std::string& message) {
+          host->SendErrorEventMessage(texture_id, message);
         });
 
       
@@ -653,6 +659,15 @@ void VideoPlayerPlugin::SendIsPlayingStateUpdate(int64_t texture_id,
        flutter::EncodableValue(is_playing)}};
   flutter::EncodableValue event(encodables);
   players_[texture_id]->event_sink->Success(event);
+}
+
+void VideoPlayerPlugin::SendErrorEventMessage(int64_t texture_id,
+                                              const std::string& message) {
+  if (players_.find(texture_id) == players_.end() ||
+      !players_[texture_id]->event_sink) {
+    return;
+  }
+  players_[texture_id]->event_sink->Error("VideoError", message, nullptr);
 }
 
 void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {

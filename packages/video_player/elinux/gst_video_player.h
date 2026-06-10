@@ -22,6 +22,7 @@
 #include <shared_mutex>
 #include <string>
 #include <map>
+#include <thread>
 
 struct AuthHeaders {
   std::map<std::string, std::string> all_headers;  // Store ALL headers as a map
@@ -80,6 +81,8 @@ class GstVideoPlayer {
   void DestroyPipeline();
   bool Preroll();
   void GetVideoSize(int32_t& width, int32_t& height);
+  void StartWatchdog();
+  void StopWatchdog();
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -97,9 +100,18 @@ class GstVideoPlayer {
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;
-  int last_buffering_percent_ = -1;
+  std::atomic<int> last_buffering_percent_{-1};
   std::chrono::steady_clock::time_point buffering_log_start_time_ =
       std::chrono::steady_clock::now();
+
+  // Stall watchdog: fires OnNotifyError if buffer stops making progress
+  // while below 100% for longer than kWatchdogStallTimeoutSecs.
+  std::thread watchdog_thread_;
+  std::atomic<bool> watchdog_running_{false};
+  std::chrono::steady_clock::time_point last_buffering_progress_time_ =
+      std::chrono::steady_clock::now();
+  std::mutex watchdog_mutex_;
+  std::condition_variable watchdog_cv_;
 
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video

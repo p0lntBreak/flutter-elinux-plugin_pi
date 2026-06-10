@@ -81,6 +81,7 @@ bool GstVideoPlayer::Init() {
     stream_handler_->OnNotifyPlaying(true);
   }
 
+  StartWatchdog();
   return true;
 }
 
@@ -322,13 +323,39 @@ static std::string PickAudioDevice() {
 static void SourceSetupCallback(GstElement* playbin, GstElement* source,
                                 gpointer user_data) {
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  const char* type_name = G_OBJECT_TYPE_NAME(source);
+  std::cout << "SOURCE-SETUP: element=" << type_name << std::endl;
 
-  if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstCurlHttpSrc") == 0) {
+  if (g_strcmp0(type_name, "GstCurlHttpSrc") == 0) {
+    // timeout   = CURLOPT_TIMEOUT: total transfer time per segment request.
+    //             Prevents a hung body read from stalling forever.
+    // connect-timeout = CURLOPT_CONNECTTIMEOUT: TCP handshake timeout.
     g_object_set(source,
-                 "timeout",    30,
-                 "compress",   TRUE,
-                 "keep-alive", TRUE,
+                 "timeout",         (gint)30,
+                 "connect-timeout", (gint)10,
+                 "compress",        TRUE,
+                 "keep-alive",      TRUE,
                  NULL);
+
+    // low-speed-limit / low-speed-time: abort if transfer rate stays below
+    // 200 bytes/s for 15 s (catches partial-body hangs CURLOPT_TIMEOUT misses).
+    GObjectClass* klass = G_OBJECT_GET_CLASS(source);
+    if (g_object_class_find_property(klass, "low-speed-time")) {
+      g_object_set(source,
+                   "low-speed-time",  (gint)15,
+                   "low-speed-limit", (glong)200,
+                   NULL);
+      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed: <200B/s for 15s = abort" << std::endl;
+    } else {
+      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed properties unavailable (old version)" << std::endl;
+    }
+
+    // Log the effective timeout values we just set.
+    gint t = 0, ct = 0;
+    g_object_get(source, "timeout", &t, "connect-timeout", &ct, NULL);
+    std::cout << "SOURCE-SETUP: curlhttpsrc timeout=" << t
+              << "s connect-timeout=" << ct << "s" << std::endl;
+
     if (!self->auth_headers_.all_headers.empty()) {
       GstStructure* headers = gst_structure_new_empty("extra-headers");
       for (const auto& [key, value] : self->auth_headers_.all_headers) {
@@ -338,7 +365,7 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
       g_object_set(source, "extra-headers", headers, NULL);
       gst_structure_free(headers);
     }
-  } else if (g_strcmp0(G_OBJECT_TYPE_NAME(source), "GstSoupHTTPSrc") == 0) {
+  } else if (g_strcmp0(type_name, "GstSoupHTTPSrc") == 0) {
     std::cerr << "WARNING: souphttpsrc selected despite rank override" << std::endl;
   }
 }
@@ -533,6 +560,8 @@ bool GstVideoPlayer::Preroll() {
 }
 
 void GstVideoPlayer::DestroyPipeline() {
+  StopWatchdog();
+
   if (gst_.video_sink) {
     g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
   }
@@ -667,6 +696,57 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   self->stream_handler_->OnNotifyFrameDecoded();
 }
 
+void GstVideoPlayer::StartWatchdog() {
+  if (watchdog_running_.exchange(true)) return; // already running
+  {
+    std::lock_guard<std::mutex> lock(watchdog_mutex_);
+    last_buffering_progress_time_ = std::chrono::steady_clock::now();
+  }
+  watchdog_thread_ = std::thread([this]() {
+    constexpr auto kCheckInterval = std::chrono::seconds(10);
+    constexpr int kStallTimeoutSecs = 30;
+
+    while (true) {
+      std::chrono::steady_clock::time_point progress_snap;
+      {
+        std::unique_lock<std::mutex> lock(watchdog_mutex_);
+        watchdog_cv_.wait_for(lock, kCheckInterval);
+        if (!watchdog_running_.load()) break;
+        progress_snap = last_buffering_progress_time_;
+      }
+
+      int pct = last_buffering_percent_.load();
+      if (pct < 0 || pct >= 100) continue; // not currently buffering
+
+      auto now = std::chrono::steady_clock::now();
+      auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
+          now - progress_snap).count();
+
+      std::cout << "WATCHDOG: buffer=" << pct << "% no-progress-for="
+                << stalled_secs << "s" << std::endl;
+
+      if (stalled_secs >= kStallTimeoutSecs) {
+        std::string msg = "Network stall: buffer stuck at " +
+                          std::to_string(pct) + "% for " +
+                          std::to_string(stalled_secs) + "s";
+        std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init" << std::endl;
+        // Disarm before calling back so a re-created player starts fresh.
+        watchdog_running_.store(false);
+        stream_handler_->OnNotifyError(msg);
+        break;
+      }
+    }
+  });
+}
+
+void GstVideoPlayer::StopWatchdog() {
+  watchdog_running_.store(false);
+  watchdog_cv_.notify_all();
+  if (watchdog_thread_.joinable()) {
+    watchdog_thread_.join();
+  }
+}
+
 // static
 GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                                                  GstMessage* message,
@@ -683,8 +763,15 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       gint percent;
       gst_message_parse_buffering(message, &percent);
 
-      if (percent != self->last_buffering_percent_) {
-        self->last_buffering_percent_ = percent;
+      if (percent != self->last_buffering_percent_.load()) {
+        self->last_buffering_percent_.store(percent);
+
+        // Reset watchdog stall timer on any percent change (= buffer progress).
+        {
+          std::lock_guard<std::mutex> lock(self->watchdog_mutex_);
+          self->last_buffering_progress_time_ = std::chrono::steady_clock::now();
+        }
+        self->watchdog_cv_.notify_one();
 
         gint64 position = 0;
         const bool has_position = gst_element_query_position(
@@ -692,13 +779,42 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - self->buffering_log_start_time_);
 
+        // Extended buffering stats: download rate and ETA (mpv-style).
+        GstBufferingMode mode;
+        gint avg_in_bps, avg_out_bps;
+        gint64 buffering_left_ms;
+        gst_message_parse_buffering_stats(message, &mode, &avg_in_bps,
+                                          &avg_out_bps, &buffering_left_ms);
+
         std::cout << "BUFFERING: " << percent << "% elapsed="
                   << elapsed.count() << "s";
         if (has_position) {
           std::cout << " pos=" << (position / GST_SECOND) << "s";
         }
+        if (avg_in_bps > 0) {
+          std::cout << " dl=" << (avg_in_bps / 1024) << "KB/s";
+        }
+        if (buffering_left_ms > 0) {
+          std::cout << " eta=" << (buffering_left_ms / 1000) << "s";
+        }
         std::cout << " cache-target=30s/10MiB from "
                   << GST_MESSAGE_SRC_NAME(message) << std::endl;
+      }
+      break;
+    }
+    case GST_MESSAGE_STATE_CHANGED: {
+      // Log pipeline-level state transitions only (element noise is too verbose).
+      auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+      if (GST_MESSAGE_SRC(message) == GST_OBJECT(self->gst_.pipeline)) {
+        GstState old_s, new_s, pending;
+        gst_message_parse_state_changed(message, &old_s, &new_s, &pending);
+        std::cout << "PIPELINE-STATE: "
+                  << gst_element_state_get_name(old_s) << " -> "
+                  << gst_element_state_get_name(new_s);
+        if (pending != GST_STATE_VOID_PENDING) {
+          std::cout << " (pending " << gst_element_state_get_name(pending) << ")";
+        }
+        std::cout << std::endl;
       }
       break;
     }
@@ -706,20 +822,31 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
-      g_printerr("WARNING from %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
+      std::cout << "WARNING from " << GST_OBJECT_NAME(message->src)
+                << ": " << (error->message ? error->message : "?");
+      if (debug && debug[0]) std::cout << "\n  debug: " << debug;
+      std::cout << std::endl;
       g_free(debug);
       g_error_free(error);
       break;
     }
     case GST_MESSAGE_ERROR: {
+      auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       gchar* debug;
       GError* error;
       gst_message_parse_error(message, &error, &debug);
-      g_printerr("ERROR from %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
+      std::string error_msg = error->message ? error->message : "unknown error";
+      std::cout << "ERROR from " << GST_OBJECT_NAME(message->src)
+                << ": " << error_msg;
+      if (debug && debug[0]) std::cout << "\n  debug: " << debug;
+      std::cout << std::endl;
       g_free(debug);
       g_error_free(error);
+      // Stop the watchdog (it would otherwise fire again after re-init).
+      self->watchdog_running_.store(false);
+      self->watchdog_cv_.notify_all();
+      // Notify Flutter so it can re-authenticate and re-initialize the player.
+      self->stream_handler_->OnNotifyError(error_msg);
       break;
     }
     default:
