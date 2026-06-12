@@ -34,7 +34,10 @@ GstVideoPlayer::~GstVideoPlayer() {
 #ifdef USE_EGL_IMAGE_DMABUF
   UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
-  Stop();
+  // Do NOT call Stop() here: the PAUSED->READY transition tries to deactivate
+  // the v4l2 buffer pools while gst_.buffer still holds one of their buffers,
+  // orphaning the pool and leaking its CMA memory on every teardown.
+  // DestroyPipeline() releases the held buffer first, then goes to NULL.
   DestroyPipeline();
 }
 
@@ -563,10 +566,25 @@ void GstVideoPlayer::DestroyPipeline() {
     g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
   }
 
+  // Release the held frame BEFORE the NULL transition. The buffer belongs to
+  // v4l2convert's CMA-backed pool; a pool with an outstanding buffer cannot
+  // be deactivated and is orphaned, leaking its V4L2/CMA memory. Repeated
+  // reconnect cycles then exhaust CMA ("Failed to allocate required memory",
+  // "export failed") and every new pipeline renders a blank screen.
+  {
+    std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
+    if (gst_.buffer) {
+      gst_buffer_unref(gst_.buffer);
+      gst_.buffer = nullptr;
+    }
+  }
+
   if (gst_.pipeline) {
     gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
   }
 
+  // A handoff in flight between disabling signal-handoffs and the NULL
+  // transition may have stored one more frame — release it as well.
   {
     std::lock_guard<std::shared_mutex> lock(mutex_buffer_);
     if (gst_.buffer) {

@@ -459,6 +459,9 @@ void VideoPlayerPlugin::HandlePauseMethodCall(
   flutter::EncodableMap result;
 
   if (players_.find(texture_id) != players_.end()) {
+    // Diagnostic: a pipeline stuck in PAUSED traces back to whoever sent this.
+    std::cout << "PAUSE method call from Dart for texture " << texture_id
+              << std::endl;
     players_[texture_id]->player->Pause();
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
