@@ -6,6 +6,8 @@
 
 #include <glob.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -85,6 +87,7 @@ bool GstVideoPlayer::Init() {
   }
 
   StartWatchdog();
+  StartAbrEngine();
   return true;
 }
 
@@ -413,6 +416,11 @@ bool GstVideoPlayer::CreatePipeline() {
 
   g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
 
+  // ABR engine: catch hlsdemux as soon as decodebin creates it so the
+  // throughput probe and connection-speed steering can attach to it.
+  g_signal_connect(gst_.pipeline, "deep-element-added",
+                   G_CALLBACK(DeepElementAddedHandler), this);
+
   // Video converter: prefer v4l2convert (hardware-accelerated) with RGBA output,
   // fall back to software videoconvert if unavailable.
   gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
@@ -561,6 +569,7 @@ bool GstVideoPlayer::Preroll() {
 
 void GstVideoPlayer::DestroyPipeline() {
   StopWatchdog();
+  StopAbrEngine();
 
   if (gst_.video_sink) {
     g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
@@ -607,6 +616,14 @@ void GstVideoPlayer::DestroyPipeline() {
   gst_.output = nullptr;
   gst_.video_sink = nullptr;
   gst_.video_convert = nullptr;
+
+  {
+    std::lock_guard<std::mutex> lock(abr_mutex_);
+    if (hls_demux_) {
+      gst_object_unref(hls_demux_);
+      hls_demux_ = nullptr;
+    }
+  }
 }
 
 std::string GstVideoPlayer::ParseUri(const std::string& uri) {
@@ -766,6 +783,229 @@ void GstVideoPlayer::StopWatchdog() {
   if (watchdog_thread_.joinable()) {
     watchdog_thread_.join();
   }
+}
+
+// ============================================================
+// ABR engine — Continuous Playback Intelligence
+//
+// Measurement : pad probe on hlsdemux sink counts segment-download bursts
+//               (bytes / active transfer time = true network throughput)
+// Prediction  : min(fast mean, harmonic mean) with a jitter discount
+// Policy      : buffer-health safety zones; down-switch immediately,
+//               up-switch only with headroom + dwell time (anti-flap)
+// Actuation   : hlsdemux "connection-speed" (kbps) — the demuxer picks the
+//               best rendition under that figure at each segment boundary,
+//               so switches never interrupt playback
+// ============================================================
+
+namespace {
+// connection-speed is guint (kbps) on adaptivedemux-based hlsdemux but
+// guint64 on playbin — set it through GValue so the type always matches.
+void SetConnectionSpeedKbps(GstElement* element, guint64 kbps) {
+  GParamSpec* pspec = g_object_class_find_property(
+      G_OBJECT_GET_CLASS(element), "connection-speed");
+  if (!pspec) return;
+  GValue v = G_VALUE_INIT;
+  g_value_init(&v, pspec->value_type);
+  if (pspec->value_type == G_TYPE_UINT) {
+    g_value_set_uint(&v, static_cast<guint>(kbps));
+  } else if (pspec->value_type == G_TYPE_UINT64) {
+    g_value_set_uint64(&v, kbps);
+  } else {
+    g_value_unset(&v);
+    return;
+  }
+  g_object_set_property(G_OBJECT(element), "connection-speed", &v);
+  g_value_unset(&v);
+}
+}  // namespace
+
+// static
+void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
+                                             GstBin* /*sub_bin*/,
+                                             GstElement* element,
+                                             gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  gchar* name = gst_element_get_name(element);
+  if (name && g_str_has_prefix(name, "hlsdemux")) {
+    {
+      std::lock_guard<std::mutex> lock(self->abr_mutex_);
+      if (self->hls_demux_) gst_object_unref(self->hls_demux_);
+      self->hls_demux_ = GST_ELEMENT(gst_object_ref(element));
+    }
+    GstPad* sinkpad = gst_element_get_static_pad(element, "sink");
+    if (sinkpad) {
+      gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_BUFFER,
+                        AbrThroughputProbe, self, NULL);
+      gst_object_unref(sinkpad);
+    }
+    std::cout << "ABR: attached throughput probe to " << name << std::endl;
+  }
+  g_free(name);
+}
+
+// static
+GstPadProbeReturn GstVideoPlayer::AbrThroughputProbe(GstPad* /*pad*/,
+                                                     GstPadProbeInfo* info,
+                                                     gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buf) return GST_PAD_PROBE_OK;
+
+  const gsize size = gst_buffer_get_size(buf);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::lock_guard<std::mutex> lock(self->abr_mutex_);
+  // An idle gap separates one segment download from the next.
+  if (self->burst_bytes_ > 0 &&
+      now - self->burst_last_rx_ > std::chrono::milliseconds(250)) {
+    self->CloseBurstLocked();
+  }
+  if (self->burst_bytes_ == 0) self->burst_start_ = now;
+  self->burst_bytes_ += size;
+  self->burst_last_rx_ = now;
+  return GST_PAD_PROBE_OK;
+}
+
+// Caller holds abr_mutex_.
+void GstVideoPlayer::CloseBurstLocked() {
+  const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
+                          burst_last_rx_ - burst_start_)
+                          .count();
+  // Skip playlist refreshes and degenerate timings — only segment-sized
+  // transfers measured over a meaningful window are useful samples.
+  if (burst_bytes_ >= 64 * 1024 && secs > 0.05) {
+    abr_samples_.push_back(static_cast<double>(burst_bytes_) * 8.0 / secs);
+    while (abr_samples_.size() > 16) abr_samples_.pop_front();
+  }
+  burst_bytes_ = 0;
+}
+
+void GstVideoPlayer::StartAbrEngine() {
+  if (abr_running_.exchange(true)) return;
+  last_upswitch_time_ = std::chrono::steady_clock::now();
+  abr_thread_ = std::thread([this]() {
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lock(abr_mutex_);
+        abr_cv_.wait_for(lock, std::chrono::seconds(1));
+      }
+      if (!abr_running_.load()) break;
+      AbrTick();
+    }
+  });
+}
+
+void GstVideoPlayer::StopAbrEngine() {
+  abr_running_.store(false);
+  abr_cv_.notify_all();
+  if (abr_thread_.joinable()) {
+    abr_thread_.join();
+  }
+}
+
+void GstVideoPlayer::AbrTick() {
+  std::deque<double> samples;
+  GstElement* demux = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(abr_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (burst_bytes_ > 0) {
+      if (now - burst_last_rx_ > std::chrono::milliseconds(250)) {
+        // Transfer finished and no new segment started yet.
+        CloseBurstLocked();
+      } else if (now - burst_start_ > std::chrono::seconds(3)) {
+        // Saturated link: data flows continuously with no idle gaps, so
+        // bursts never close on their own — sample the running transfer.
+        CloseBurstLocked();
+      }
+    }
+    samples = abr_samples_;
+    if (hls_demux_) demux = GST_ELEMENT(gst_object_ref(hls_demux_));
+  }
+
+  if (!demux) return;
+  if (samples.size() < 2) {
+    gst_object_unref(demux);
+    return;
+  }
+
+  // --- Prediction ---
+  const size_t n = samples.size();
+  const size_t window = std::min<size_t>(n, 8);
+  double mean = 0.0, hm_denom = 0.0;
+  for (size_t i = n - window; i < n; ++i) {
+    mean += samples[i];
+    hm_denom += 1.0 / samples[i];
+  }
+  mean /= window;
+  const double harmonic = window / hm_denom;  // robust vs. one fast burst
+  double variance = 0.0;
+  for (size_t i = n - window; i < n; ++i) {
+    variance += (samples[i] - mean) * (samples[i] - mean);
+  }
+  const double cv = mean > 0 ? std::sqrt(variance / window) / mean : 0.0;
+  const double fast = (samples[n - 1] + samples[n - 2]) / 2.0;  // recency
+
+  // Sustainable estimate: the cautious of recent vs. long-run, discounted
+  // by jitter — an erratic link earns a lower promise than a steady one.
+  double predicted_bps = std::min(fast, harmonic);
+  predicted_bps *= std::min(1.0, std::max(0.5, 1.0 - 0.5 * cv));
+
+  // --- Buffer health (percent of the 30 s buffering target) ---
+  const int pct = last_buffering_percent_.load();
+  const double buffer_secs = pct < 0 ? 10.0 : pct * 0.30;
+
+  double safety;
+  if (buffer_secs < 6.0) {
+    safety = 0.50;  // emergency: survival beats quality
+  } else if (buffer_secs < 15.0) {
+    safety = 0.65;  // cautious: rebuild cushion first
+  } else {
+    safety = 0.85;  // comfortable: ride quality close to the estimate
+  }
+
+  guint64 target_kbps =
+      static_cast<guint64>(predicted_bps * safety / 1000.0);
+  if (target_kbps < 100) target_kbps = 100;  // keep the lowest rung reachable
+
+  // --- Anti-flap policy ---
+  const auto now = std::chrono::steady_clock::now();
+  bool publish = false;
+  const char* reason = "";
+  if (published_kbps_ == 0) {
+    publish = true;
+    reason = "first estimate";
+  } else if (target_kbps * 5 <= published_kbps_ * 4) {
+    publish = true;  // >=20% drop: act immediately, quality can wait
+    reason = "bandwidth drop";
+  } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
+    publish = true;  // buffer emergency: any reduction helps now
+    reason = "buffer emergency";
+  } else if (target_kbps * 4 >= published_kbps_ * 5 && buffer_secs >= 20.0 &&
+             now - last_upswitch_time_ > std::chrono::seconds(30)) {
+    publish = true;  // >=25% headroom, healthy buffer, dwell time served
+    reason = "up-switch";
+    last_upswitch_time_ = now;
+  }
+
+  if (publish) {
+    SetConnectionSpeedKbps(demux, target_kbps);
+    published_kbps_ = target_kbps;
+    std::cout << "ABR: " << reason << " — connection-speed=" << target_kbps
+              << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
+              << "kbps cv=" << static_cast<int>(cv * 100) << "% buffer="
+              << static_cast<int>(buffer_secs) << "s safety=" << safety << ")"
+              << std::endl;
+  } else if (++abr_heartbeat_counter_ % 30 == 0) {
+    std::cout << "ABR: holding " << published_kbps_ << "kbps (predicted="
+              << static_cast<int>(predicted_bps / 1000) << "kbps cv="
+              << static_cast<int>(cv * 100) << "% buffer="
+              << static_cast<int>(buffer_secs) << "s samples=" << n << ")"
+              << std::endl;
+  }
+
+  gst_object_unref(demux);
 }
 
 // static

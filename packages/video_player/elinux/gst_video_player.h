@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -83,6 +84,15 @@ class GstVideoPlayer {
   void GetVideoSize(int32_t& width, int32_t& height);
   void StartWatchdog();
   void StopWatchdog();
+  void StartAbrEngine();
+  void StopAbrEngine();
+  void AbrTick();
+  void CloseBurstLocked();
+  static void DeepElementAddedHandler(GstBin* bin, GstBin* sub_bin,
+                                      GstElement* element, gpointer user_data);
+  static GstPadProbeReturn AbrThroughputProbe(GstPad* pad,
+                                              GstPadProbeInfo* info,
+                                              gpointer user_data);
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -113,6 +123,29 @@ class GstVideoPlayer {
       std::chrono::steady_clock::now();
   std::mutex watchdog_mutex_;
   std::condition_variable watchdog_cv_;
+
+  // --- ABR engine (Continuous Playback Intelligence) ---
+  // Measures per-segment download throughput with a pad probe on hlsdemux's
+  // sink pad, predicts sustainable bandwidth (harmonic mean + jitter
+  // discount), modulates it by buffer health, and steers hlsdemux's rendition
+  // selection through its connection-speed property (kbps). hlsdemux switches
+  // renditions at segment boundaries, so playback never interrupts.
+  std::thread abr_thread_;
+  std::atomic<bool> abr_running_{false};
+  std::mutex abr_mutex_;  // guards hls_demux_, burst state, abr_samples_
+  std::condition_variable abr_cv_;
+  GstElement* hls_demux_ = nullptr;  // ref held; released in DestroyPipeline
+  // Burst accumulator — written from the demuxer streaming thread. A gap in
+  // buffer arrivals marks the boundary between segment downloads.
+  guint64 burst_bytes_ = 0;
+  std::chrono::steady_clock::time_point burst_start_;
+  std::chrono::steady_clock::time_point burst_last_rx_;
+  // Completed per-burst throughput samples in bits/sec (newest at back).
+  std::deque<double> abr_samples_;
+  // Policy state — touched only by the ABR thread.
+  guint64 published_kbps_ = 0;
+  std::chrono::steady_clock::time_point last_upswitch_time_;
+  int abr_heartbeat_counter_ = 0;
 
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video
