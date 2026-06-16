@@ -114,13 +114,20 @@ class GstVideoPlayer {
   std::chrono::steady_clock::time_point buffering_log_start_time_ =
       std::chrono::steady_clock::now();
 
-  // Stall watchdog: fires OnNotifyError if buffer stops making progress
-  // while below 100% for longer than kWatchdogStallTimeoutSecs.
+  // Stall watchdog: fires OnNotifyError only when the pipeline is PLAYING but
+  // no decoded video frame has reached the sink for kFrameStallTimeoutSecs —
+  // i.e. the picture is genuinely frozen. The old buffer-percent trigger was
+  // demoted to a diagnostic log: a buffering plateau (e.g. stuck at 78% at the
+  // live edge) is NOT a freeze if frames are still being rendered, and firing
+  // a full reconnect on it produced false positives that churned pipelines and
+  // ended in a crash. frames_handed_off_ moves only on a real buffer at the
+  // video sink (HandoffHandler), so it is the ground-truth liveness signal.
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_running_{false};
   std::atomic<bool> error_notified_{false};  // single-fire guard for OnNotifyError
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
+  std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer
   std::mutex watchdog_mutex_;
   std::condition_variable watchdog_cv_;
 

@@ -725,6 +725,10 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
     self->stream_handler_->OnNotifyPlaying(true);
   }
 
+  // Ground-truth liveness signal for the watchdog: only moves when a real
+  // video buffer reaches the sink, so a wedged decoder stalls it.
+  self->frames_handed_off_.fetch_add(1, std::memory_order_relaxed);
+
   self->stream_handler_->OnNotifyFrameDecoded();
 }
 
@@ -735,8 +739,12 @@ void GstVideoPlayer::StartWatchdog() {
     last_buffering_progress_time_ = std::chrono::steady_clock::now();
   }
   watchdog_thread_ = std::thread([this]() {
-    constexpr auto kCheckInterval = std::chrono::seconds(10);
-    constexpr int kStallTimeoutSecs = 30;
+    constexpr auto kCheckInterval = std::chrono::seconds(5);
+    constexpr int kFrameStallTimeoutSecs = 30;  // PLAYING but no frame this long
+
+    // Frame-arrival baseline. Locals: touched only by this thread.
+    uint64_t last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+    auto last_frame_advance_time = std::chrono::steady_clock::now();
 
     while (true) {
       std::chrono::steady_clock::time_point progress_snap;
@@ -747,25 +755,52 @@ void GstVideoPlayer::StartWatchdog() {
         progress_snap = last_buffering_progress_time_;
       }
 
-      int pct = last_buffering_percent_.load();
-      if (pct < 0 || pct >= 100) continue; // not currently buffering
-
       auto now = std::chrono::steady_clock::now();
-      auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
-          now - progress_snap).count();
 
-      // Only log when genuinely stalled — suppress the noise from notify_one()
-      // wakeups during normal buffer fill (stalled_secs == 0 in that case).
-      if (stalled_secs > 0) {
-        std::cout << "WATCHDOG: buffer=" << pct << "% no-progress-for="
-                  << stalled_secs << "s" << std::endl;
+      // --- Diagnostic only: buffer-percent plateau (NO LONGER fires a
+      // reconnect). A live-edge plateau where frames keep rendering is not a
+      // freeze; firing on it churned pipelines and crashed the app. ---
+      const int pct = last_buffering_percent_.load();
+      if (pct >= 0 && pct < 100) {
+        auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
+            now - progress_snap).count();
+        if (stalled_secs > 0) {
+          std::cout << "WATCHDOG: buffer=" << pct << "% no-progress-for="
+                    << stalled_secs << "s (diagnostic; not fatal)" << std::endl;
+        }
       }
 
-      if (stalled_secs >= kStallTimeoutSecs) {
-        std::string msg = "Network stall: buffer stuck at " +
-                          std::to_string(pct) + "% for " +
-                          std::to_string(stalled_secs) + "s";
-        std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init" << std::endl;
+      // --- Firing trigger: frame-arrival stall. Only when the pipeline is
+      // actually PLAYING but no decoded frame has arrived for the timeout. ---
+      if (!gst_.pipeline) continue;  // safe: StopWatchdog joins before teardown
+      GstState state = GST_STATE_VOID_PENDING;
+      gst_element_get_state(gst_.pipeline, &state, nullptr, 0);
+      if (state != GST_STATE_PLAYING) {
+        // Paused / buffering / seeking — re-baseline so a legitimate pause
+        // doesn't look like a freeze when playback resumes.
+        last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+        last_frame_advance_time = now;
+        continue;
+      }
+
+      uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
+      if (frames != last_seen_frames) {
+        last_seen_frames = frames;
+        last_frame_advance_time = now;
+        continue;
+      }
+
+      auto frozen_secs = std::chrono::duration_cast<std::chrono::seconds>(
+          now - last_frame_advance_time).count();
+      if (frozen_secs > 0) {
+        std::cout << "WATCHDOG: PLAYING but no video frame for " << frozen_secs
+                  << "s (buffer=" << pct << "%)" << std::endl;
+      }
+      if (frozen_secs >= kFrameStallTimeoutSecs) {
+        std::string msg = "Playback frozen: no video frame for " +
+                          std::to_string(frozen_secs) + "s while PLAYING";
+        std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init"
+                  << std::endl;
         watchdog_running_.store(false);
         bool expected = false;
         if (error_notified_.compare_exchange_strong(expected, true)) {
