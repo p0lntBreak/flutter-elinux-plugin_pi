@@ -783,6 +783,15 @@ void GstVideoPlayer::StartWatchdog() {
         continue;
       }
 
+      const int pct = last_buffering_percent_.load();
+      if (pct >= 0 && pct < 100) {
+        // Active buffering — re-baseline so a buffering stall doesn't trigger
+        // a false-positive watchdog frame-stall reconnect.
+        last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+        last_frame_advance_time = now;
+        continue;
+      }
+
       uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
       if (frames != last_seen_frames) {
         last_seen_frames = frames;
