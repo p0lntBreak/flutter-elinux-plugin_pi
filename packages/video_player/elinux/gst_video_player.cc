@@ -784,11 +784,15 @@ void GstVideoPlayer::StartWatchdog() {
       }
 
       if (pct >= 0 && pct < 100) {
-        // Active buffering — re-baseline so a buffering stall doesn't trigger
-        // a false-positive watchdog frame-stall reconnect.
-        last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
-        last_frame_advance_time = now;
-        continue;
+        auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
+            now - progress_snap).count();
+        if (stalled_secs < kFrameStallTimeoutSecs) {
+          // Active buffering and making progress — re-baseline so a buffering
+          // pause doesn't trigger a false-positive frame-stall reconnect.
+          last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+          last_frame_advance_time = now;
+          continue;
+        }
       }
 
       uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
