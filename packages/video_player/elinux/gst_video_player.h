@@ -125,6 +125,7 @@ class GstVideoPlayer {
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_running_{false};
   std::atomic<bool> error_notified_{false};  // single-fire guard for OnNotifyError
+  std::atomic<bool> play_state_requested_{false}; // tracks if user requested PLAYING
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
   std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer

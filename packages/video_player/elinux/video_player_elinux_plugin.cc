@@ -385,6 +385,51 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         // OnNotifyError
         [texture_id, host = this](const std::string& message) {
           host->SendErrorEventMessage(texture_id, message);
+        },
+        // OnNotifyBufferingStart
+        [texture_id, host = this]() {
+          if (host->players_.find(texture_id) != host->players_.end() &&
+              host->players_[texture_id]->event_sink) {
+            flutter::EncodableMap encodables = {
+                {flutter::EncodableValue("event"),
+                 flutter::EncodableValue("bufferingStart")}};
+            flutter::EncodableValue event(encodables);
+            host->players_[texture_id]->event_sink->Success(event);
+          }
+        },
+        // OnNotifyBufferingUpdate
+        [texture_id, host = this](int percent) {
+          if (host->players_.find(texture_id) != host->players_.end() &&
+              host->players_[texture_id]->event_sink) {
+            auto duration = host->players_[texture_id]->player->GetDuration();
+            if (duration < 0) duration = 0;
+            int64_t buffered_end = (duration * percent) / 100;
+
+            flutter::EncodableList ranges = {
+                flutter::EncodableValue(flutter::EncodableList{
+                    flutter::EncodableValue(static_cast<int64_t>(0)),
+                    flutter::EncodableValue(buffered_end)
+                })
+            };
+            flutter::EncodableMap encodables = {
+                {flutter::EncodableValue("event"),
+                 flutter::EncodableValue("bufferingUpdate")},
+                {flutter::EncodableValue("values"),
+                 flutter::EncodableValue(ranges)}};
+            flutter::EncodableValue event(encodables);
+            host->players_[texture_id]->event_sink->Success(event);
+          }
+        },
+        // OnNotifyBufferingEnd
+        [texture_id, host = this]() {
+          if (host->players_.find(texture_id) != host->players_.end() &&
+              host->players_[texture_id]->event_sink) {
+            flutter::EncodableMap encodables = {
+                {flutter::EncodableValue("event"),
+                 flutter::EncodableValue("bufferingEnd")}};
+            flutter::EncodableValue event(encodables);
+            host->players_[texture_id]->event_sink->Success(event);
+          }
         });
 
       

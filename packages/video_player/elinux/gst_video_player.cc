@@ -64,9 +64,11 @@ bool GstVideoPlayer::Init() {
   // receive a buffer in PAUSED. Advance to PLAYING now so the V4L2 hardware
   // decoder starts producing frames and HandoffHandler can capture real
   // dimensions before OnNotifyInitialized() is sent to Flutter.
+  play_state_requested_.store(true);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Init: Failed to reach PLAYING state" << std::endl;
+    play_state_requested_.store(false);
     DestroyPipeline();
     return false;
   }
@@ -92,9 +94,11 @@ bool GstVideoPlayer::Init() {
 }
 
 bool GstVideoPlayer::Play() {
+  play_state_requested_.store(true);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Failed to change the state to PLAYING" << std::endl;
+    play_state_requested_.store(false);
     return false;
   }
 
@@ -103,6 +107,7 @@ bool GstVideoPlayer::Play() {
 }
 
 bool GstVideoPlayer::Pause() {
+  play_state_requested_.store(false);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Failed to change the state to PAUSED" << std::endl;
@@ -114,6 +119,7 @@ bool GstVideoPlayer::Pause() {
 }
 
 bool GstVideoPlayer::Stop() {
+  play_state_requested_.store(false);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_READY) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Failed to change the state to READY" << std::endl;
@@ -568,6 +574,7 @@ bool GstVideoPlayer::Preroll() {
 }
 
 void GstVideoPlayer::DestroyPipeline() {
+  play_state_requested_.store(false);
   StopWatchdog();
   StopAbrEngine();
 
@@ -603,6 +610,7 @@ void GstVideoPlayer::DestroyPipeline() {
   }
 
   if (gst_.bus) {
+    gst_bus_set_sync_handler(gst_.bus, NULL, NULL, NULL);
     gst_object_unref(gst_.bus);
     gst_.bus = nullptr;
   }
@@ -756,43 +764,42 @@ void GstVideoPlayer::StartWatchdog() {
       }
 
       auto now = std::chrono::steady_clock::now();
-
-      // --- Diagnostic only: buffer-percent plateau (NO LONGER fires a
-      // reconnect). A live-edge plateau where frames keep rendering is not a
-      // freeze; firing on it churned pipelines and crashed the app. ---
       const int pct = last_buffering_percent_.load();
-      if (pct >= 0 && pct < 100) {
+
+      // --- Check 1: Active buffering but stalled (no progress) for too long ---
+      if (pct >= 0 && pct < 100 && play_state_requested_.load()) {
         auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
             now - progress_snap).count();
-        if (stalled_secs > 0) {
-          std::cout << "WATCHDOG: buffer=" << pct << "% no-progress-for="
-                    << stalled_secs << "s (diagnostic; not fatal)" << std::endl;
+        if (stalled_secs >= kFrameStallTimeoutSecs) {
+          std::string msg = "Buffering stalled: stuck at " + std::to_string(pct) +
+                            "% for " + std::to_string(stalled_secs) + "s";
+          std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init"
+                    << std::endl;
+          watchdog_running_.store(false);
+          bool expected = false;
+          if (error_notified_.compare_exchange_strong(expected, true)) {
+            stream_handler_->OnNotifyError(msg);
+          }
+          break;
         }
-      }
 
-      // --- Firing trigger: frame-arrival stall. Only when the pipeline is
-      // actually PLAYING but no decoded frame has arrived for the timeout. ---
-      if (!gst_.pipeline) continue;  // safe: StopWatchdog joins before teardown
-      GstState state = GST_STATE_VOID_PENDING;
-      gst_element_get_state(gst_.pipeline, &state, nullptr, 0);
-      if (state != GST_STATE_PLAYING) {
-        // Paused / buffering / seeking — re-baseline so a legitimate pause
-        // doesn't look like a freeze when playback resumes.
+        // Active buffering and making progress — re-baseline so a buffering
+        // pause doesn't trigger a false-positive frame-stall reconnect.
         last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
         last_frame_advance_time = now;
         continue;
       }
 
-      if (pct >= 0 && pct < 100) {
-        auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
-            now - progress_snap).count();
-        if (stalled_secs < kFrameStallTimeoutSecs) {
-          // Active buffering and making progress — re-baseline so a buffering
-          // pause doesn't trigger a false-positive frame-stall reconnect.
-          last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
-          last_frame_advance_time = now;
-          continue;
-        }
+      // --- Check 2: Playback frozen (pipeline is PLAYING but no video frame advances) ---
+      if (!gst_.pipeline) continue;  // safe: StopWatchdog joins before teardown
+      GstState state = GST_STATE_VOID_PENDING;
+      gst_element_get_state(gst_.pipeline, &state, nullptr, 0);
+      if (state != GST_STATE_PLAYING) {
+        // Paused / seeking / not playing — re-baseline so a legitimate pause
+        // doesn't look like a freeze when playback resumes.
+        last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+        last_frame_advance_time = now;
+        continue;
       }
 
       uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
@@ -806,7 +813,7 @@ void GstVideoPlayer::StartWatchdog() {
           now - last_frame_advance_time).count();
       if (frozen_secs > 0) {
         std::cout << "WATCHDOG: PLAYING but no video frame for " << frozen_secs
-                  << "s (buffer=" << pct << "%)" << std::endl;
+                  << "s" << std::endl;
       }
       if (frozen_secs >= kFrameStallTimeoutSecs) {
         std::string msg = "Playback frozen: no video frame for " +
@@ -1080,6 +1087,39 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
           self->last_buffering_progress_time_ = std::chrono::steady_clock::now();
         }
         self->watchdog_cv_.notify_one();
+
+        // Notify buffering update to Flutter
+        self->stream_handler_->OnNotifyBufferingUpdate(percent);
+
+        if (self->play_state_requested_.load()) {
+          if (percent < 100) {
+            GstState state = GST_STATE_VOID_PENDING;
+            gst_element_get_state(self->gst_.pipeline, &state, nullptr, 0);
+            if (state == GST_STATE_PLAYING) {
+              std::cout << "BUFFERING: percent=" << percent << " < 100, pausing pipeline..." << std::endl;
+              self->stream_handler_->OnNotifyBufferingStart();
+
+              GstElement* pipeline = GST_ELEMENT(gst_object_ref(self->gst_.pipeline));
+              std::thread([pipeline]() {
+                gst_element_set_state(pipeline, GST_STATE_PAUSED);
+                gst_object_unref(pipeline);
+              }).detach();
+            }
+          } else {
+            GstState state = GST_STATE_VOID_PENDING;
+            gst_element_get_state(self->gst_.pipeline, &state, nullptr, 0);
+            if (state == GST_STATE_PAUSED) {
+              std::cout << "BUFFERING: percent=100, resuming pipeline..." << std::endl;
+              self->stream_handler_->OnNotifyBufferingEnd();
+
+              GstElement* pipeline = GST_ELEMENT(gst_object_ref(self->gst_.pipeline));
+              std::thread([pipeline]() {
+                gst_element_set_state(pipeline, GST_STATE_PLAYING);
+                gst_object_unref(pipeline);
+              }).detach();
+            }
+          }
+        }
 
         gint64 position = 0;
         const bool has_position = gst_element_query_position(

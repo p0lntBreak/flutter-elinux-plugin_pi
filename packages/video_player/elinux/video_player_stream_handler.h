@@ -31,12 +31,24 @@ class VideoPlayerStreamHandler {
   // Notifies a fatal playback error (e.g. network stall, stream failure).
   void OnNotifyError(const std::string& message) { OnNotifyErrorInternal(message); }
 
+  // Notifies the start of buffering.
+  void OnNotifyBufferingStart() { OnNotifyBufferingStartInternal(); }
+
+  // Notifies buffering progress update.
+  void OnNotifyBufferingUpdate(int percent) { OnNotifyBufferingUpdateInternal(percent); }
+
+  // Notifies the end of buffering.
+  void OnNotifyBufferingEnd() { OnNotifyBufferingEndInternal(); }
+
  protected:
   virtual void OnNotifyInitializedInternal() = 0;
   virtual void OnNotifyFrameDecodedInternal() = 0;
   virtual void OnNotifyCompletedInternal() = 0;
   virtual void OnNotifyPlayingInternal(bool is_playing) = 0;
   virtual void OnNotifyErrorInternal(const std::string& message) = 0;
+  virtual void OnNotifyBufferingStartInternal() = 0;
+  virtual void OnNotifyBufferingUpdateInternal(int percent) = 0;
+  virtual void OnNotifyBufferingEndInternal() = 0;
 };
 
 #endif  // PACKAGES_VIDEO_PLAYER_VIDEO_PLAYER_ELINUX_VIDEO_PLAYER_STREAM_HANDLER_H_
