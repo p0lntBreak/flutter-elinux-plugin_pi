@@ -783,7 +783,6 @@ void GstVideoPlayer::StartWatchdog() {
         continue;
       }
 
-      const int pct = last_buffering_percent_.load();
       if (pct >= 0 && pct < 100) {
         // Active buffering — re-baseline so a buffering stall doesn't trigger
         // a false-positive watchdog frame-stall reconnect.
