@@ -1088,38 +1088,18 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         }
         self->watchdog_cv_.notify_one();
 
-        // Notify buffering update to Flutter
+        // Notify buffering update to Flutter (UI only — never drives pipeline
+        // state).
         self->stream_handler_->OnNotifyBufferingUpdate(percent);
 
-        if (self->play_state_requested_.load()) {
-          if (percent < 100) {
-            GstState state = GST_STATE_VOID_PENDING;
-            gst_element_get_state(self->gst_.pipeline, &state, nullptr, 0);
-            if (state == GST_STATE_PLAYING) {
-              std::cout << "BUFFERING: percent=" << percent << " < 100, pausing pipeline..." << std::endl;
-              self->stream_handler_->OnNotifyBufferingStart();
-
-              GstElement* pipeline = GST_ELEMENT(gst_object_ref(self->gst_.pipeline));
-              std::thread([pipeline]() {
-                gst_element_set_state(pipeline, GST_STATE_PAUSED);
-                gst_object_unref(pipeline);
-              }).detach();
-            }
-          } else {
-            GstState state = GST_STATE_VOID_PENDING;
-            gst_element_get_state(self->gst_.pipeline, &state, nullptr, 0);
-            if (state == GST_STATE_PAUSED) {
-              std::cout << "BUFFERING: percent=100, resuming pipeline..." << std::endl;
-              self->stream_handler_->OnNotifyBufferingEnd();
-
-              GstElement* pipeline = GST_ELEMENT(gst_object_ref(self->gst_.pipeline));
-              std::thread([pipeline]() {
-                gst_element_set_state(pipeline, GST_STATE_PLAYING);
-                gst_object_unref(pipeline);
-              }).detach();
-            }
-          }
-        }
+        // NOTE: We deliberately do NOT pause/resume the pipeline on buffering
+        // percentage. For a LIVE stream that approach is unsafe: when the
+        // download starves the percent never climbs back to 100, so the resume
+        // condition is unreachable and the pipeline wedges in PAUSED forever.
+        // Two unsynchronized detached set_state() threads also raced to a
+        // nondeterministic final state. Recovery from a real buffer stall is
+        // handled by the watchdog Check 1 below (it fires OnNotifyError so
+        // Flutter can re-authenticate and rebuild the pipeline).
 
         gint64 position = 0;
         const bool has_position = gst_element_query_position(
