@@ -341,8 +341,23 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
   if (g_strcmp0(type_name, "GstCurlHttpSrc") == 0) {
     GObjectClass* klass = G_OBJECT_GET_CLASS(source);
 
+    // keep-alive=FALSE: do NOT reuse the HTTP connection across segment
+    // requests. Device logs (2026-06-22) showed ~2 min of perfect playback
+    // (buffer pinned at 100%) followed by a sudden buffer collapse 100%->9%
+    // and a 30s frame freeze — the signature of a keep-alive socket that the
+    // CDN edge silently recycled/half-closed. This build's curlhttpsrc is an
+    // old version with neither low-speed-time nor connect-timeout, so it
+    // cannot detect or abort the dead socket; the fetch just hangs until the
+    // blunt total timeout. A fresh connection per segment means a recycled
+    // socket can never poison the stream, and a single bad fetch fails in
+    // isolation so hlsdemux can retry the next segment without a full reconnect.
+    //
     // timeout = CURLOPT_TIMEOUT: total transfer time per segment request.
-    g_object_set(source, "timeout", (gint)30, "compress", TRUE, "keep-alive", TRUE, NULL);
+    // Lowered 30s->12s so a hung fetch aborts and hlsdemux retries BEFORE the
+    // 30s frame-stall watchdog tears the whole pipeline down. A healthy ~10s
+    // 720p segment (~3.4 MB @ 2.75 Mbps) downloads well within 12s.
+    g_object_set(source, "timeout", (gint)12, "compress", TRUE, "keep-alive",
+                 FALSE, NULL);
 
     // connect-timeout = CURLOPT_CONNECTTIMEOUT: not present in all GStreamer builds.
     if (g_object_class_find_property(klass, "connect-timeout")) {
