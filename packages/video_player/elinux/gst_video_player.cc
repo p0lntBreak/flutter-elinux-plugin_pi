@@ -766,28 +766,26 @@ void GstVideoPlayer::StartWatchdog() {
       auto now = std::chrono::steady_clock::now();
       const int pct = last_buffering_percent_.load();
 
-      // --- Check 1: Active buffering but stalled (no progress) for too long ---
+      // --- Check 1 (DIAGNOSTIC ONLY — no longer reconnects): buffer-% plateau.
+      // A LIVE stream sitting at the live edge legitimately plateaus below 100%:
+      // the cache-target (e.g. 30s) is unsatisfiable because no segments beyond
+      // the live edge exist yet, so buffering messages just stop at ~91% with no
+      // % change. That is NOT a stall while frames keep arriving. Firing a full
+      // re-init here tore down healthy streams — device log 2026-06-22 showed 7
+      // reconnects, ALL buffer-% fires at 91-96%, with ZERO frame-arrival stalls
+      // (grep -c "no video frame" = 0). Genuine starvation that actually freezes
+      // playback is caught by the frame-arrival check below (Check 2), which is
+      // the ground truth. So: log and FALL THROUGH — do not break, do not
+      // re-baseline Check 2 (a live-edge plateau keeps the pipeline PLAYING and
+      // frames flowing, so Check 2 stays silent on its own). ---
       if (pct >= 0 && pct < 100 && play_state_requested_.load()) {
         auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
             now - progress_snap).count();
         if (stalled_secs >= kFrameStallTimeoutSecs) {
-          std::string msg = "Buffering stalled: stuck at " + std::to_string(pct) +
-                            "% for " + std::to_string(stalled_secs) + "s";
-          std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init"
-                    << std::endl;
-          watchdog_running_.store(false);
-          bool expected = false;
-          if (error_notified_.compare_exchange_strong(expected, true)) {
-            stream_handler_->OnNotifyError(msg);
-          }
-          break;
+          std::cout << "WATCHDOG: buffer=" << pct << "% no %-change for "
+                    << stalled_secs << "s (diagnostic; not fatal — frame-arrival "
+                       "governs reconnect)" << std::endl;
         }
-
-        // Active buffering and making progress — re-baseline so a buffering
-        // pause doesn't trigger a false-positive frame-stall reconnect.
-        last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
-        last_frame_advance_time = now;
-        continue;
       }
 
       // --- Check 2: Playback frozen (pipeline is PLAYING but no video frame advances) ---
