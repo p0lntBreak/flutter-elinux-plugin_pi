@@ -150,6 +150,16 @@ bool GstVideoPlayer::SetPlaybackRate(double rate) {
     return false;
   }
 
+  // No-op when the rate isn't actually changing (the common case: the Flutter
+  // side calls setPlaybackSpeed(1.0) on init/resume). Seeking to set the same
+  // rate is pointless and, on a LIVE stream, the seek ALWAYS fails
+  // ("Failed to set playback rate to 1 (gst_element_seek failed)") — and if the
+  // caller treats that failure as fatal it can blank a reconnect instead of
+  // recovering. Returning success without seeking avoids both.
+  if (rate == playback_rate_) {
+    return true;
+  }
+
   auto position = GetCurrentPosition();
   if (position < 0) {
     return false;
