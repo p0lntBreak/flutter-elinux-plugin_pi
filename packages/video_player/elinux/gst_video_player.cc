@@ -408,7 +408,55 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
       gst_structure_free(headers);
     }
   } else if (g_strcmp0(type_name, "GstSoupHTTPSrc") == 0) {
-    std::cerr << "WARNING: souphttpsrc selected despite rank override" << std::endl;
+    GObjectClass* klass = G_OBJECT_GET_CLASS(source);
+    std::cout << "SOURCE-SETUP: using souphttpsrc" << std::endl;
+
+    // souphttpsrc's `timeout` is a BLOCKING-I/O (INACTIVITY) timeout: abort a
+    // read that produces no data for N seconds. This is exactly what the old
+    // curlhttpsrc could NOT do — curl only had a total-transfer cap, so a
+    // segment fetch that TCP-connected then delivered nothing hung until the
+    // blunt total timeout, draining the multiqueue and starving the decoder
+    // (the recurring buffer-LOW source stall). With an inactivity timeout a
+    // stalled fetch dies in 5s and hlsdemux retries, while a slow-but-
+    // PROGRESSING segment keeps data flowing and is NOT cut.
+    g_object_set(source, "timeout", (guint)5, NULL);
+
+    // TLS: this CDN previously failed soup's strict certificate check, which is
+    // why the project switched to curl. Relax strict verification so soup can
+    // connect (the CDN is known/trusted). If soup STILL cannot connect after
+    // this, the TLS *backend* (glib-networking) is missing from the rootfs — an
+    // image fix, and we revert to curl.
+    if (g_object_class_find_property(klass, "ssl-strict")) {
+      g_object_set(source, "ssl-strict", FALSE, NULL);
+      std::cout << "SOURCE-SETUP: souphttpsrc ssl-strict=FALSE" << std::endl;
+    }
+    // Retry an aborted/failed fetch a few times before erroring upstream.
+    if (g_object_class_find_property(klass, "retries")) {
+      g_object_set(source, "retries", (gint)3, NULL);
+    }
+    // Fresh connection per request — avoid a CDN-recycled half-open socket
+    // (same rationale as curl keep-alive=FALSE).
+    if (g_object_class_find_property(klass, "keep-alive")) {
+      g_object_set(source, "keep-alive", FALSE, NULL);
+    }
+    if (g_object_class_find_property(klass, "compress")) {
+      g_object_set(source, "compress", TRUE, NULL);
+    }
+
+    guint st = 0;
+    g_object_get(source, "timeout", &st, NULL);
+    std::cout << "SOURCE-SETUP: souphttpsrc timeout=" << st
+              << "s (inactivity/blocking-IO)" << std::endl;
+
+    if (!self->auth_headers_.all_headers.empty()) {
+      GstStructure* headers = gst_structure_new_empty("extra-headers");
+      for (const auto& [key, value] : self->auth_headers_.all_headers) {
+        gst_structure_set(headers, key.c_str(), G_TYPE_STRING, value.c_str(),
+                          NULL);
+      }
+      g_object_set(source, "extra-headers", headers, NULL);
+      gst_structure_free(headers);
+    }
   }
 }
 
@@ -420,18 +468,26 @@ void GstVideoPlayer::SetAuthHeaders(
 bool GstVideoPlayer::CreatePipeline() {
   GstRegistry* registry = gst_registry_get();
 
-  // curlhttpsrc handles HTTPS streams reliably; souphttpsrc has TLS issues.
+  // PREFER souphttpsrc: its `timeout` is a blocking-I/O (inactivity) timeout
+  // that aborts a stalled-body fetch (TCP-connected but delivering no data) in
+  // seconds, which the old curlhttpsrc cannot do (it only had a blunt total
+  // transfer cap, so a stalled fetch hung long enough to drain the buffer and
+  // starve the decoder = the recurring source stall). soup's earlier TLS
+  // failure is worked around with ssl-strict=FALSE in SourceSetupCallback.
+  // curl is kept as a LOWER-ranked fallback in case soup is unavailable.
   GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
   GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
+  if (soup_feature) {
+    gst_plugin_feature_set_rank(soup_feature, GST_RANK_PRIMARY + 300);
+    gst_object_unref(soup_feature);
+  } else {
+    std::cerr << "CreatePipeline: WARNING - souphttpsrc not found" << std::endl;
+  }
   if (curl_feature) {
-    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 300);
+    gst_plugin_feature_set_rank(curl_feature, GST_RANK_PRIMARY + 200);
     gst_object_unref(curl_feature);
   } else {
     std::cerr << "CreatePipeline: WARNING - curlhttpsrc not found" << std::endl;
-  }
-  if (soup_feature) {
-    gst_plugin_feature_set_rank(soup_feature, GST_RANK_NONE);
-    gst_object_unref(soup_feature);
   }
 
   // Prefer hardware H.264 decode on the Pi.
