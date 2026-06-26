@@ -46,7 +46,15 @@ class GstVideoPlayer {
   bool Stop();
   bool SetVolume(double volume);
   bool SetPlaybackRate(double rate);
-  void SetAutoRepeat(bool auto_repeat) { auto_repeat_ = auto_repeat; };
+  // Looping is force-disabled. The app never intends to loop any content (no
+  // setLooping originates from soatv); the zeroratehls wrapper enables it by
+  // default, which on a LIVE stream turns a spurious souphttpsrc EOS into a
+  // SetSeek(0) replay of the buffered window — the "same buffer loops" bug
+  // (continuous frames + Current Position resetting ~30s→0). With auto_repeat_
+  // pinned false, a live EOS never seeks-to-0; frames just stop and the
+  // frame-arrival watchdog reconnects (clean, like curl). Re-enable per-stream
+  // via a real live flag if VOD looping is ever genuinely needed.
+  void SetAutoRepeat(bool /*auto_repeat*/) { auto_repeat_ = false; };
   bool SetSeek(int64_t position);
   int64_t GetDuration();
   int64_t GetCurrentPosition();
