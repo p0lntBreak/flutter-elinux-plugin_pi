@@ -4,6 +4,8 @@
 
 #include "gst_video_player.h"
 
+#include "logging.h"
+
 #include <glob.h>
 
 #include <algorithm>
@@ -13,9 +15,15 @@
 #include <iostream>
 #include <string>
 
+namespace {
+constexpr double kBufferTargetSecs = 30.0;
+constexpr gint64 kBufferTargetNs = 30000000000LL;
+}  // namespace
+
 GstVideoPlayer::GstVideoPlayer(
     const std::string& uri, std::unique_ptr<VideoPlayerStreamHandler> handler)
     : stream_handler_(std::move(handler)) {
+  video_player_elinux::InitTimestampedLogging();
   gst_.pipeline = nullptr;
   gst_.playbin = nullptr;
   gst_.video_convert = nullptr;
@@ -545,7 +553,7 @@ bool GstVideoPlayer::CreatePipeline() {
   // time-depth. This gives the player enough cushion for a late segment fetch.
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
-               "buffer-duration", (gint64)30000000000LL,  // 30 s
+               "buffer-duration", kBufferTargetNs,        // 30 s
                "connection-speed", (guint64)5000,
                NULL);
 
@@ -765,6 +773,113 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   self->stream_handler_->OnNotifyFrameDecoded();
 }
 
+
+void GstVideoPlayer::LogPlaybackHealth(
+    GstState state, uint64_t frames, std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::time_point last_frame_time) {
+  if (!gst_.pipeline) return;
+
+  // Example:
+  // Current Position: 120 sec
+  // Buffered Until: 140 sec
+  // Buffer Health: 20 sec
+  // Network Throughput: 3500 kbps
+  // Actual measured throughput: throughput = segment_size_bytes / download_time_seconds
+
+  gint64 position = 0;
+  const bool has_position = gst_element_query_position(
+      gst_.pipeline, GST_FORMAT_TIME, &position);
+  const double position_secs = has_position
+      ? static_cast<double>(position) / static_cast<double>(GST_SECOND)
+      : -1.0;
+
+  const int pct = last_buffering_percent_.load();
+  double buffered_until_secs = -1.0;
+  double buffer_health_secs = -1.0;
+  bool used_estimate = true;
+
+  GstQuery* query = gst_query_new_buffering(GST_FORMAT_TIME);
+  if (query && gst_element_query(gst_.pipeline, query)) {
+    GstFormat format = GST_FORMAT_TIME;
+    gint64 start = 0;
+    gint64 stop = -1;
+    gint64 estimated_total = -1;
+    gst_query_parse_buffering_range(query, &format, &start, &stop,
+                                    &estimated_total);
+    if (format == GST_FORMAT_TIME && has_position && stop >= position) {
+      buffered_until_secs = static_cast<double>(stop) /
+                            static_cast<double>(GST_SECOND);
+      buffer_health_secs = static_cast<double>(stop - position) /
+                           static_cast<double>(GST_SECOND);
+      used_estimate = false;
+    }
+  }
+  if (query) gst_query_unref(query);
+
+  if (used_estimate && has_position && pct >= 0) {
+    buffer_health_secs = (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
+    buffered_until_secs = position_secs + buffer_health_secs;
+  }
+
+  guint64 last_segment_bytes = 0;
+  double last_segment_secs = 0.0;
+  double last_segment_bps = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(abr_mutex_);
+    last_segment_bytes = last_segment_bytes_;
+    last_segment_secs = last_segment_download_secs_;
+    last_segment_bps = last_segment_throughput_bps_;
+  }
+
+  const auto no_frame_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - last_frame_time).count();
+
+  std::cout << "HEALTH: state=" << gst_element_state_get_name(state)
+            << " Current Position: ";
+  if (has_position) {
+    std::cout << static_cast<int>(position_secs) << " sec";
+  } else {
+    std::cout << "unknown";
+  }
+
+  std::cout << " Buffered Until: ";
+  if (buffered_until_secs >= 0.0) {
+    std::cout << static_cast<int>(buffered_until_secs) << " sec";
+  } else {
+    std::cout << "unknown";
+  }
+
+  std::cout << " Buffer Health: ";
+  if (buffer_health_secs >= 0.0) {
+    std::cout << static_cast<int>(buffer_health_secs) << " sec";
+    if (used_estimate) std::cout << " (est)";
+  } else {
+    std::cout << "unknown";
+  }
+
+  std::cout << " Buffer Percent: ";
+  if (pct >= 0) {
+    std::cout << pct << "%";
+  } else {
+    std::cout << "unknown";
+  }
+
+  std::cout << " Target Buffer: " << static_cast<int>(kBufferTargetSecs)
+            << " sec Frames: " << frames
+            << " No Frame For: " << no_frame_ms << " ms";
+
+  if (last_segment_bytes > 0 && last_segment_secs > 0.0) {
+    std::cout << " Network Throughput: "
+              << static_cast<int>(last_segment_bps / 1000.0) << " kbps"
+              << " (segment=" << last_segment_bytes << "B/"
+              << last_segment_secs << "s)";
+  } else {
+    std::cout << " Network Throughput: unknown";
+  }
+
+  std::cout << std::endl;
+}
+
 void GstVideoPlayer::StartWatchdog() {
   if (watchdog_running_.exchange(true)) return; // already running
   {
@@ -772,7 +887,7 @@ void GstVideoPlayer::StartWatchdog() {
     last_buffering_progress_time_ = std::chrono::steady_clock::now();
   }
   watchdog_thread_ = std::thread([this]() {
-    constexpr auto kCheckInterval = std::chrono::seconds(5);
+    constexpr auto kCheckInterval = std::chrono::seconds(1);
     constexpr int kFrameStallTimeoutSecs = 30;  // PLAYING but no frame this long
 
     // Frame-arrival baseline. Locals: touched only by this thread.
@@ -817,21 +932,24 @@ void GstVideoPlayer::StartWatchdog() {
       if (!gst_.pipeline) continue;  // safe: StopWatchdog joins before teardown
       GstState state = GST_STATE_VOID_PENDING;
       gst_element_get_state(gst_.pipeline, &state, nullptr, 0);
+      uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
       if (state != GST_STATE_PLAYING) {
         // Paused / seeking / not playing — re-baseline so a legitimate pause
         // doesn't look like a freeze when playback resumes.
-        last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+        last_seen_frames = frames;
         last_frame_advance_time = now;
+        LogPlaybackHealth(state, frames, now, last_frame_advance_time);
         continue;
       }
 
-      uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
       if (frames != last_seen_frames) {
         last_seen_frames = frames;
         last_frame_advance_time = now;
+        LogPlaybackHealth(state, frames, now, last_frame_advance_time);
         continue;
       }
 
+      LogPlaybackHealth(state, frames, now, last_frame_advance_time);
       auto frozen_secs = std::chrono::duration_cast<std::chrono::seconds>(
           now - last_frame_advance_time).count();
       if (frozen_secs > 0) {
@@ -952,8 +1070,19 @@ void GstVideoPlayer::CloseBurstLocked() {
   // Skip playlist refreshes and degenerate timings — only segment-sized
   // transfers measured over a meaningful window are useful samples.
   if (burst_bytes_ >= 64 * 1024 && secs > 0.05) {
-    abr_samples_.push_back(static_cast<double>(burst_bytes_) * 8.0 / secs);
+    const double throughput_bps = static_cast<double>(burst_bytes_) * 8.0 / secs;
+    last_segment_bytes_ = burst_bytes_;
+    last_segment_download_secs_ = secs;
+    last_segment_throughput_bps_ = throughput_bps;
+    abr_samples_.push_back(throughput_bps);
     while (abr_samples_.size() > 16) abr_samples_.pop_front();
+
+    std::cout << "NETWORK: Actual measured throughput: throughput = "
+              << burst_bytes_ << " bytes / " << secs << " seconds"
+              << " = "
+              << static_cast<int>((static_cast<double>(burst_bytes_) / secs) / 1024.0)
+              << " KB/s (" << static_cast<int>(throughput_bps / 1000.0)
+              << " kbps)" << std::endl;
   }
   burst_bytes_ = 0;
 }
@@ -1031,7 +1160,8 @@ void GstVideoPlayer::AbrTick() {
 
   // --- Buffer health (percent of the 30 s buffering target) ---
   const int pct = last_buffering_percent_.load();
-  const double buffer_secs = pct < 0 ? 10.0 : pct * 0.30;
+  const double buffer_secs = pct < 0 ? 10.0 :
+      (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
 
   double safety;
   if (buffer_secs < 6.0) {

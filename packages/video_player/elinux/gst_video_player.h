@@ -88,6 +88,9 @@ class GstVideoPlayer {
   void StopAbrEngine();
   void AbrTick();
   void CloseBurstLocked();
+  void LogPlaybackHealth(GstState state, uint64_t frames,
+                         std::chrono::steady_clock::time_point now,
+                         std::chrono::steady_clock::time_point last_frame_time);
   static void DeepElementAddedHandler(GstBin* bin, GstBin* sub_bin,
                                       GstElement* element, gpointer user_data);
   static GstPadProbeReturn AbrThroughputProbe(GstPad* pad,
@@ -150,6 +153,9 @@ class GstVideoPlayer {
   std::chrono::steady_clock::time_point burst_last_rx_;
   // Completed per-burst throughput samples in bits/sec (newest at back).
   std::deque<double> abr_samples_;
+  guint64 last_segment_bytes_ = 0;
+  double last_segment_download_secs_ = 0.0;
+  double last_segment_throughput_bps_ = 0.0;
   // Policy state — touched only by the ABR thread.
   guint64 published_kbps_ = 0;
   std::chrono::steady_clock::time_point last_upswitch_time_;
