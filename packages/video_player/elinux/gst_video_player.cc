@@ -1278,6 +1278,26 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
   switch (GST_MESSAGE_TYPE(message)) {
     case GST_MESSAGE_EOS: {
       auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+      // A LIVE stream has no end and must never "complete". souphttpsrc can
+      // emit a spurious EOS on a live source (e.g. at the live edge, or on a
+      // closed keep-alive=FALSE connection) where curlhttpsrc did not. Marking
+      // is_completed_ then makes GetCurrentPosition either SetSeek(0) (when
+      // auto-repeat/looping is on → "Failed to seek" on live) or fire a
+      // 'completed' event the app restarts from — BOTH replay the buffered
+      // window, and a repeating EOS turns that into the "same buffer loops"
+      // bug. So on a live stream (no known/seekable duration) IGNORE EOS; a
+      // genuine stop is recovered by the frame-arrival watchdog instead.
+      gint64 dur = 0;
+      const bool have_duration =
+          self->gst_.pipeline &&
+          gst_element_query_duration(self->gst_.pipeline, GST_FORMAT_TIME,
+                                     &dur) &&
+          dur > 0;
+      if (!have_duration) {
+        std::cout << "EOS on LIVE stream — ignoring (no completion/seek-0; "
+                     "frame-arrival watchdog handles a real stop)" << std::endl;
+        break;
+      }
       std::lock_guard<std::mutex> lock(self->mutex_event_completed_);
       self->is_completed_ = true;
       break;
