@@ -419,7 +419,14 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
     // (the recurring buffer-LOW source stall). With an inactivity timeout a
     // stalled fetch dies in 5s and hlsdemux retries, while a slow-but-
     // PROGRESSING segment keeps data flowing and is NOT cut.
-    g_object_set(source, "timeout", (guint)5, NULL);
+    // 15s, not 5s: this is an INACTIVITY timeout (abort a read with no data for
+    // N seconds). HLS segments here are ~10s, and at the live edge a legitimate
+    // wait for the next segment (or a CDN that holds the request open until the
+    // segment is ready) can exceed 5s — a 5s timeout aborts that healthy fetch,
+    // causing stutter and preventing the buffer from building. 15s is longer
+    // than a segment but still well under the 30s frame-stall watchdog, so a
+    // genuinely hung fetch still aborts+retries before a reconnect.
+    g_object_set(source, "timeout", (guint)15, NULL);
 
     // TLS: this CDN previously failed soup's strict certificate check, which is
     // why the project switched to curl. Relax strict verification so soup can
