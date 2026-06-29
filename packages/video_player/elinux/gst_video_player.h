@@ -118,6 +118,10 @@ class GstVideoPlayer {
   bool mute_ = false;
   bool auto_repeat_ = false;
   bool is_completed_ = false;
+  // True when the source is LIVE (set in Preroll from GST_STATE_CHANGE_NO_PREROLL).
+  // A live stream has no end: EOS on it is spurious and must never be treated as
+  // completion (no seek-0, no 'completed' event) or it loops the buffered window.
+  bool is_live_ = false;
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;

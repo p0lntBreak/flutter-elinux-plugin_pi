@@ -663,6 +663,15 @@ bool GstVideoPlayer::Preroll() {
     return false;
   }
   // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
+  // NO_PREROLL is GStreamer's authoritative "this source is LIVE" signal — far
+  // more reliable than a duration/seekable heuristic (a live HLS playlist still
+  // reports a small sliding-window duration, which looks like VOD). Capture it
+  // so EOS handling never treats a live stream as "completed".
+  if (result == GST_STATE_CHANGE_NO_PREROLL) {
+    is_live_ = true;
+    std::cout << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
+              << std::endl;
+  }
   // Give GStreamer up to 5 s to settle before Init() advances to PLAYING.
   GstState state;
   gst_element_get_state(gst_.pipeline, &state, NULL, 5 * GST_SECOND);
@@ -1286,21 +1295,20 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
     case GST_MESSAGE_EOS: {
       auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       // A LIVE stream has no end and must never "complete". souphttpsrc can
-      // emit a spurious EOS on a live source (e.g. at the live edge, or on a
-      // closed keep-alive=FALSE connection) where curlhttpsrc did not. Marking
-      // is_completed_ then makes GetCurrentPosition either SetSeek(0) (when
-      // auto-repeat/looping is on → "Failed to seek" on live) or fire a
-      // 'completed' event the app restarts from — BOTH replay the buffered
-      // window, and a repeating EOS turns that into the "same buffer loops"
-      // bug. So on a live stream (no known/seekable duration) IGNORE EOS; a
-      // genuine stop is recovered by the frame-arrival watchdog instead.
-      gint64 dur = 0;
-      const bool have_duration =
-          self->gst_.pipeline &&
-          gst_element_query_duration(self->gst_.pipeline, GST_FORMAT_TIME,
-                                     &dur) &&
-          dur > 0;
-      if (!have_duration) {
+      // emit a spurious EOS on a live source (live edge, or a closed
+      // keep-alive=FALSE connection) where curlhttpsrc did not. Marking
+      // is_completed_ then makes GetCurrentPosition either SetSeek(0) (auto-
+      // repeat → "Failed to seek" on live) or fire a 'completed' event the app
+      // restarts from — BOTH replay the buffered window, and a repeating EOS
+      // turns that into the "same buffer loops" bug (which appeared anywhere
+      // from 10 to 95 min into playback).
+      //
+      // Gate on is_live_ (set in Preroll from NO_PREROLL) — the authoritative
+      // live signal. The earlier duration>0 check was INERT because a live HLS
+      // playlist reports a small sliding-window duration that looks like VOD.
+      // On live: ignore EOS entirely; a genuine stop is recovered by the
+      // frame-arrival watchdog. On VOD: complete normally.
+      if (self->is_live_) {
         std::cout << "EOS on LIVE stream — ignoring (no completion/seek-0; "
                      "frame-arrival watchdog handles a real stop)" << std::endl;
         break;
