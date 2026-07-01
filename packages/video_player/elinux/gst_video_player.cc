@@ -73,6 +73,9 @@ bool GstVideoPlayer::Init() {
   // decoder starts producing frames and HandoffHandler can capture real
   // dimensions before OnNotifyInitialized() is sent to Flutter.
   play_state_requested_.store(true);
+  if (is_live_) {
+    std::cout << "Init: live stream stays in PLAYING after preroll" << std::endl;
+  }
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
     std::cerr << "Init: Failed to reach PLAYING state" << std::endl;
@@ -110,11 +113,20 @@ bool GstVideoPlayer::Play() {
     return false;
   }
 
+  if (is_live_) {
+    std::cout << "Play: live stream confirmed as PLAYING" << std::endl;
+  }
   stream_handler_->OnNotifyPlaying(true);
   return true;
 }
 
 bool GstVideoPlayer::Pause() {
+  if (is_live_) {
+    std::cout << "Pause ignored for live stream; keeping pipeline PLAYING"
+              << std::endl;
+    return true;
+  }
+
   play_state_requested_.store(false);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED) ==
       GST_STATE_CHANGE_FAILURE) {
