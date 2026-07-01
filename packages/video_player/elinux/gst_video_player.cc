@@ -1095,18 +1095,29 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
   gchar* name = gst_element_get_name(element);
   if (name && g_str_has_prefix(name, "hlsdemux")) {
+    // Keep a ref for the ABR engine (connection-speed actuation). The throughput
+    // probe does NOT go here: hlsdemux's sink pad only carries the periodic
+    // manifest/playlist (a few KB) — the media segments are fetched by the
+    // demux's internal source and never cross this pad, so a probe here never
+    // measures a real segment (throughput read as "unknown").
     {
       std::lock_guard<std::mutex> lock(self->abr_mutex_);
       if (self->hls_demux_) gst_object_unref(self->hls_demux_);
       self->hls_demux_ = GST_ELEMENT(gst_object_ref(element));
     }
-    GstPad* sinkpad = gst_element_get_static_pad(element, "sink");
-    if (sinkpad) {
-      gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_BUFFER,
+    std::cout << "ABR: found hlsdemux element: " << name << std::endl;
+  } else if (name && (g_str_has_prefix(name, "souphttpsrc") ||
+                      g_str_has_prefix(name, "curlhttpsrc"))) {
+    // Segments DO cross the http source's src pad — probe here for real
+    // per-segment throughput (size / download-time).
+    GstPad* srcpad = gst_element_get_static_pad(element, "src");
+    if (srcpad) {
+      gst_pad_add_probe(srcpad, GST_PAD_PROBE_TYPE_BUFFER,
                         AbrThroughputProbe, self, NULL);
-      gst_object_unref(sinkpad);
+      gst_object_unref(srcpad);
+      std::cout << "ABR: attached throughput probe to source: " << name
+                << std::endl;
     }
-    std::cout << "ABR: attached throughput probe to " << name << std::endl;
   }
   g_free(name);
 }
