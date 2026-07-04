@@ -92,6 +92,10 @@ class GstVideoPlayer {
   void GetVideoSize(int32_t& width, int32_t& height);
   void StartWatchdog();
   void StopWatchdog();
+  // Fire OnNotifyError at most once (matches the watchdog/error single-fire
+  // guard) and stop the watchdog. Used by both the fatal-error path and the
+  // entitlement-unavailable path so they never double-notify.
+  void NotifyErrorOnce(const std::string& message);
   void StartAbrEngine();
   void StopAbrEngine();
   void AbrTick();
@@ -140,6 +144,14 @@ class GstVideoPlayer {
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_running_{false};
   std::atomic<bool> error_notified_{false};  // single-fire guard for OnNotifyError
+  // Consecutive HTTP 401/403/410 failures from the HTTP source. A live stream
+  // whose subscription/entitlement has lapsed 4xx's every fetch; hlsdemux
+  // retries and swallows them (emitting EOS, which we ignore on live), so no
+  // fatal bus ERROR ever fires and playback silently loops the buffered
+  // remnant. Counting these warnings lets us detect that case and signal
+  // Flutter to check the subscription instead of reconnecting forever. Reset
+  // to 0 whenever a video frame advances (proof the stream is alive).
+  std::atomic<int> consecutive_unauthorized_{0};
   std::atomic<bool> play_state_requested_{false}; // tracks if user requested PLAYING
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
