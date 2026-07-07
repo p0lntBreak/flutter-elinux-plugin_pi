@@ -458,7 +458,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
     players_[texture_id] = std::move(instance);
   }
 
-  flutter::EncodableMap value;
+flutter::EncodableMap value;
   TextureMessage result;
 
   bool ok = players_[texture_id]->player->Init();
@@ -471,6 +471,13 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
                          std::to_string(texture_id);
     value.emplace(flutter::EncodableValue(kEncodableMapkeyError),
                   flutter::EncodableValue(WrapError(error_message)));
+    // Init() failed. The texture was already registered and this entry
+    // already inserted into players_ above, but Dart's create() never
+    // returns a textureId on this branch (the Future rejects with
+    // PlatformException) — so Dart has no id to pass to dispose() later.
+    // Clean up here or the texture + player leak on every failed Init().
+    DisposePlayer(texture_id);
+    players_.erase(texture_id);
   }
   reply(flutter::EncodableValue(value));
 }

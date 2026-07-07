@@ -118,11 +118,25 @@ bool GstVideoPlayer::Init() {
     return false;
   }
 
-  // Wait up to 5 s for HandoffHandler to deliver the first decoded frame.
+// Wait up to 5 s for HandoffHandler to deliver the first decoded frame, or
+  // for a fatal bus error (e.g. typefind failure) to arrive first.
   {
     std::unique_lock<std::mutex> lock(mutex_first_frame_);
-    first_frame_cv_.wait_for(lock, std::chrono::seconds(5),
-                             [this] { return first_frame_ready_.load(); });
+    first_frame_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+      return first_frame_ready_.load() || error_notified_.load();
+    });
+  }
+
+  // A fatal error arrived before any frame did — the pipeline is dead, not
+  // just slow. Returning true here previously told the caller Init succeeded
+  // while the pipeline sat wedged at READY with zero frames forever; the
+  // watchdog can't rescue this either, since its frame-stall check only runs
+  // once state==PLAYING, which this path never reaches.
+  if (error_notified_.load() && !first_frame_ready_.load()) {
+    std::cerr << "Init: pipeline error before first frame — failing Init()"
+              << std::endl;
+    DestroyPipeline();
+    return false;
   }
 
   // Complete init here (platform thread) if a frame arrived during the wait.
@@ -1063,10 +1077,6 @@ void GstVideoPlayer::StartWatchdog() {
       if (frames != last_seen_frames) {
         last_seen_frames = frames;
         last_frame_advance_time = now;
-        // A frame reached the sink → the stream is delivering, so any earlier
-        // transient HTTP 4xx (e.g. a token rotation) is stale. Clear the
-        // entitlement-failure tally so only a sustained lapse trips it.
-        consecutive_unauthorized_.store(0);
         LogPlaybackHealth(state, frames, now, last_frame_advance_time);
         continue;
       }
@@ -1099,20 +1109,6 @@ void GstVideoPlayer::StopWatchdog() {
   watchdog_cv_.notify_all();
   if (watchdog_thread_.joinable()) {
     watchdog_thread_.join();
-  }
-}
-
-void GstVideoPlayer::NotifyErrorOnce(const std::string& message) {
-  // Wake/stop the watchdog first so it cannot race a second notification, then
-  // fire exactly once. Do NOT join here: this can be called from the bus sync
-  // handler (a streaming thread), and the watchdog thread also touches the bus,
-  // so joining could deadlock. StopWatchdog() (which joins) runs later on
-  // teardown from the main thread.
-  watchdog_running_.store(false);
-  watchdog_cv_.notify_all();
-  bool expected = false;
-  if (error_notified_.compare_exchange_strong(expected, true)) {
-    stream_handler_->OnNotifyError(message);
   }
 }
 
@@ -1466,7 +1462,6 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       break;
     }
     case GST_MESSAGE_WARNING: {
-      auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
@@ -1474,29 +1469,6 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                 << ": " << (error->message ? error->message : "?");
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
-
-      // An entitlement lapse on a LIVE stream 4xx's every fetch, but hlsdemux
-      // retries and swallows them (surfacing only warnings + a live EOS we
-      // ignore), so no fatal error ever arrives. Count consecutive HTTP
-      // 401/403/410 warnings and, once they cross the threshold, signal Flutter
-      // that the stream is unavailable so it can prompt a subscription check
-      // instead of silently looping the buffered remnant forever.
-      if (self->is_live_ && self->play_state_requested_.load() &&
-          IsHttpUnavailable(error, debug)) {
-        int count = self->consecutive_unauthorized_.fetch_add(1) + 1;
-        std::cout << "WATCHDOG: HTTP-unauthorized warning " << count << "/"
-                  << kUnauthorizedWarningThreshold << " on live stream"
-                  << std::endl;
-        if (count >= kUnauthorizedWarningThreshold) {
-          std::string msg = std::string(kStreamUnavailablePrefix) +
-                            (error->message ? error->message : "stream unavailable");
-          std::cout << "WATCHDOG: " << msg
-                    << " — notifying Flutter (subscription/entitlement)"
-                    << std::endl;
-          self->NotifyErrorOnce(msg);
-        }
-      }
-
       g_free(debug);
       g_error_free(error);
       break;
@@ -1511,16 +1483,16 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                 << ": " << error_msg;
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
-      // Tag an entitlement/HTTP-auth failure so Flutter can branch to a
-      // subscription check rather than the (never-give-up) reconnect loop.
-      if (IsHttpUnavailable(error, debug)) {
-        error_msg = std::string(kStreamUnavailablePrefix) + error_msg;
-      }
       g_free(debug);
       g_error_free(error);
       // Stop the watchdog then fire OnNotifyError exactly once, even if the
       // watchdog and GST_MESSAGE_ERROR race at the same 30s boundary.
-      self->NotifyErrorOnce(error_msg);
+      self->watchdog_running_.store(false);
+      self->watchdog_cv_.notify_all();
+      bool expected = false;
+      if (self->error_notified_.compare_exchange_strong(expected, true)) {
+        self->stream_handler_->OnNotifyError(error_msg);
+      }
       break;
     }
     default:
