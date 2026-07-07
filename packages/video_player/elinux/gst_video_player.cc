@@ -26,12 +26,6 @@ constexpr gint64 kBufferTargetNs = 30000000000LL;
 // loop (reconnect just thrashes re-auth against a stream it can no longer play).
 constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 
-// Number of consecutive HTTP 401/403/410 warnings from the HTTP source before we
-// declare the stream unavailable. hlsdemux 4xx's every fetch once entitlement
-// lapses, so this trips quickly; a lone 4xx during a token rotation is reset by
-// the next advancing frame long before reaching the threshold.
-constexpr int kUnauthorizedWarningThreshold = 3;
-
 // True when a GStreamer error/warning is an HTTP entitlement failure (401/403/
 // 410) rather than a transient/network fault. souphttpsrc reports 401/403 as
 // GST_RESOURCE_ERROR_NOT_AUTHORIZED; we also scan the message/debug text so a
@@ -1465,10 +1459,15 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
+      std::string error_msg = error->message ? error->message : "unknown warning";
       std::cout << "WARNING from " << GST_OBJECT_NAME(message->src)
-                << ": " << (error->message ? error->message : "?");
+                << ": " << error_msg;
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
+      if (IsHttpUnavailable(error, debug)) {
+        std::cout << "WARNING: treating as entitlement lapse on live stream"
+                  << std::endl;
+      }
       g_free(debug);
       g_error_free(error);
       break;
@@ -1483,6 +1482,9 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                 << ": " << error_msg;
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
+      if (IsHttpUnavailable(error, debug)) {
+        error_msg = std::string(kStreamUnavailablePrefix) + error_msg;
+      }
       g_free(debug);
       g_error_free(error);
       // Stop the watchdog then fire OnNotifyError exactly once, even if the
