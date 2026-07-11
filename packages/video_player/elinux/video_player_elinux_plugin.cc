@@ -14,7 +14,12 @@
 #include <flutter/standard_method_codec.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "gst_video_player.h"
 #include "messages/messages.h"
@@ -63,12 +68,20 @@ class VideoPlayerPlugin : public flutter::Plugin {
     GstVideoPlayer::GstLibraryLoad();
   }
   virtual ~VideoPlayerPlugin() {
-    for (auto itr = players_.begin(); itr != players_.end();) {
-      auto texture_id = itr->first;
-      DisposePlayer(texture_id);
-      itr = players_.erase(itr);
+    // DisposePlayer() erases from players_ itself and parks the shell in
+    // retired_players_, so snapshot the ids first and don't erase here.
+    std::vector<int64_t> texture_ids;
+    texture_ids.reserve(players_.size());
+    for (const auto& entry : players_) {
+      texture_ids.push_back(entry.first);
     }
-
+    for (const auto texture_id : texture_ids) {
+      DisposePlayer(texture_id);
+    }
+    // Every GstVideoPlayer was destroyed synchronously inside DisposePlayer;
+    // the retired shells hold no GStreamer objects, so drop them now, before
+    // the library unload.
+    retired_players_.clear();
     GstVideoPlayer::GstLibraryUnload();
   }
 
@@ -78,6 +91,10 @@ class VideoPlayerPlugin : public flutter::Plugin {
     std::unique_ptr<GstVideoPlayer> player;
     std::unique_ptr<flutter::TextureVariant> texture;
     std::unique_ptr<FlutterDesktopPixelBuffer> buffer;
+    // Serialises the pixel-buffer copy (and the engine's subsequent
+    // glTexImage2D read, released via the buffer's release_callback) against
+    // DisposePlayer() tearing down `player`. See DisposePlayer().
+    std::mutex buffer_mutex;
 #ifdef USE_EGL_IMAGE_DMABUF
     std::unique_ptr<FlutterDesktopEGLImage> egl_image;
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -126,6 +143,7 @@ class VideoPlayerPlugin : public flutter::Plugin {
   void SendErrorEventMessage(int64_t texture_id, const std::string& message);
 
   void DisposePlayer(int64_t texture_id);
+  void ReapRetiredPlayers();
 
   flutter::EncodableValue WrapError(const std::string& message,
                                     const std::string& code = std::string(),
@@ -135,7 +153,15 @@ class VideoPlayerPlugin : public flutter::Plugin {
 
   flutter::PluginRegistrar* plugin_registrar_;
   flutter::TextureRegistrar* texture_registrar_;
-  std::unordered_map<int64_t, std::unique_ptr<FlutterVideoPlayer>> players_;
+  std::unordered_map<int64_t, std::shared_ptr<FlutterVideoPlayer>> players_;
+  // Disposed players whose FlutterVideoPlayer shell is kept alive briefly after
+  // UnregisterTexture(): the deprecated synchronous UnregisterTexture(int64_t)
+  // does not wait for the raster thread to stop invoking the texture callback,
+  // so the object (and its buffer_mutex) must outlive dispose. Reclaimed by
+  // ReapRetiredPlayers() once the raster thread has certainly drained.
+  std::vector<std::pair<std::chrono::steady_clock::time_point,
+                        std::shared_ptr<FlutterVideoPlayer>>>
+      retired_players_;
 };
 
 // static
@@ -274,10 +300,14 @@ void VideoPlayerPlugin::HandleInitializeMethodCall(
   // Dispose of all existing players. This helps to shut down existing players
   // on a hot restart.
   // https://github.com/flutter/flutter/issues/10437
-  for (auto itr = players_.begin(); itr != players_.end();) {
-    auto texture_id = itr->first;
+  // DisposePlayer() erases from players_ itself, so snapshot the ids first.
+  std::vector<int64_t> texture_ids;
+  texture_ids.reserve(players_.size());
+  for (const auto& entry : players_) {
+    texture_ids.push_back(entry.first);
+  }
+  for (const auto texture_id : texture_ids) {
     DisposePlayer(texture_id);
-    itr = players_.erase(itr);
   }
 
   flutter::EncodableMap result;
@@ -325,12 +355,31 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
       std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
           [instance = instance.get()](
               size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
+            // Hold buffer_mutex across the whole copy AND the engine's later
+            // glTexImage2D read: the engine reads the returned buffer after
+            // this callback returns and signals completion via the buffer's
+            // release_callback, so the lock is released there (or on an early
+            // return here). DisposePlayer() takes the same lock before freeing
+            // `player`, so the frame can't be freed mid-read; and the shell is
+            // kept alive past dispose (retired_players_), so this never
+            // dereferences freed memory even if it fires after dispose.
+            instance->buffer_mutex.lock();
             if (!instance->player) {
+              instance->buffer_mutex.unlock();
+              return nullptr;
+            }
+            const uint8_t* frame = instance->player->GetFrameBuffer();
+            if (!frame) {
+              instance->buffer_mutex.unlock();
               return nullptr;
             }
             instance->buffer->width = instance->player->GetWidth();
             instance->buffer->height = instance->player->GetHeight();
-            instance->buffer->buffer = instance->player->GetFrameBuffer();
+            instance->buffer->buffer = frame;
+            instance->buffer->release_callback = [](void* ctx) {
+              static_cast<FlutterVideoPlayer*>(ctx)->buffer_mutex.unlock();
+            };
+            instance->buffer->release_context = instance;
             return instance->buffer.get();
           }));
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -476,8 +525,8 @@ flutter::EncodableMap value;
     // returns a textureId on this branch (the Future rejects with
     // PlatformException) — so Dart has no id to pass to dispose() later.
     // Clean up here or the texture + player leak on every failed Init().
+    // DisposePlayer() erases from players_ itself.
     DisposePlayer(texture_id);
-    players_.erase(texture_id);
   }
   reply(flutter::EncodableValue(value));
 }
@@ -490,8 +539,8 @@ void VideoPlayerPlugin::HandleDisposeMethodCall(
   flutter::EncodableMap result;
 
   if (players_.find(texture_id) != players_.end()) {
+    // DisposePlayer() erases from players_ itself.
     DisposePlayer(texture_id);
-    players_.erase(texture_id);
     result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                    flutter::EncodableValue());
   } else {
@@ -726,16 +775,57 @@ void VideoPlayerPlugin::SendErrorEventMessage(int64_t texture_id,
 }
 
 void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
-  if (players_.find(texture_id) != players_.end()) {
-    texture_registrar_->UnregisterTexture(texture_id);
-    auto* player = players_[texture_id].get();
-    player->event_sink = nullptr;
-    if (player->event_channel) {
-      player->event_channel->SetStreamHandler(nullptr);
-    }
+  auto it = players_.find(texture_id);
+  if (it == players_.end()) {
+    return;
+  }
+  std::shared_ptr<FlutterVideoPlayer> player = it->second;
+  players_.erase(it);
+
+  // Detach the Dart-facing channels (platform thread — safe).
+  player->event_sink = nullptr;
+  if (player->event_channel) {
+    player->event_channel->SetStreamHandler(nullptr);
+  }
+
+  // Ask the engine to stop sampling this texture. This client wrapper only
+  // exposes the deprecated synchronous UnregisterTexture(int64_t), which
+  // returns BEFORE the raster thread has necessarily finished a copy in flight
+  // (or one it is about to start), so it does not by itself make teardown safe.
+  texture_registrar_->UnregisterTexture(texture_id);
+
+  // Tear down the GstVideoPlayer now (stops the pipeline and frees its
+  // CMA-backed buffers, which must not linger across reconnects) but UNDER
+  // buffer_mutex: if the raster thread is mid-copy, the copy callback holds the
+  // lock until the engine finishes reading the frame (release_callback), so we
+  // block here rather than freeing the frame out from under glTexImage2D.
+  // Nulling `player` also makes any copy that starts afterwards bail at once.
+  {
+    std::lock_guard<std::mutex> guard(player->buffer_mutex);
     player->player = nullptr;
-    player->buffer = nullptr;
-    player->texture = nullptr;
+  }
+
+  // Do NOT destroy the FlutterVideoPlayer shell here. A copy the raster thread
+  // already scheduled can still fire after UnregisterTexture() returns, and it
+  // dereferences this object (and its buffer_mutex). Keep the shell alive —
+  // `player` is now null, so the callback returns nullptr immediately — and
+  // reclaim it once the raster thread has certainly drained. This closes the
+  // use-after-free that segfaulted on reconnect teardown.
+  ReapRetiredPlayers();
+  retired_players_.emplace_back(std::chrono::steady_clock::now(),
+                                std::move(player));
+}
+
+void VideoPlayerPlugin::ReapRetiredPlayers() {
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = retired_players_.begin(); it != retired_players_.end();) {
+    // 5 s is far longer than the few frames the engine needs to stop invoking
+    // an unregistered texture's callback, so the shell is safe to free.
+    if (now - it->first > std::chrono::seconds(5)) {
+      it = retired_players_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 

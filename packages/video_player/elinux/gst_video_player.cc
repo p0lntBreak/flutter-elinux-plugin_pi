@@ -142,7 +142,15 @@ bool GstVideoPlayer::Init() {
   }
 
   StartWatchdog();
-  StartAbrEngine();
+  // ABR engine intentionally NOT started. On this deployment the network
+  // comfortably sustains the top rung and the manifest carries only two rungs,
+  // so the engine's conservative estimate only ever produced spurious
+  // down-switches to the 480p rung — which the HW ISP cannot pack to RGBA
+  // (S_FMT AB24 @ 854x480 fails) and which forced reconnect churn. The top
+  // rung is pinned via a high static connection-speed in CreatePipeline
+  // instead. StopAbrEngine() in DestroyPipeline() is a safe no-op when the
+  // engine was never started.
+  // StartAbrEngine();
   return true;
 }
 
@@ -668,10 +676,17 @@ bool GstVideoPlayer::CreatePipeline() {
 
   // The origin emits 10 s HLS segments, so keep roughly three segments of
   // time-depth. This gives the player enough cushion for a late segment fetch.
+  //
+  // Pin the top rendition: a connection-speed well above the highest rung's
+  // bandwidth makes hlsdemux always select the top variant and never
+  // down-switch (paired with the ABR engine being disabled in Init). On a link
+  // that genuinely cannot sustain the top rung this rebuffers rather than
+  // dropping to 480p — an accepted trade-off on this deployment (the 480p rung
+  // triggers the HW-convert S_FMT AB24 failure).
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
                "buffer-duration", kBufferTargetNs,        // 30 s
-               "connection-speed", (guint64)5000,
+               "connection-speed", (guint64)100000,       // 100 Mbps: pin top rung
                NULL);
 
   // Audio: audioconvert -> audioresample -> alsasink (HDMI auto-detected).
