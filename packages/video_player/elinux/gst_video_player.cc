@@ -142,15 +142,15 @@ bool GstVideoPlayer::Init() {
   }
 
   StartWatchdog();
-  // ABR engine intentionally NOT started. On this deployment the network
-  // comfortably sustains the top rung and the manifest carries only two rungs,
-  // so the engine's conservative estimate only ever produced spurious
-  // down-switches to the 480p rung — which the HW ISP cannot pack to RGBA
-  // (S_FMT AB24 @ 854x480 fails) and which forced reconnect churn. The top
-  // rung is pinned via a high static connection-speed in CreatePipeline
-  // instead. StopAbrEngine() in DestroyPipeline() is a safe no-op when the
-  // engine was never started.
-  // StartAbrEngine();
+  // ABR engine RE-ENABLED on fix8-ABR. It was previously disabled because a
+  // down-switch to the 480p rung crashed the HW ISP (S_FMT AB24 @ 854x480
+  // fails when the converter's output format is renegotiated mid-stream). That
+  // failure is now removed by pinning the ISP output geometry to a fixed
+  // 1280x720 in CreatePipeline (see the sink-bin comment), so the ISP simply
+  // scales a 480p rung up to 720p and its output S_FMT never changes. With the
+  // switch made safe, the engine can once again drop rungs on genuine sustained
+  // congestion instead of rebuffering on the top rung.
+  StartAbrEngine();
   return true;
 }
 
@@ -586,7 +586,9 @@ bool GstVideoPlayer::CreatePipeline() {
                    G_CALLBACK(DeepElementAddedHandler), this);
 
   // Video converter: prefer v4l2convert (hardware-accelerated) with RGBA output,
-  // fall back to software videoconvert if unavailable.
+  // fall back to software videoconvert if unavailable. The HW ISP does BOTH
+  // colour conversion (NV12->RGBA) and scaling, which is what lets us pin a
+  // fixed output geometry below and survive ABR rendition switches.
   gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
   if (!gst_.video_convert) {
     gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
@@ -639,14 +641,40 @@ bool GstVideoPlayer::CreatePipeline() {
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
 
-  // queue -> v4l2convert -> video/x-raw,format=RGBA -> fakesink
+  // queue -> v4l2convert -> video/x-raw,format=RGBA,1280x720 -> fakesink
+  //
+  // SEAMLESS ABR SWITCHING (fix8-ABR): pin the converter's OUTPUT geometry to a
+  // FIXED 1280x720 RGBA and let the HW ISP scale whatever the decoder produces
+  // up/down to it. This mirrors how phones/TVs/browsers switch renditions
+  // without a hitch: the display surface is a constant size and the scaler
+  // absorbs the input resolution change.
+  //
+  // Why this fixes the crash: previously the output caps constrained only the
+  // format (RGBA), so the output resolution TRACKED the input. An ABR
+  // down-switch (720p->480p) therefore changed the ISP's OUTPUT format
+  // mid-stream, forcing a VIDIOC_S_FMT for AB24 @ 854x480 that a V4L2 M2M
+  // device rejects while streaming (EINVAL) -> pipeline error -> reconnect
+  // churn -> crash. With a fixed output geometry the output S_FMT is programmed
+  // ONCE at preroll and never renegotiated; only the ISP's INPUT (capture-side
+  // NV12) changes on a switch, which the decoder drives via the standard V4L2
+  // source-change flow. Bonus: HandoffHandler's width_/height_ now never change
+  // after preroll, so the Flutter pixel buffer is allocated once (no per-switch
+  // texture resize). Both rungs are 16:9 (854x480 and 1280x720) so upscaling
+  // introduces no aspect distortion.
+  //
+  // NOTE (verify on build host): this assumes the Pi's v4l2convert can scale to
+  // a fixed output. It does (the ISP is a scaler). If a future build's HW
+  // convert cannot scale, this filtered link will fail negotiation and Init()
+  // returns false -> would then need a HW-scale-capable element or an SW
+  // videoscale (the SW colour-convert path was already proven too slow at 720p).
   gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert,
                    gst_.video_sink, NULL);
   if (!gst_element_link(video_queue, gst_.video_convert)) {
     std::cerr << "Failed to link queue to videoconvert" << std::endl;
     return false;
   }
-  auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
+  auto* caps = gst_caps_from_string(
+      "video/x-raw,format=RGBA,width=1280,height=720");
   auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
   gst_caps_unref(caps);
   if (!link_ok) {
@@ -677,16 +705,18 @@ bool GstVideoPlayer::CreatePipeline() {
   // The origin emits 10 s HLS segments, so keep roughly three segments of
   // time-depth. This gives the player enough cushion for a late segment fetch.
   //
-  // Pin the top rendition: a connection-speed well above the highest rung's
-  // bandwidth makes hlsdemux always select the top variant and never
-  // down-switch (paired with the ABR engine being disabled in Init). On a link
-  // that genuinely cannot sustain the top rung this rebuffers rather than
-  // dropping to 480p — an accepted trade-off on this deployment (the 480p rung
-  // triggers the HW-convert S_FMT AB24 failure).
+  // STARTUP rung: a high initial connection-speed makes hlsdemux pick the top
+  // variant for the first segments, before the ABR engine has its >=2 samples
+  // (AbrTick early-returns until then). This avoids the cold-start touch of the
+  // 480p rung. Once the engine has real throughput samples it OVERRIDES this
+  // value via SetConnectionSpeedKbps() and steers renditions dynamically (safe
+  // now that the ISP output geometry is pinned — see the sink-bin comment). If
+  // the engine never gets samples (e.g. probe yields nothing) hlsdemux simply
+  // stays on the top rung, which is the previous fix7 behaviour.
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
                "buffer-duration", kBufferTargetNs,        // 30 s
-               "connection-speed", (guint64)100000,       // 100 Mbps: pin top rung
+               "connection-speed", (guint64)100000,       // 100 Mbps: startup rung
                NULL);
 
   // Audio: audioconvert -> audioresample -> alsasink (HDMI auto-detected).
