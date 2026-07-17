@@ -20,13 +20,15 @@ constexpr double kBufferTargetSecs = 30.0;
 constexpr gint64 kBufferTargetNs = 30000000000LL;
 
 // --- Anti-flap ABR tuning ---
-// A healthy buffer PROVES the current rung is sustainable, so a low bandwidth
-// estimate (this link's estimate is very noisy — cv routinely >100%) must NOT
-// drop the rung while the cushion is full: that only causes visible quality
-// pumping. Only honor a bandwidth-estimate down-switch once the buffer has
-// meaningfully started draining (fallen below this floor). Above it we hold the
-// rung no matter how noisy the estimate; the buffer absorbs the variance.
-constexpr double kDropBufferFloorSecs = 20.0;
+// The "healthy buffer" line, in seconds. A buffer at/above this PROVES the
+// current rung is sustainable, so (a) a low bandwidth estimate (this link's
+// estimate is very noisy — cv routinely >100%) must NOT drop the rung above it
+// (the buffer absorbs the variance — otherwise pure quality pumping), and
+// (b) up-switching is only allowed at/above it. Set to 15s to match the code's
+// "comfortable" safety zone AND to stay BELOW the real live-edge buffer plateau
+// (which can sit ~17s, not the 30s target) — a 20s line was unreachable at the
+// live edge, trapping playback on the lowest rung with no way to climb back.
+constexpr double kHealthyBufferSecs = 15.0;
 // Even below the floor, require a >=20% drop to persist across this many 1 s
 // AbrTick cycles before acting, so a single dipped sample can't flap the rung.
 constexpr int kSustainedDropTicks = 3;
@@ -1426,7 +1428,7 @@ void GstVideoPlayer::AbrTick() {
     publish = true;
     reason = "buffer emergency";
     abr_drop_ticks_ = 0;
-  } else if (is_drop && buffer_secs < kDropBufferFloorSecs) {
+  } else if (is_drop && buffer_secs < kHealthyBufferSecs) {
     // The buffer has meaningfully drained AND the estimate is >=20% down —
     // a real decline. Still require it to persist a few ticks so a single
     // dipped sample can't flap the rung.
@@ -1443,7 +1445,8 @@ void GstVideoPlayer::AbrTick() {
   } else {
     // Either no drop, or a drop while the buffer is still healthy (absorb it).
     abr_drop_ticks_ = 0;
-    if (target_kbps * 4 >= published_kbps_ * 5 && buffer_secs >= 20.0 &&
+    if (target_kbps * 4 >= published_kbps_ * 5 &&
+        buffer_secs >= kHealthyBufferSecs &&
         now - last_upswitch_time_ > std::chrono::seconds(30)) {
       publish = true;  // >=25% headroom, healthy buffer, dwell time served
       reason = "up-switch";
