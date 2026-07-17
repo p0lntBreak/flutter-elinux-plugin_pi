@@ -19,6 +19,18 @@ namespace {
 constexpr double kBufferTargetSecs = 30.0;
 constexpr gint64 kBufferTargetNs = 30000000000LL;
 
+// --- Anti-flap ABR tuning ---
+// A healthy buffer PROVES the current rung is sustainable, so a low bandwidth
+// estimate (this link's estimate is very noisy — cv routinely >100%) must NOT
+// drop the rung while the cushion is full: that only causes visible quality
+// pumping. Only honor a bandwidth-estimate down-switch once the buffer has
+// meaningfully started draining (fallen below this floor). Above it we hold the
+// rung no matter how noisy the estimate; the buffer absorbs the variance.
+constexpr double kDropBufferFloorSecs = 20.0;
+// Even below the floor, require a >=20% drop to persist across this many 1 s
+// AbrTick cycles before acting, so a single dipped sample can't flap the rung.
+constexpr int kSustainedDropTicks = 3;
+
 // Stable machine prefix on the error string handed to Flutter for a stream that
 // is unavailable due to entitlement (subscription lapsed / channel de-entitled),
 // as opposed to a transient/network error. The Dart side branches on this: it
@@ -412,6 +424,28 @@ static std::string PickAudioDevice() {
   return "plughw:0,0";
 }
 
+// Diagnostic: log the caps negotiated on either side of the ISP (v4l2convert)
+// whenever they change. user_data is a static string tag identifying the pad.
+// This reveals what actually happens across an ABR resolution switch: the sink
+// pad shows the DECODER output (e.g. 854x480 vs 1280x720), the src pad shows
+// what the ISP produces (pinned 1280x720 if the fixed-geometry hold works). If
+// the sink changes to 854x480 while the src stays 1280x720, the ISP is being
+// asked to upscale — and a cropped/zoomed picture then confirms it is NOT
+// recomputing its scale for the new input (the crop bug we need to fix).
+static GstPadProbeReturn IspCapsLogProbe(GstPad* /*pad*/, GstPadProbeInfo* info,
+                                         gpointer user_data) {
+  GstEvent* event = GST_PAD_PROBE_INFO_EVENT(info);
+  if (event && GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
+    GstCaps* caps = nullptr;
+    gst_event_parse_caps(event, &caps);
+    gchar* s = caps ? gst_caps_to_string(caps) : nullptr;
+    std::cout << "ISP-CAPS[" << reinterpret_cast<const char*>(user_data)
+              << "]: " << (s ? s : "(null)") << std::endl;
+    if (s) g_free(s);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 static void SourceSetupCallback(GstElement* playbin, GstElement* source,
                                 gpointer user_data) {
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
@@ -680,6 +714,20 @@ bool GstVideoPlayer::CreatePipeline() {
   if (!link_ok) {
     std::cerr << "Failed to link videoconvert to fakesink" << std::endl;
     return false;
+  }
+
+  // Diagnostic (fix8-ABR): watch the caps on both sides of the ISP so a device
+  // run reveals exactly what it negotiates across a 480<->720 rendition switch
+  // (see IspCapsLogProbe). Cheap — fires only on a caps change, not per frame.
+  if (auto* isp_sink = gst_element_get_static_pad(gst_.video_convert, "sink")) {
+    gst_pad_add_probe(isp_sink, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                      IspCapsLogProbe, (gpointer) "convert-sink", NULL);
+    gst_object_unref(isp_sink);
+  }
+  if (auto* isp_src = gst_element_get_static_pad(gst_.video_convert, "src")) {
+    gst_pad_add_probe(isp_src, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                      IspCapsLogProbe, (gpointer) "convert-src", NULL);
+    gst_object_unref(isp_src);
   }
 
   auto* sinkpad = gst_element_get_static_pad(video_queue, "sink");
@@ -1358,24 +1406,49 @@ void GstVideoPlayer::AbrTick() {
       static_cast<guint64>(predicted_bps * safety / 1000.0);
   if (target_kbps < 100) target_kbps = 100;  // keep the lowest rung reachable
 
-  // --- Anti-flap policy ---
+  // --- Anti-flap policy (buffer-aware) ---
+  // The buffer, not the raw estimate, decides down-switches. A full cushion
+  // proves the current rung is sustainable, so we ignore estimate drops until
+  // the buffer actually starts draining — this kills the quality pumping seen
+  // when every noisy dip at buffer=30s triggered a "bandwidth drop".
   const auto now = std::chrono::steady_clock::now();
   bool publish = false;
   const char* reason = "";
+  const bool is_drop = target_kbps * 5 <= published_kbps_ * 4;  // >=20% below
+
   if (published_kbps_ == 0) {
     publish = true;
     reason = "first estimate";
-  } else if (target_kbps * 5 <= published_kbps_ * 4) {
-    publish = true;  // >=20% drop: act immediately, quality can wait
-    reason = "bandwidth drop";
+    abr_drop_ticks_ = 0;
   } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
-    publish = true;  // buffer emergency: any reduction helps now
+    // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
+    // the only instant down-switch path.
+    publish = true;
     reason = "buffer emergency";
-  } else if (target_kbps * 4 >= published_kbps_ * 5 && buffer_secs >= 20.0 &&
-             now - last_upswitch_time_ > std::chrono::seconds(30)) {
-    publish = true;  // >=25% headroom, healthy buffer, dwell time served
-    reason = "up-switch";
-    last_upswitch_time_ = now;
+    abr_drop_ticks_ = 0;
+  } else if (is_drop && buffer_secs < kDropBufferFloorSecs) {
+    // The buffer has meaningfully drained AND the estimate is >=20% down —
+    // a real decline. Still require it to persist a few ticks so a single
+    // dipped sample can't flap the rung.
+    if (++abr_drop_ticks_ >= kSustainedDropTicks) {
+      publish = true;
+      reason = "bandwidth drop";
+      abr_drop_ticks_ = 0;
+    } else {
+      std::cout << "ABR: drop deferred (" << abr_drop_ticks_ << "/"
+                << kSustainedDropTicks << ") buffer="
+                << static_cast<int>(buffer_secs) << "s cv="
+                << static_cast<int>(cv * 100) << "%" << std::endl;
+    }
+  } else {
+    // Either no drop, or a drop while the buffer is still healthy (absorb it).
+    abr_drop_ticks_ = 0;
+    if (target_kbps * 4 >= published_kbps_ * 5 && buffer_secs >= 20.0 &&
+        now - last_upswitch_time_ > std::chrono::seconds(30)) {
+      publish = true;  // >=25% headroom, healthy buffer, dwell time served
+      reason = "up-switch";
+      last_upswitch_time_ = now;
+    }
   }
 
   if (publish) {

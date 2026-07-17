@@ -184,6 +184,10 @@ class GstVideoPlayer {
   guint64 published_kbps_ = 0;
   std::chrono::steady_clock::time_point last_upswitch_time_;
   int abr_heartbeat_counter_ = 0;
+  // Consecutive AbrTick cycles a >=20% drop has persisted below the buffer
+  // floor; a down-switch fires only once it reaches kSustainedDropTicks so a
+  // single noisy sample can't flap the rung. Reset whenever the drop clears.
+  int abr_drop_ticks_ = 0;
 
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video
