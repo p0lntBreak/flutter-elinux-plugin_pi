@@ -146,6 +146,15 @@ bool GstVideoPlayer::Init() {
   // receive a buffer in PAUSED. Advance to PLAYING now so the V4L2 hardware
   // decoder starts producing frames and HandoffHandler can capture real
   // dimensions before OnNotifyInitialized() is sent to Flutter.
+  //
+  // Preroll audio-mute: because we transition to PLAYING before the preroll
+  // gate below is satisfied, the audio branch would otherwise play the first
+  // buffered seconds of audio while the spinner is still up (visible mismatch
+  // between UI and stream). Force playbin mute for the duration of the gate
+  // wait and restore the caller-requested mute state on the way out. Video
+  // is unaffected — HandoffHandler still needs to see frames during the wait
+  // to capture dimensions.
+  g_object_set(gst_.playbin, "mute", TRUE, NULL);
   play_state_requested_.store(true);
   if (is_live_) {
     std::cout << "Init: live stream stays in PLAYING after preroll" << std::endl;
@@ -237,6 +246,11 @@ bool GstVideoPlayer::Init() {
       std::this_thread::sleep_for(std::chrono::milliseconds(kPrerollPollMs));
     }
   }
+
+  // Preroll gate satisfied (or exited due to error): restore the caller's
+  // requested mute state. On the error path the pipeline is torn down
+  // immediately below, so setting mute back here is harmless.
+  g_object_set(gst_.playbin, "mute", mute_ ? TRUE : FALSE, NULL);
 
   // Preroll aborted by a fatal bus error (e.g. HTTP 4xx, EOS on VOD manifest,
   // souphttpsrc inactivity timeout). Bail before the first-frame wait so we
