@@ -33,6 +33,24 @@ constexpr double kHealthyBufferSecs = 15.0;
 // AbrTick cycles before acting, so a single dipped sample can't flap the rung.
 constexpr int kSustainedDropTicks = 3;
 
+// Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Chosen to
+// land near a 480p rung so the initial buffer fills fast — the ABR engine
+// override kicks in once it has >=2 throughput samples and drives quality up
+// from there. Prior behaviour was 100 Mbps (top-rung startup) which made the
+// preroll wait long on weak links.
+constexpr guint64 kColdStartConnSpeedKbps = 1200;
+
+// Cold-start preroll target (seconds of buffered content required before Init()
+// returns success). Matches kHealthyBufferSecs on purpose: it's the same "this
+// rung is sustainable" line the ABR engine uses. Deliberately no wall-clock
+// cap — spinner takes as long as needed; only a hard error (HTTP timeout,
+// EOS, resource failure) ends the wait early.
+constexpr double kColdStartPrerollSecs = 15.0;
+
+// Poll interval for the preroll wait. Fast enough to feel responsive on a good
+// link; slow enough not to spam gst_query_new_buffering().
+constexpr int kPrerollPollMs = 500;
+
 // Stable machine prefix on the error string handed to Flutter for a stream that
 // is unavailable due to entitlement (subscription lapsed / channel de-entitled),
 // as opposed to a transient/network error. The Dart side branches on this: it
@@ -126,8 +144,101 @@ bool GstVideoPlayer::Init() {
     return false;
   }
 
-// Wait up to 5 s for HandoffHandler to deliver the first decoded frame, or
-  // for a fatal bus error (e.g. typefind failure) to arrive first.
+  // Preroll gate (task #8a — YouTube-pattern cold start): wait for
+  // kColdStartPrerollSecs of *real* buffered content before returning to
+  // Flutter. The pipeline is technically PLAYING here (fakesink+sync=TRUE
+  // needs it so HandoffHandler can capture first-frame dimensions), but Init()
+  // stays blocked and the Dart side keeps the spinner up. No wall-clock cap —
+  // only a hard error breaks the wait early. Query logic mirrors
+  // LogPlaybackHealth() exactly so both agree on "how much is buffered."
+  {
+    auto last_progress_log = std::chrono::steady_clock::now();
+    double last_logged_secs = -1.0;
+    while (!error_notified_.load()) {
+      gint64 position = 0;
+      const bool has_position = gst_element_query_position(
+          gst_.pipeline, GST_FORMAT_TIME, &position);
+
+      double buffer_health_secs = -1.0;
+      bool used_estimate = true;
+      GstQuery* query = gst_query_new_buffering(GST_FORMAT_TIME);
+      if (query && gst_element_query(gst_.pipeline, query)) {
+        GstFormat format = GST_FORMAT_TIME;
+        gint64 start = 0;
+        gint64 stop = -1;
+        gint64 estimated_total = -1;
+        gst_query_parse_buffering_range(query, &format, &start, &stop,
+                                        &estimated_total);
+        if (format == GST_FORMAT_TIME && has_position && stop >= position) {
+          buffer_health_secs = static_cast<double>(stop - position) /
+                               static_cast<double>(GST_SECOND);
+          used_estimate = false;
+        }
+      }
+      if (query) gst_query_unref(query);
+
+      const int pct = last_buffering_percent_.load();
+      if (used_estimate && pct >= 0) {
+        // Fallback: percent-derived estimate. Also treat pct>=100 as threshold
+        // met — some live sources never emit a valid TIME buffering-range but
+        // do drive buffering percent to 100 once the playbin queue is full.
+        buffer_health_secs =
+            (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
+      }
+
+      if (buffer_health_secs >= kColdStartPrerollSecs || pct >= 100) {
+        std::cout << "PREROLL_WAIT: threshold met — buffered="
+                  << static_cast<int>(buffer_health_secs) << "s pct=" << pct
+                  << (used_estimate ? " (est)" : "") << std::endl;
+        break;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      const auto since_log = std::chrono::duration_cast<std::chrono::seconds>(
+          now - last_progress_log).count();
+      // Log/publish every ~1s so Dart has a live pulse and the health log has
+      // a trail. Also fire whenever the value moved by >=1s so a rapid climb
+      // on a fast link isn't hidden behind the 1s throttle.
+      const bool moved =
+          buffer_health_secs >= 0.0 &&
+          (last_logged_secs < 0.0 ||
+           std::abs(buffer_health_secs - last_logged_secs) >= 1.0);
+      if (since_log >= 1 || moved) {
+        std::cout << "PREROLL_WAIT: buffered="
+                  << static_cast<int>(buffer_health_secs >= 0.0
+                                          ? buffer_health_secs
+                                          : 0.0)
+                  << "s/" << static_cast<int>(kColdStartPrerollSecs)
+                  << "s pct=" << pct << (used_estimate ? " (est)" : "")
+                  << std::endl;
+        // Republish buffering percent so the Dart side has a pulse even on
+        // sources whose BUFFERING messages are quiet between edges.
+        if (pct >= 0) {
+          stream_handler_->OnNotifyBufferingUpdate(pct);
+        }
+        last_progress_log = now;
+        last_logged_secs = buffer_health_secs;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(kPrerollPollMs));
+    }
+  }
+
+  // Preroll aborted by a fatal bus error (e.g. HTTP 4xx, EOS on VOD manifest,
+  // souphttpsrc inactivity timeout). Bail before the first-frame wait so we
+  // don't sit another 5s on a dead pipeline.
+  if (error_notified_.load()) {
+    std::cerr << "Init: pipeline error during preroll — failing Init()"
+              << std::endl;
+    DestroyPipeline();
+    return false;
+  }
+
+  // Wait up to 5 s for HandoffHandler to deliver the first decoded frame, or
+  // for a fatal bus error (e.g. typefind failure) to arrive first. After the
+  // preroll gate above, the buffer is deep so this should almost always be
+  // near-instant; kept intact so the deferred-init path still exists for the
+  // corner case where a frame slips past the query.
   {
     std::unique_lock<std::mutex> lock(mutex_first_frame_);
     first_frame_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
@@ -755,18 +866,22 @@ bool GstVideoPlayer::CreatePipeline() {
   // The origin emits 10 s HLS segments, so keep roughly three segments of
   // time-depth. This gives the player enough cushion for a late segment fetch.
   //
-  // STARTUP rung: a high initial connection-speed makes hlsdemux pick the top
-  // variant for the first segments, before the ABR engine has its >=2 samples
-  // (AbrTick early-returns until then). This avoids the cold-start touch of the
-  // 480p rung. Once the engine has real throughput samples it OVERRIDES this
-  // value via SetConnectionSpeedKbps() and steers renditions dynamically (safe
-  // now that the ISP output geometry is pinned — see the sink-bin comment). If
-  // the engine never gets samples (e.g. probe yields nothing) hlsdemux simply
-  // stays on the top rung, which is the previous fix7 behaviour.
+  // STARTUP rung: a conservative initial connection-speed hint makes hlsdemux
+  // pick a mid-low variant (aim: 480p) for the first segments, before the ABR
+  // engine has its >=2 samples (AbrTick early-returns until then). The prior
+  // 100 Mbps top-rung startup made the preroll wait long on weak links — a
+  // large top-rung segment can be 5-10x the wall time of a small 480p one,
+  // stretching the spinner for no quality gain (ABR still has to prove the top
+  // rung is sustainable before staying there). Once the engine has real
+  // throughput samples it OVERRIDES this value via SetConnectionSpeedKbps()
+  // and climbs renditions dynamically. Safe on this pipeline because the ISP
+  // output geometry is pinned (see the sink-bin comment) so a 480p rung
+  // upscaled to 720p costs nothing downstream. If the ABR engine never gets
+  // samples (e.g. probe yields nothing) hlsdemux simply stays on this rung.
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
                "buffer-duration", kBufferTargetNs,        // 30 s
-               "connection-speed", (guint64)100000,       // 100 Mbps: startup rung
+               "connection-speed", kColdStartConnSpeedKbps,
                NULL);
 
   // Audio: audioconvert -> audioresample -> alsasink (HDMI auto-detected).
