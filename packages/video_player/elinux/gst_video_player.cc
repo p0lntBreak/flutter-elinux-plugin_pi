@@ -33,12 +33,17 @@ constexpr double kHealthyBufferSecs = 15.0;
 // AbrTick cycles before acting, so a single dipped sample can't flap the rung.
 constexpr int kSustainedDropTicks = 3;
 
-// Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Chosen to
-// land near a 480p rung so the initial buffer fills fast — the ABR engine
-// override kicks in once it has >=2 throughput samples and drives quality up
-// from there. Prior behaviour was 100 Mbps (top-rung startup) which made the
-// preroll wait long on weak links.
-constexpr guint64 kColdStartConnSpeedKbps = 1200;
+// Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Kept at
+// top-rung (100 Mbps) on purpose: an initial mid-low hint (e.g. 1200 kbps for
+// a 360p landing) creates a cold-start→up-switch→down-switch pool-geometry
+// sequence the bcm2835-codec V4L2 pool cannot survive. The pool grows fine
+// but S_FMT to a smaller geometry after growing fails with "Device has no
+// supported format" (verified on device 2026-07-30). fix8-ABR's whole design
+// is to only ever set the input pool to the LARGEST geometry that will be
+// seen; top-rung startup preserves that invariant. The preroll gate below
+// (task #8a) handles honest-wait behavior separately — it does NOT depend on
+// the rung choice.
+constexpr guint64 kColdStartConnSpeedKbps = 100000;
 
 // Cold-start preroll target (seconds of buffered content required before Init()
 // returns success). Matches kHealthyBufferSecs on purpose: it's the same "this
@@ -866,18 +871,18 @@ bool GstVideoPlayer::CreatePipeline() {
   // The origin emits 10 s HLS segments, so keep roughly three segments of
   // time-depth. This gives the player enough cushion for a late segment fetch.
   //
-  // STARTUP rung: a conservative initial connection-speed hint makes hlsdemux
-  // pick a mid-low variant (aim: 480p) for the first segments, before the ABR
-  // engine has its >=2 samples (AbrTick early-returns until then). The prior
-  // 100 Mbps top-rung startup made the preroll wait long on weak links — a
-  // large top-rung segment can be 5-10x the wall time of a small 480p one,
-  // stretching the spinner for no quality gain (ABR still has to prove the top
-  // rung is sustainable before staying there). Once the engine has real
-  // throughput samples it OVERRIDES this value via SetConnectionSpeedKbps()
-  // and climbs renditions dynamically. Safe on this pipeline because the ISP
-  // output geometry is pinned (see the sink-bin comment) so a 480p rung
-  // upscaled to 720p costs nothing downstream. If the ABR engine never gets
-  // samples (e.g. probe yields nothing) hlsdemux simply stays on this rung.
+  // STARTUP rung: a high initial connection-speed makes hlsdemux pick the top
+  // variant for the first segments, before the ABR engine has its >=2 samples
+  // (AbrTick early-returns until then). This is NOT for speed — it's the
+  // invariant that keeps the bcm2835-codec V4L2 input pool safe. Starting at a
+  // lower rung and letting ABR climb sets the pool to a small geometry first,
+  // then GROWS it on up-switch (OK), then tries to SHRINK it on the next
+  // down-switch (FAILS: S_FMT "Device has no supported format", verified
+  // 2026-07-30). Top-rung startup means the pool is set once at the largest
+  // geometry that will ever be seen; every subsequent switch is a no-op or a
+  // shrink the ISP can absorb via the pinned 1280x720 output geometry (see
+  // the sink-bin comment). If the ABR engine never gets samples (e.g. probe
+  // yields nothing) hlsdemux simply stays on the top rung.
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
                "buffer-duration", kBufferTargetNs,        // 30 s
