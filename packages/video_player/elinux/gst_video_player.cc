@@ -33,6 +33,15 @@ constexpr double kHealthyBufferSecs = 15.0;
 // AbrTick cycles before acting, so a single dipped sample can't flap the rung.
 constexpr int kSustainedDropTicks = 3;
 
+// Minimum time between a (non-emergency) down-switch and a subsequent
+// up-switch. The 11:20:29 -> 11:20:30 log showed a bandwidth-drop and an
+// up-switch fire one second apart on a jittery link; the two decisions
+// disagreed on direction but the estimate hadn't actually stabilised, and
+// hlsdemux ended up re-selecting essentially the same rung. Holding the new
+// (lower) rung for a stability window lets the estimate settle before we
+// let it climb again.
+constexpr int kPostDownDwellSecs = 20;
+
 // Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Kept at
 // top-rung (100 Mbps) on purpose: an initial mid-low hint (e.g. 1200 kbps for
 // a 360p landing) creates a cold-start→up-switch→down-switch pool-geometry
@@ -1544,7 +1553,8 @@ void GstVideoPlayer::AbrTick() {
     abr_drop_ticks_ = 0;
   } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
     // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
-    // the only instant down-switch path.
+    // the only instant down-switch path. Deliberately does NOT stamp
+    // last_downswitch_time_: survival beats the anti-thrash dwell.
     publish = true;
     reason = "buffer emergency";
     abr_drop_ticks_ = 0;
@@ -1556,6 +1566,7 @@ void GstVideoPlayer::AbrTick() {
       publish = true;
       reason = "bandwidth drop";
       abr_drop_ticks_ = 0;
+      last_downswitch_time_ = now;
     } else {
       std::cout << "ABR: drop deferred (" << abr_drop_ticks_ << "/"
                 << kSustainedDropTicks << ") buffer="
@@ -1565,10 +1576,20 @@ void GstVideoPlayer::AbrTick() {
   } else {
     // Either no drop, or a drop while the buffer is still healthy (absorb it).
     abr_drop_ticks_ = 0;
+    // Anti-thrash gate: after a non-emergency down-switch, hold the new rung
+    // for kPostDownDwellSecs regardless of estimate before letting it climb
+    // again. On device (11:20:29 drop -> 11:20:30 up-switch) the two decisions
+    // fired one second apart on the same noisy sample window; the up-switch
+    // often resolved to the very rung the drop had just left, producing
+    // pipeline-visible churn for zero quality gain.
+    const bool post_down_dwell_served =
+        last_downswitch_time_.time_since_epoch().count() == 0 ||
+        now - last_downswitch_time_ > std::chrono::seconds(kPostDownDwellSecs);
     if (target_kbps * 4 >= published_kbps_ * 5 &&
         buffer_secs >= kHealthyBufferSecs &&
-        now - last_upswitch_time_ > std::chrono::seconds(30)) {
-      publish = true;  // >=25% headroom, healthy buffer, dwell time served
+        now - last_upswitch_time_ > std::chrono::seconds(30) &&
+        post_down_dwell_served) {
+      publish = true;  // >=25% headroom, healthy buffer, both dwell timers served
       reason = "up-switch";
       last_upswitch_time_ = now;
     }

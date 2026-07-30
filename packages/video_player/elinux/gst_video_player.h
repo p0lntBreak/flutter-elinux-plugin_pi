@@ -183,6 +183,13 @@ class GstVideoPlayer {
   // Policy state — touched only by the ABR thread.
   guint64 published_kbps_ = 0;
   std::chrono::steady_clock::time_point last_upswitch_time_;
+  // Timestamp of the last non-emergency down-switch. Used to enforce a
+  // cross-direction dwell: an up-switch immediately after a down-switch
+  // (seen 11:20:29 -> 11:20:30 on device) is quality thrash and often
+  // resolves to the same rung, so the second decision was pointless churn.
+  // Emergency down-switches deliberately do NOT stamp this — survival still
+  // beats hysteresis when the buffer is nearly gone.
+  std::chrono::steady_clock::time_point last_downswitch_time_;
   int abr_heartbeat_counter_ = 0;
   // Consecutive AbrTick cycles a >=20% drop has persisted below the buffer
   // floor; a down-switch fires only once it reaches kSustainedDropTicks so a
