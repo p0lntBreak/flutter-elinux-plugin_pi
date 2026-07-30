@@ -516,8 +516,16 @@ flutter::EncodableMap value;
     value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
                   result.ToMap());
   } else {
-    auto error_message = "Failed to initialize the player with texture id: " +
-                         std::to_string(texture_id);
+    // Prefer the specific error surfaced from Init() (e.g. NETWORK_TOO_SLOW:,
+    // STREAM_UNAVAILABLE:) if one was recorded — the Dart side branches on
+    // those prefixes to render distinct UIs. Fall back to the generic
+    // texture-id message if nothing was recorded (e.g. a very early failure
+    // before any NotifyError path fired).
+    std::string specific = players_[texture_id]->player->GetLastError();
+    auto error_message = !specific.empty()
+        ? specific
+        : ("Failed to initialize the player with texture id: " +
+           std::to_string(texture_id));
     value.emplace(flutter::EncodableValue(kEncodableMapkeyError),
                   flutter::EncodableValue(WrapError(error_message)));
     // Init() failed. The texture was already registered and this entry

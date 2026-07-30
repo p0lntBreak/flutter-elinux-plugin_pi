@@ -309,6 +309,7 @@ bool GstVideoPlayer::Init() {
             std::cerr << msg << std::endl;
             bool expected = false;
             if (error_notified_.compare_exchange_strong(expected, true)) {
+              last_error_ = msg;
               stream_handler_->OnNotifyError(msg);
             }
             break;
@@ -1415,6 +1416,7 @@ void GstVideoPlayer::StartWatchdog() {
         watchdog_running_.store(false);
         bool expected = false;
         if (error_notified_.compare_exchange_strong(expected, true)) {
+          last_error_ = msg;
           stream_handler_->OnNotifyError(msg);
         }
         break;
@@ -1856,6 +1858,7 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       self->watchdog_cv_.notify_all();
       bool expected = false;
       if (self->error_notified_.compare_exchange_strong(expected, true)) {
+        self->last_error_ = error_msg;
         self->stream_handler_->OnNotifyError(error_msg);
       }
       break;

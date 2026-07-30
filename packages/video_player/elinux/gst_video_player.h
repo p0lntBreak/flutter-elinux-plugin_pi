@@ -68,6 +68,14 @@ class GstVideoPlayer {
   // ADD THIS METHOD DECLARATION
   void SetAuthHeaders(const std::map<std::string, std::string>& headers);
 
+  // Last error string set on this player (via NotifyErrorOnce). The plugin's
+  // create() reply must carry the specific error text through — the Dart
+  // side's event channel is not yet connected when Init() runs, so an
+  // OnNotifyError() dispatch at that stage is not observable to Dart, and the
+  // create-method-channel reply is the only signal Dart receives on init
+  // failure. Returns an empty string if no error was ever recorded.
+  std::string GetLastError() const { return last_error_; }
+
  AuthHeaders auth_headers_;
 
  private:
@@ -150,6 +158,11 @@ class GstVideoPlayer {
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_running_{false};
   std::atomic<bool> error_notified_{false};  // single-fire guard for OnNotifyError
+  // Last error message stored alongside the single-fire guard. Read by
+  // GetLastError() so the create-method-channel reply can carry the specific
+  // error text (e.g. NETWORK_TOO_SLOW:) when Init() fails. Written only under
+  // the same compare_exchange_strong that flips error_notified_ true.
+  std::string last_error_;
   // Consecutive HTTP 401/403/410 failures from the HTTP source. A live stream
   // whose subscription/entitlement has lapsed 4xx's every fetch; hlsdemux
   // retries and swallows them (emitting EOS, which we ignore on live), so no
