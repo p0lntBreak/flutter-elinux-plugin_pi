@@ -72,6 +72,27 @@ constexpr int kPrerollPollMs = 500;
 // loop (reconnect just thrashes re-auth against a stream it can no longer play).
 constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 
+// Stable machine prefix on the error string handed to Flutter when the preroll
+// gate makes no meaningful progress for a long window — i.e. the network is
+// sustained below the lowest-rung's segment rate and the 15 s cold-start line
+// is genuinely unreachable. The Dart side branches on this to render a "check
+// your connection" UI instead of leaving the spinner up indefinitely; it does
+// NOT count against the reconnect budget the way a transient error does,
+// because retrying against the same slow link will keep failing the same way.
+constexpr char kNetworkTooSlowPrefix[] = "NETWORK_TOO_SLOW: ";
+
+// Pathological-preroll detector. Fires when `buffered_secs` grew less than
+// kPathologicalPrerollMinDeltaSecs over kPathologicalPrerollNoProgressSecs of
+// wallclock (measured from the first sample past the warmup window). Values
+// chosen from the 2026-07-30 device log: the marginal regime cleared 15s of
+// buffer in ~20s (13:05:53 -> 13:06:13), the pathological regime crawled to
+// pct=19 over 5+ minutes on a link averaging <1 Mbps. A 25 s no-progress
+// window comfortably distinguishes the two without false-firing on cold-start
+// SoupHTTP handshakes (kPathologicalPrerollWarmupSecs = 5).
+constexpr int kPathologicalPrerollWarmupSecs = 5;
+constexpr int kPathologicalPrerollNoProgressSecs = 25;
+constexpr double kPathologicalPrerollMinDeltaSecs = 1.0;
+
 // True when a GStreamer error/warning is an HTTP entitlement failure (401/403/
 // 410) rather than a transient/network fault. souphttpsrc reports 401/403 as
 // GST_RESOURCE_ERROR_NOT_AUTHORIZED; we also scan the message/debug text so a
@@ -180,6 +201,15 @@ bool GstVideoPlayer::Init() {
   {
     auto last_progress_log = std::chrono::steady_clock::now();
     double last_logged_secs = -1.0;
+    // Pathological-preroll tracking. We keep a checkpoint (time, buffered_secs)
+    // and require the buffer to grow by >= kPathologicalPrerollMinDeltaSecs
+    // within kPathologicalPrerollNoProgressSecs of that checkpoint, otherwise
+    // the network is genuinely too slow to feed even the lowest rung and we
+    // surface NETWORK_TOO_SLOW: to Dart. The checkpoint is only armed after a
+    // warmup window so a slow first-connect doesn't false-fire.
+    const auto preroll_start = std::chrono::steady_clock::now();
+    auto stall_check_time = preroll_start;
+    double stall_check_secs = -1.0;
     while (!error_notified_.load()) {
       gint64 position = 0;
       const bool has_position = gst_element_query_position(
@@ -244,6 +274,46 @@ bool GstVideoPlayer::Init() {
         }
         last_progress_log = now;
         last_logged_secs = buffer_health_secs;
+      }
+
+      // Pathological-preroll detection. Wait past the warmup window, then arm
+      // a checkpoint. If the buffer hasn't grown by kPathologicalPrerollMinDeltaSecs
+      // within kPathologicalPrerollNoProgressSecs of that checkpoint, the network
+      // is sustained below the lowest rung and no amount of waiting will clear
+      // the gate. Fail with NETWORK_TOO_SLOW: so Dart can render the
+      // check-connection UI instead of spinning forever.
+      const auto secs_since_start = std::chrono::duration_cast<std::chrono::seconds>(
+          now - preroll_start).count();
+      if (secs_since_start >= kPathologicalPrerollWarmupSecs &&
+          buffer_health_secs >= 0.0) {
+        if (stall_check_secs < 0.0) {
+          // Arm the first checkpoint at the end of the warmup window.
+          stall_check_time = now;
+          stall_check_secs = buffer_health_secs;
+        } else if (buffer_health_secs - stall_check_secs >=
+                   kPathologicalPrerollMinDeltaSecs) {
+          // Meaningful progress since the checkpoint — advance it. This keeps
+          // the detector honest on links that trickle a segment through every
+          // ~20 s (still slow, but not pathological).
+          stall_check_time = now;
+          stall_check_secs = buffer_health_secs;
+        } else {
+          const auto stall_secs = std::chrono::duration_cast<std::chrono::seconds>(
+              now - stall_check_time).count();
+          if (stall_secs >= kPathologicalPrerollNoProgressSecs) {
+            std::string msg = std::string(kNetworkTooSlowPrefix) +
+                "preroll stalled at " +
+                std::to_string(static_cast<int>(buffer_health_secs)) +
+                "s buffered after " + std::to_string(stall_secs) +
+                "s of no progress";
+            std::cerr << msg << std::endl;
+            bool expected = false;
+            if (error_notified_.compare_exchange_strong(expected, true)) {
+              stream_handler_->OnNotifyError(msg);
+            }
+            break;
+          }
+        }
       }
 
       std::this_thread::sleep_for(std::chrono::milliseconds(kPrerollPollMs));
