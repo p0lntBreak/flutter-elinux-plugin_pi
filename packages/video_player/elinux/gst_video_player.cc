@@ -1009,9 +1009,21 @@ bool GstVideoPlayer::CreatePipeline() {
   } else {
     std::string audio_device = PickAudioDevice();
     g_object_set(audio_sink, "device", audio_device.c_str(), NULL);
+    // ALSA cushion sizing. Previously 50 ms / 100 ms — tight enough on a Pi 4
+    // under Flutter render + V4L2 decode + ISP scale + Wi-Fi soft-IRQ load
+    // that a ~100 ms scheduling gap caused alsasink underruns, and because
+    // the audio sink provides the pipeline clock under sync=TRUE, each
+    // underrun hiccuped the clock: video branch either burst-dropped frames
+    // to catch up or held frames to wait, showing visible stutter (device
+    // log 2026-07-30 15:48:38-15:48:45 showed exactly this — burst deltas
+    // of +80/+68/+38/+35/+17 frames in successive wallclock seconds with a
+    // full buffer and 5 Mbps throughput). 100 ms / 500 ms is the standard
+    // robust default for Pi-class devices; adds ~400 ms audio-branch latency
+    // which is imperceptible for live TV (no interactivity beyond channel
+    // changes, which rebuild the pipeline anyway).
     g_object_set(audio_sink,
-                 "latency-time", (gint64)50000,   // 50 ms
-                 "buffer-time",  (gint64)100000,  // 100 ms
+                 "latency-time", (gint64)100000,   // 100 ms
+                 "buffer-time",  (gint64)500000,   // 500 ms
                  NULL);
 
     gst_bin_add_many(GST_BIN(audio_bin), conv, resample, volume, audio_sink, NULL);
