@@ -113,6 +113,12 @@ class GstVideoPlayer {
 #endif  // USE_EGL_IMAGE_DMABUF
 
   GstVideoElements gst_;
+  // Held reference to the "volume" element inside our custom audio bin. We
+  // wrap alsasink in a bin, which means playbin's own "mute" property has no
+  // GstStreamVolume interface to forward to on this pipeline (the alsasink
+  // bin doesn't implement one), and mute silently no-ops. Driving this
+  // element directly gives us a working mute during the preroll gate.
+  GstElement* audio_volume_ = nullptr;
   std::string uri_;
   std::unique_ptr<uint32_t[]> pixels_;
   int32_t width_ = 0;

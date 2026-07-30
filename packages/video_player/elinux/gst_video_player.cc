@@ -150,11 +150,14 @@ bool GstVideoPlayer::Init() {
   // Preroll audio-mute: because we transition to PLAYING before the preroll
   // gate below is satisfied, the audio branch would otherwise play the first
   // buffered seconds of audio while the spinner is still up (visible mismatch
-  // between UI and stream). Force playbin mute for the duration of the gate
-  // wait and restore the caller-requested mute state on the way out. Video
-  // is unaffected — HandoffHandler still needs to see frames during the wait
-  // to capture dimensions.
-  g_object_set(gst_.playbin, "mute", TRUE, NULL);
+  // between UI and stream). Drive mute on our custom audio_volume_ element
+  // (playbin's own "mute" no-ops on this pipeline — the custom audio bin
+  // doesn't implement GstStreamVolume; playsink logs "No volume control
+  // found / Volume/mute is not available"). Video is unaffected —
+  // HandoffHandler still needs frames during the wait to capture dimensions.
+  if (audio_volume_) {
+    g_object_set(audio_volume_, "mute", TRUE, NULL);
+  }
   play_state_requested_.store(true);
   if (is_live_) {
     std::cout << "Init: live stream stays in PLAYING after preroll" << std::endl;
@@ -250,7 +253,9 @@ bool GstVideoPlayer::Init() {
   // Preroll gate satisfied (or exited due to error): restore the caller's
   // requested mute state. On the error path the pipeline is torn down
   // immediately below, so setting mute back here is harmless.
-  g_object_set(gst_.playbin, "mute", mute_ ? TRUE : FALSE, NULL);
+  if (audio_volume_) {
+    g_object_set(audio_volume_, "mute", mute_ ? TRUE : FALSE, NULL);
+  }
 
   // Preroll aborted by a fatal bus error (e.g. HTTP 4xx, EOS on VOD manifest,
   // souphttpsrc inactivity timeout). Bail before the first-frame wait so we
@@ -912,15 +917,23 @@ bool GstVideoPlayer::CreatePipeline() {
                "connection-speed", kColdStartConnSpeedKbps,
                NULL);
 
-  // Audio: audioconvert -> audioresample -> alsasink (HDMI auto-detected).
-  // Explicit alsasink is required because Buildroot omits autoaudiosink.
-  // audioresample prevents ALSA sample-rate-mismatch underruns under load.
+  // Audio: audioconvert -> audioresample -> volume -> alsasink
+  // (HDMI auto-detected). Explicit alsasink is required because Buildroot
+  // omits autoaudiosink. audioresample prevents ALSA sample-rate-mismatch
+  // underruns under load. The "volume" element is inserted before the sink
+  // so that Init() can mute audio during the preroll gate: playbin's own
+  // "mute" property forwards to the audio sink's GstStreamVolume interface,
+  // which our alsasink-in-a-bin does not implement (playsink logs
+  // "No volume control found / Volume/mute is not available" on start),
+  // so driving mute on this element is the only mute path that actually
+  // silences audio.
   GstElement* audio_bin  = gst_bin_new("audio_bin");
   GstElement* conv       = gst_element_factory_make("audioconvert",  "audio_convert");
   GstElement* resample   = gst_element_factory_make("audioresample", "audio_resample");
+  GstElement* volume     = gst_element_factory_make("volume",        "audio_volume");
   GstElement* audio_sink = gst_element_factory_make("alsasink",      "audio_alsa");
 
-  if (!audio_bin || !conv || !resample || !audio_sink) {
+  if (!audio_bin || !conv || !resample || !volume || !audio_sink) {
     std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
   } else {
     std::string audio_device = PickAudioDevice();
@@ -930,8 +943,10 @@ bool GstVideoPlayer::CreatePipeline() {
                  "buffer-time",  (gint64)100000,  // 100 ms
                  NULL);
 
-    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, audio_sink, NULL);
-    if (!gst_element_link(conv, resample) || !gst_element_link(resample, audio_sink)) {
+    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, volume, audio_sink, NULL);
+    if (!gst_element_link(conv, resample) ||
+        !gst_element_link(resample, volume) ||
+        !gst_element_link(volume, audio_sink)) {
       std::cerr << "CreatePipeline: Failed to link audio chain" << std::endl;
     } else {
       GstPad* apad = gst_element_get_static_pad(conv, "sink");
@@ -940,6 +955,7 @@ bool GstVideoPlayer::CreatePipeline() {
       gst_element_add_pad(audio_bin, ghost_apad);
       gst_object_unref(apad);
       g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
+      audio_volume_ = volume;  // ref held via bin ownership; cleared in DestroyPipeline
     }
   }
 
@@ -1021,6 +1037,7 @@ void GstVideoPlayer::DestroyPipeline() {
   gst_.output = nullptr;
   gst_.video_sink = nullptr;
   gst_.video_convert = nullptr;
+  audio_volume_ = nullptr;
 
   {
     std::lock_guard<std::mutex> lock(abr_mutex_);
