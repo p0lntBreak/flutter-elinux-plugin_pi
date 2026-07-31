@@ -398,6 +398,18 @@ bool GstVideoPlayer::Init() {
 }
 
 bool GstVideoPlayer::Play() {
+  // Guard against post-teardown calls. Confirmed segfault path 2026-07-31
+  // 12:04:53: a bus ERROR from videoconvert triggered DestroyPipeline (which
+  // NULLs gst_.pipeline), while Dart's auto-resume was scheduled from the same
+  // pause-event burst and reached us AFTER teardown. Passing NULL to
+  // gst_element_set_state dereferences garbage → SIGSEGV at unmapped PC.
+  // The Dart-side `_player != null` check doesn't help: the Dart handle
+  // outlives the C++ pipeline. Returning false here turns the race into a
+  // benign no-op; the reconnect flow rebuilds the pipeline from scratch.
+  if (!gst_.pipeline) {
+    std::cerr << "Play ignored: pipeline destroyed" << std::endl;
+    return false;
+  }
   play_state_requested_.store(true);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
@@ -420,6 +432,10 @@ bool GstVideoPlayer::Pause() {
     return true;
   }
 
+  if (!gst_.pipeline) {
+    std::cerr << "Pause ignored: pipeline destroyed" << std::endl;
+    return false;
+  }
   play_state_requested_.store(false);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED) ==
       GST_STATE_CHANGE_FAILURE) {
@@ -432,6 +448,10 @@ bool GstVideoPlayer::Pause() {
 }
 
 bool GstVideoPlayer::Stop() {
+  if (!gst_.pipeline) {
+    std::cerr << "Stop ignored: pipeline destroyed" << std::endl;
+    return false;
+  }
   play_state_requested_.store(false);
   if (gst_element_set_state(gst_.pipeline, GST_STATE_READY) ==
       GST_STATE_CHANGE_FAILURE) {
@@ -454,7 +474,7 @@ bool GstVideoPlayer::SetVolume(double volume) {
 }
 
 bool GstVideoPlayer::SetPlaybackRate(double rate) {
-  if (!gst_.playbin) {
+  if (!gst_.playbin || !gst_.pipeline) {
     return false;
   }
 
@@ -495,6 +515,9 @@ bool GstVideoPlayer::SetPlaybackRate(double rate) {
 }
 
 bool GstVideoPlayer::SetSeek(int64_t position) {
+  if (!gst_.pipeline) {
+    return false;
+  }
   auto nanosecond = position * 1000 * 1000;
   if (!gst_element_seek(
           gst_.pipeline, playback_rate_, GST_FORMAT_TIME,
@@ -508,6 +531,9 @@ bool GstVideoPlayer::SetSeek(int64_t position) {
 }
 
 int64_t GstVideoPlayer::GetDuration() {
+  if (!gst_.pipeline) {
+    return -1;
+  }
   GstFormat fmt = GST_FORMAT_TIME;
   gint64 duration_msec;
   if (!gst_element_query_duration(gst_.pipeline, fmt, &duration_msec)) {
@@ -519,6 +545,9 @@ int64_t GstVideoPlayer::GetDuration() {
 }
 
 int64_t GstVideoPlayer::GetCurrentPosition() {
+  if (!gst_.pipeline) {
+    return 0;
+  }
   gint64 position = 0;
 
   // Sometimes we get an error when playing streaming videos.
