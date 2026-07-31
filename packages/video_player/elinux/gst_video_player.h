@@ -221,6 +221,15 @@ class GstVideoPlayer {
   // floor; a down-switch fires only once it reaches kSustainedDropTicks so a
   // single noisy sample can't flap the rung. Reset whenever the drop clears.
   int abr_drop_ticks_ = 0;
+  // Consecutive AbrTick cycles the predicted throughput has been below the
+  // currently-published rate. Separate from abr_drop_ticks_ because it fires
+  // regardless of buffer health — a sustained undershoot means the network
+  // genuinely can't sustain the current rung, so we should down-switch before
+  // the buffer drains rather than after. Reset whenever predicted catches up.
+  // Device log 2026-07-31 18:22:11-18:23:41 held 1091 kbps published while
+  // predicted was 446/517/257/307 kbps across four ticks (with buffer still
+  // healthy) — the ABR should have already been on a lower rung.
+  int abr_undershoot_ticks_ = 0;
 
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video

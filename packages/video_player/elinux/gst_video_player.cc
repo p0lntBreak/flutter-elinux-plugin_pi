@@ -33,6 +33,18 @@ constexpr double kHealthyBufferSecs = 15.0;
 // AbrTick cycles before acting, so a single dipped sample can't flap the rung.
 constexpr int kSustainedDropTicks = 3;
 
+// Number of consecutive AbrTick cycles the predicted throughput has to sit
+// below the currently-published rate before we down-switch even though the
+// buffer is still healthy. Distinguishes a genuine sustained decline (network
+// has actually changed for the worse) from noisy dips (predicted swings
+// around published, buffer absorbs it). Device log 2026-07-31 18:22-18:23:
+// predicted 446/517/257/307 kbps for four ticks while published stayed at
+// 1091 kbps. The buffer eventually drained anyway; a proactive down-switch
+// on the first few ticks of undershoot would have preserved playback.
+// Longer than kSustainedDropTicks (3) so noisy dips at a healthy buffer
+// don't flap the rung, but short enough to catch a real decline early.
+constexpr int kSustainedUndershootTicks = 5;
+
 // Minimum time between a (non-emergency) down-switch and a subsequent
 // up-switch. The 11:20:29 -> 11:20:30 log showed a bandwidth-drop and an
 // up-switch fire one second apart on a jittery link; the two decisions
@@ -1757,6 +1769,7 @@ void GstVideoPlayer::AbrTick() {
     publish = true;
     reason = "first estimate";
     abr_drop_ticks_ = 0;
+    abr_undershoot_ticks_ = 0;
   } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
     // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
     // the only instant down-switch path. Deliberately does NOT stamp
@@ -1764,6 +1777,7 @@ void GstVideoPlayer::AbrTick() {
     publish = true;
     reason = "buffer emergency";
     abr_drop_ticks_ = 0;
+    abr_undershoot_ticks_ = 0;
   } else if (is_drop && buffer_secs < kHealthyBufferSecs) {
     // The buffer has meaningfully drained AND the estimate is >=20% down —
     // a real decline. Still require it to persist a few ticks so a single
@@ -1772,6 +1786,7 @@ void GstVideoPlayer::AbrTick() {
       publish = true;
       reason = "bandwidth drop";
       abr_drop_ticks_ = 0;
+      abr_undershoot_ticks_ = 0;
       last_downswitch_time_ = now;
     } else {
       std::cout << "ABR: drop deferred (" << abr_drop_ticks_ << "/"
@@ -1779,9 +1794,37 @@ void GstVideoPlayer::AbrTick() {
                 << static_cast<int>(buffer_secs) << "s cv="
                 << static_cast<int>(cv * 100) << "%" << std::endl;
     }
-  } else {
-    // Either no drop, or a drop while the buffer is still healthy (absorb it).
+  } else if (target_kbps < published_kbps_) {
+    // Sustained-undershoot down-switch. Predicted throughput is below the
+    // currently-published rate, but the buffer is still healthy (otherwise
+    // one of the branches above would have fired). Old behaviour was to
+    // trust the buffer and absorb the variance. That's fine for noise, but
+    // when the network has GENUINELY declined the predicted throughput sits
+    // below published for many consecutive ticks and the buffer eventually
+    // drains anyway — by which time we're reacting late. Track consecutive
+    // undershoot ticks; when it hits kSustainedUndershootTicks, down-switch
+    // proactively regardless of buffer state. Device evidence: 2026-07-31
+    // 18:22:11-18:23:41 held 1091 kbps published while predicted was
+    // 446/517/257/307 kbps for four ticks; buffer drained on the fifth and
+    // preroll never recovered.
     abr_drop_ticks_ = 0;
+    if (++abr_undershoot_ticks_ >= kSustainedUndershootTicks) {
+      publish = true;
+      reason = "sustained undershoot";
+      abr_undershoot_ticks_ = 0;
+      last_downswitch_time_ = now;
+    } else {
+      std::cout << "ABR: undershoot (" << abr_undershoot_ticks_ << "/"
+                << kSustainedUndershootTicks << ") predicted="
+                << static_cast<int>(predicted_bps / 1000) << "kbps published="
+                << published_kbps_ << "kbps buffer="
+                << static_cast<int>(buffer_secs) << "s" << std::endl;
+    }
+  } else {
+    // No drop and predicted meets or exceeds published — reset both drop
+    // counters and consider an up-switch.
+    abr_drop_ticks_ = 0;
+    abr_undershoot_ticks_ = 0;
     // Anti-thrash gate: after a non-emergency down-switch, hold the new rung
     // for kPostDownDwellSecs regardless of estimate before letting it climb
     // again. On device (11:20:29 drop -> 11:20:30 up-switch) the two decisions
