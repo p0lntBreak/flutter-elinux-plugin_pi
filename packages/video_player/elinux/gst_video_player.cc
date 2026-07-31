@@ -42,17 +42,23 @@ constexpr int kSustainedDropTicks = 3;
 // let it climb again.
 constexpr int kPostDownDwellSecs = 20;
 
-// Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Kept at
-// top-rung (100 Mbps) on purpose: an initial mid-low hint (e.g. 1200 kbps for
-// a 360p landing) creates a cold-start→up-switch→down-switch pool-geometry
-// sequence the bcm2835-codec V4L2 pool cannot survive. The pool grows fine
-// but S_FMT to a smaller geometry after growing fails with "Device has no
-// supported format" (verified on device 2026-07-30). fix8-ABR's whole design
-// is to only ever set the input pool to the LARGEST geometry that will be
-// seen; top-rung startup preserves that invariant. The preroll gate below
-// (task #8a) handles honest-wait behavior separately — it does NOT depend on
-// the rung choice.
-constexpr guint64 kColdStartConnSpeedKbps = 100000;
+// Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Sized
+// so hlsdemux picks 360p on this project's manifest (960 kbps rendition):
+// 1500 leaves headroom above 360p's 960 but stays below 480p's 1800. A
+// conservative first pick lets ABR climb toward the rung the link actually
+// sustains, instead of forcing top-rung and rebuffering on any link that
+// can't feed a 720p first segment inside the preroll window (device log
+// 2026-07-31 09:37:08-38 showed exactly this: healthy ~4 Mbps average
+// throughput, buffer plateau at 5s during 720p first-segment fetch, false
+// NETWORK_TOO_SLOW fire).
+//
+// KNOWN REGRESSION until Scope 1 lands: an up-switch after a low-rung
+// cold-start can trip the bcm2835-codec pool geometry bug (S_FMT "Device
+// has no supported format" verified on device 2026-07-30 when growing then
+// shrinking the pool). On that path the pipeline errors out and Dart's
+// existing reconnect flow rebuilds fresh at the last hint. Bounded churn is
+// preferable to never-starting; the root fix is on a separate branch.
+constexpr guint64 kColdStartConnSpeedKbps = 1500;
 
 // Cold-start preroll target (seconds of buffered content required before Init()
 // returns success). Matches kHealthyBufferSecs on purpose: it's the same "this
