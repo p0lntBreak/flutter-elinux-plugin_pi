@@ -335,16 +335,11 @@ bool GstVideoPlayer::Init() {
     }
   }
 
-  // Preroll gate satisfied (or exited due to error): restore the caller's
-  // requested mute state. On the error path the pipeline is torn down
-  // immediately below, so setting mute back here is harmless.
-  if (audio_volume_) {
-    g_object_set(audio_volume_, "mute", mute_ ? TRUE : FALSE, NULL);
-  }
-
   // Preroll aborted by a fatal bus error (e.g. HTTP 4xx, EOS on VOD manifest,
   // souphttpsrc inactivity timeout). Bail before the first-frame wait so we
-  // don't sit another 5s on a dead pipeline.
+  // don't sit another 5s on a dead pipeline. Audio is still muted here from
+  // the top of Init(); the pipeline is torn down immediately below so no
+  // audio can leak.
   if (error_notified_.load()) {
     std::cerr << "Init: pipeline error during preroll — failing Init()"
               << std::endl;
@@ -362,6 +357,17 @@ bool GstVideoPlayer::Init() {
     first_frame_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
       return first_frame_ready_.load() || error_notified_.load();
     });
+  }
+
+  // Unmute audio only AFTER the first decoded frame has surfaced. Previously
+  // the unmute happened when the preroll gate opened, which was too early:
+  // the very first video frame arrives a moment later, producing a visible
+  // (audible) gap where sound plays over a still spinner. Moving the unmute
+  // past first_frame_ready lines up audio start with picture start. On the
+  // error path (fatal bus error before first frame), pipeline is torn down
+  // below and audio stays muted throughout — no leak.
+  if (audio_volume_ && first_frame_ready_.load()) {
+    g_object_set(audio_volume_, "mute", mute_ ? TRUE : FALSE, NULL);
   }
 
   // A fatal error arrived before any frame did — the pipeline is dead, not
@@ -1271,6 +1277,14 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   if (!self->initialized_.exchange(true)) {
     self->stream_handler_->OnNotifyInitialized();
     self->stream_handler_->OnNotifyPlaying(true);
+    // Init()'s post-preroll unmute is gated on first_frame_ready_ so audio
+    // stays muted through the preroll wait. On the deferred-init path Init()
+    // returned before this frame arrived, so we must unmute here or audio
+    // stays silent for the rest of the session.
+    if (self->audio_volume_) {
+      g_object_set(self->audio_volume_, "mute",
+                   self->mute_ ? TRUE : FALSE, NULL);
+    }
   }
 
   // Ground-truth liveness signal for the watchdog: only moves when a real
