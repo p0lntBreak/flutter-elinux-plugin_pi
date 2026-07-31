@@ -1685,6 +1685,19 @@ void GstVideoPlayer::AbrTick() {
   }
 
   if (!demux) return;
+  // Require more samples before the very first publish so the initial rung
+  // pick is based on a stable estimate. The prior 2-sample threshold could
+  // land 240p or 360p on a link that could actually sustain 720p — then
+  // every 30 s the up-switch dwell would let us climb one rung at a time,
+  // producing the visible 240p→360p→480p→720p walk-through. 5 samples is
+  // ~5 seconds of measurement on a live stream, still fast enough to keep
+  // startup responsive. Subsequent decisions still work off the same 16-
+  // sample window; only the "first estimate" branch cares about this.
+  const size_t kFirstEstimateMinSamples = 5;
+  if (published_kbps_ == 0 && samples.size() < kFirstEstimateMinSamples) {
+    gst_object_unref(demux);
+    return;
+  }
   if (samples.size() < 2) {
     gst_object_unref(demux);
     return;
@@ -1778,12 +1791,23 @@ void GstVideoPlayer::AbrTick() {
     const bool post_down_dwell_served =
         last_downswitch_time_.time_since_epoch().count() == 0 ||
         now - last_downswitch_time_ > std::chrono::seconds(kPostDownDwellSecs);
+    // A "big jump" up-switch bypasses the 30 s dwell so we don't walk through
+    // every intermediate rung (240p → 360p → 480p → 720p) on a first-connect
+    // where each intermediate step is visible on screen. If the estimate says
+    // we can afford well over 2x the currently-published rate, that's not a
+    // gentle climb — that's the estimator catching up to a link the previous
+    // publish underestimated. Take the jump directly. Still requires a healthy
+    // buffer + post-down dwell served, so this can't accidentally re-enter
+    // up-switch behavior on a jittery down-then-up.
+    const bool big_jump_up = target_kbps >= published_kbps_ * 2;
+    const bool up_dwell_served =
+        now - last_upswitch_time_ > std::chrono::seconds(30);
     if (target_kbps * 4 >= published_kbps_ * 5 &&
         buffer_secs >= kHealthyBufferSecs &&
-        now - last_upswitch_time_ > std::chrono::seconds(30) &&
+        (up_dwell_served || big_jump_up) &&
         post_down_dwell_served) {
-      publish = true;  // >=25% headroom, healthy buffer, both dwell timers served
-      reason = "up-switch";
+      publish = true;  // >=25% headroom, healthy buffer, dwell served (or big jump)
+      reason = big_jump_up ? "up-switch (big jump)" : "up-switch";
       last_upswitch_time_ = now;
     }
   }
