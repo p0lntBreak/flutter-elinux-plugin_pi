@@ -194,6 +194,13 @@ class GstVideoPlayer {
   guint64 burst_bytes_ = 0;
   std::chrono::steady_clock::time_point burst_start_;
   std::chrono::steady_clock::time_point burst_last_rx_;
+  // Total bytes seen at the http source pad since Init() began. Read atomically
+  // by the preroll gate to distinguish "network is genuinely dead" (bytes not
+  // accumulating) from "downstream is throttling" (bytes accumulating but the
+  // buffering signal capped). Written from the throughput-probe pad callback
+  // (which already holds abr_mutex_), so kept as an atomic for lock-free reads
+  // from the preroll thread. Never resets during a pipeline's lifetime.
+  std::atomic<uint64_t> total_bytes_fetched_{0};
   // Completed per-burst throughput samples in bits/sec (newest at back).
   std::deque<double> abr_samples_;
   guint64 last_segment_bytes_ = 0;

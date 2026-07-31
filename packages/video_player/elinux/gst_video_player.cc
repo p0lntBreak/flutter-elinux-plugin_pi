@@ -87,17 +87,21 @@ constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 // because retrying against the same slow link will keep failing the same way.
 constexpr char kNetworkTooSlowPrefix[] = "NETWORK_TOO_SLOW: ";
 
-// Pathological-preroll detector. Fires when `buffered_secs` grew less than
-// kPathologicalPrerollMinDeltaSecs over kPathologicalPrerollNoProgressSecs of
-// wallclock (measured from the first sample past the warmup window). Values
-// chosen from the 2026-07-30 device log: the marginal regime cleared 15s of
-// buffer in ~20s (13:05:53 -> 13:06:13), the pathological regime crawled to
-// pct=19 over 5+ minutes on a link averaging <1 Mbps. A 25 s no-progress
-// window comfortably distinguishes the two without false-firing on cold-start
-// SoupHTTP handshakes (kPathologicalPrerollWarmupSecs = 5).
+// Pathological-preroll detector. Fires when total bytes fetched at the http
+// source pad grew by less than kPathologicalPrerollMinDeltaBytes over
+// kPathologicalPrerollNoProgressSecs of wallclock. Bytes-based instead of
+// buffered-seconds-based because a downstream throttle (multiqueue limits,
+// decoder backpressure) can freeze the buffered-seconds signal while the
+// network is delivering fine — device log 2026-07-31 09:37 saw buffer
+// plateau at 5 s while throughput averaged ~4 Mbps, an obvious false
+// pathological signal by the old rule. Bytes-in only sees the network.
+//
+// 500 KB in 25 s = ~160 kbps sustained — well under even the 240p rung's
+// 550 kbps. Any working link fetches more than that; only a genuinely dead
+// or captive-portal-blocked network trips this floor.
 constexpr int kPathologicalPrerollWarmupSecs = 5;
 constexpr int kPathologicalPrerollNoProgressSecs = 25;
-constexpr double kPathologicalPrerollMinDeltaSecs = 1.0;
+constexpr uint64_t kPathologicalPrerollMinDeltaBytes = 500 * 1024;
 
 // True when a GStreamer error/warning is an HTTP entitlement failure (401/403/
 // 410) rather than a transient/network fault. souphttpsrc reports 401/403 as
@@ -207,15 +211,16 @@ bool GstVideoPlayer::Init() {
   {
     auto last_progress_log = std::chrono::steady_clock::now();
     double last_logged_secs = -1.0;
-    // Pathological-preroll tracking. We keep a checkpoint (time, buffered_secs)
-    // and require the buffer to grow by >= kPathologicalPrerollMinDeltaSecs
-    // within kPathologicalPrerollNoProgressSecs of that checkpoint, otherwise
-    // the network is genuinely too slow to feed even the lowest rung and we
-    // surface NETWORK_TOO_SLOW: to Dart. The checkpoint is only armed after a
-    // warmup window so a slow first-connect doesn't false-fire.
+    // Pathological-preroll tracking. Watches BYTES fetched at the http source
+    // pad, not buffered-seconds — downstream throttles (multiqueue limits,
+    // decoder backpressure) can cap buffered-seconds long before the network
+    // stops delivering (see device log 2026-07-31 09:37). Fires only when
+    // fewer than kPathologicalPrerollMinDeltaBytes have arrived over
+    // kPathologicalPrerollNoProgressSecs — a floor no working link crosses.
     const auto preroll_start = std::chrono::steady_clock::now();
     auto stall_check_time = preroll_start;
-    double stall_check_secs = -1.0;
+    uint64_t stall_check_bytes = 0;
+    bool stall_check_armed = false;
     while (!error_notified_.load()) {
       gint64 position = 0;
       const bool has_position = gst_element_query_position(
@@ -282,36 +287,39 @@ bool GstVideoPlayer::Init() {
         last_logged_secs = buffer_health_secs;
       }
 
-      // Pathological-preroll detection. Wait past the warmup window, then arm
-      // a checkpoint. If the buffer hasn't grown by kPathologicalPrerollMinDeltaSecs
-      // within kPathologicalPrerollNoProgressSecs of that checkpoint, the network
-      // is sustained below the lowest rung and no amount of waiting will clear
-      // the gate. Fail with NETWORK_TOO_SLOW: so Dart can render the
-      // check-connection UI instead of spinning forever.
+      // Pathological-preroll detection. Watches BYTES fetched at the http
+      // source pad. After the warmup window, arm a checkpoint. If fewer than
+      // kPathologicalPrerollMinDeltaBytes have arrived since the checkpoint
+      // within kPathologicalPrerollNoProgressSecs, the network is genuinely
+      // dead (captive portal, DNS blackhole, sub-160 kbps sustained). Otherwise
+      // advance the checkpoint. Fires NETWORK_TOO_SLOW so Dart can render the
+      // check-connection UI.
       const auto secs_since_start = std::chrono::duration_cast<std::chrono::seconds>(
           now - preroll_start).count();
-      if (secs_since_start >= kPathologicalPrerollWarmupSecs &&
-          buffer_health_secs >= 0.0) {
-        if (stall_check_secs < 0.0) {
+      const uint64_t bytes_now = total_bytes_fetched_.load(std::memory_order_relaxed);
+      if (secs_since_start >= kPathologicalPrerollWarmupSecs) {
+        if (!stall_check_armed) {
           // Arm the first checkpoint at the end of the warmup window.
           stall_check_time = now;
-          stall_check_secs = buffer_health_secs;
-        } else if (buffer_health_secs - stall_check_secs >=
-                   kPathologicalPrerollMinDeltaSecs) {
-          // Meaningful progress since the checkpoint — advance it. This keeps
-          // the detector honest on links that trickle a segment through every
-          // ~20 s (still slow, but not pathological).
+          stall_check_bytes = bytes_now;
+          stall_check_armed = true;
+        } else if (bytes_now - stall_check_bytes >=
+                   kPathologicalPrerollMinDeltaBytes) {
+          // Meaningful bytes since the checkpoint — advance. The link is
+          // delivering; any buffering-percent plateau is downstream, not
+          // network. Preroll will clear on its own or the frame-arrival
+          // watchdog will act after PLAYING.
           stall_check_time = now;
-          stall_check_secs = buffer_health_secs;
+          stall_check_bytes = bytes_now;
         } else {
           const auto stall_secs = std::chrono::duration_cast<std::chrono::seconds>(
               now - stall_check_time).count();
           if (stall_secs >= kPathologicalPrerollNoProgressSecs) {
+            const uint64_t bytes_this_window = bytes_now - stall_check_bytes;
             std::string msg = std::string(kNetworkTooSlowPrefix) +
-                "preroll stalled at " +
-                std::to_string(static_cast<int>(buffer_health_secs)) +
-                "s buffered after " + std::to_string(stall_secs) +
-                "s of no progress";
+                "preroll stalled — only " +
+                std::to_string(bytes_this_window / 1024) +
+                "KB fetched in last " + std::to_string(stall_secs) + "s";
             std::cerr << msg << std::endl;
             bool expected = false;
             if (error_notified_.compare_exchange_strong(expected, true)) {
@@ -1547,6 +1555,11 @@ GstPadProbeReturn GstVideoPlayer::AbrThroughputProbe(GstPad* /*pad*/,
 
   const gsize size = gst_buffer_get_size(buf);
   const auto now = std::chrono::steady_clock::now();
+
+  // Bump the monotonic total FIRST, outside the mutex. The preroll gate reads
+  // this without contending for abr_mutex_ so it stays responsive even while
+  // the streaming thread is mid-burst-close.
+  self->total_bytes_fetched_.fetch_add(size, std::memory_order_relaxed);
 
   std::lock_guard<std::mutex> lock(self->abr_mutex_);
   // An idle gap separates one segment download from the next.
