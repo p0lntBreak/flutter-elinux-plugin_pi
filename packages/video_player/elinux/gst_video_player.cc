@@ -1517,6 +1517,22 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
       std::cout << "ABR: attached throughput probe to source: " << name
                 << std::endl;
     }
+  } else if (name && g_str_has_prefix(name, "multiqueue")) {
+    // hlsdemux's downstream multiqueue defaults to max-size-buffers=5,
+    // max-size-bytes=2MB, max-size-time=2s — a much smaller window than
+    // our 30 s buffering target. On a healthy link the buffering percent
+    // plateaus in the mid-teens because the multiqueue is applying
+    // backpressure to hlsdemux before hlsdemux has fetched a full 30 s
+    // cushion (device log 2026-07-31 09:37 saw pct stuck at ~17 for 25 s
+    // on a >4 Mbps average link). Widen the limits to 60 s / 20 MB and
+    // remove the buffer-count cap so time/bytes govern instead.
+    g_object_set(G_OBJECT(element),
+                 "max-size-buffers", (guint)0,          // unlimited count
+                 "max-size-bytes",   (guint)(20 * 1024 * 1024),
+                 "max-size-time",    (guint64)(60 * GST_SECOND),
+                 NULL);
+    std::cout << "MULTIQUEUE: widened limits on " << name
+              << " (time=60s bytes=20MB buffers=unlimited)" << std::endl;
   }
   g_free(name);
 }
