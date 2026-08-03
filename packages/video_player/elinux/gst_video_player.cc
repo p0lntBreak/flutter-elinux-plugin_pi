@@ -45,6 +45,17 @@ constexpr int kSustainedDropTicks = 3;
 // don't flap the rung, but short enough to catch a real decline early.
 constexpr int kSustainedUndershootTicks = 5;
 
+// Mirror of the undershoot detector for the trapped-low-rate case: after a
+// buffer emergency drops the published rate to something like 177 kbps, the
+// buffer can't reach the "healthy" line because the low rate starves the
+// pipeline. So the normal up-switch gate never opens even though the network
+// has fully recovered. Device log 2026-08-03 14:14 held 177 kbps for 6+
+// minutes while predicted showed 6-18 Mbps. Escape trigger: predicted has
+// been >=kTrappedRateMultiplier x published for kTrappedRateTicks consecutive
+// ticks. When it fires, publish an up-switch regardless of buffer state.
+constexpr int kTrappedRateTicks = 5;
+constexpr double kTrappedRateMultiplier = 5.0;
+
 // Minimum time between a (non-emergency) down-switch and a subsequent
 // up-switch. The 11:20:29 -> 11:20:30 log showed a bandwidth-drop and an
 // up-switch fire one second apart on a jittery link; the two decisions
@@ -1428,6 +1439,88 @@ void GstVideoPlayer::LogPlaybackHealth(
   }
 
   std::cout << std::endl;
+
+  // Buffer-collapse detector. On device 2026-08-03 14:14:04, buffer_health
+  // dropped from 30s to 2s inside a single tick with no ABR decision, no
+  // rendition switch, no bus error — and playback never recovered for the
+  // next ~7 minutes. We do not know what triggered it. Emit a prominent log
+  // line whenever we see the same shape (drop >=5s in one tick) so the next
+  // occurrence carries context to diagnose the cause.
+  //
+  // Passive: no behavior change. Just captures hlsdemux + multiqueue state
+  // at the moment of collapse. Future work adds bus-message capture for
+  // FLUSH_START / SEGMENT_START / hlsdemux ELEMENT messages.
+  if (prev_buffer_health_secs_ >= 0.0 && buffer_health_secs >= 0.0 &&
+      prev_buffer_health_secs_ - buffer_health_secs >= 5.0) {
+    // The delta itself is worth flagging even without more state.
+    std::cout << "BUFFER-COLLAPSE: dropped from "
+              << static_cast<int>(prev_buffer_health_secs_)
+              << "s to " << static_cast<int>(buffer_health_secs)
+              << "s in one tick; pos=" << static_cast<int>(position_secs)
+              << "s pct=" << pct
+              << "% state=" << gst_element_state_get_name(state) << std::endl;
+
+    // Dump hlsdemux's current-bitrate — if it changed at the moment of the
+    // drop, a manifest refresh / rendition selection is likely the trigger.
+    GstElement* demux = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(abr_mutex_);
+      if (hls_demux_) demux = GST_ELEMENT(gst_object_ref(hls_demux_));
+    }
+    if (demux) {
+      guint64 current_bitrate = 0;
+      GObjectClass* klass = G_OBJECT_GET_CLASS(demux);
+      if (g_object_class_find_property(klass, "current-bitrate")) {
+        g_object_get(demux, "current-bitrate", &current_bitrate, NULL);
+        std::cout << "BUFFER-COLLAPSE: hlsdemux current-bitrate="
+                  << current_bitrate << std::endl;
+      }
+      gst_object_unref(demux);
+    }
+  }
+  prev_buffer_health_secs_ = buffer_health_secs;
+}
+
+bool GstVideoPlayer::TryFlushRecovery() {
+  // Called by the watchdog when playback has been stuck but the network and
+  // buffer look fine. Force a flush-seek to the current playback position so
+  // downstream elements resync from a clean state. The user sees a brief cut;
+  // the alternative is endless stutter until the 30 s watchdog trips a full
+  // reconnect.
+  //
+  // Guarded by null-pipeline check and by the watchdog's caller having a live
+  // reference to gst_.pipeline. If the seek fails, we return false and the
+  // caller escalates to the reconnect path on its own timeline.
+  if (!gst_.pipeline) return false;
+
+  gint64 position = 0;
+  if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
+    std::cerr << "FLUSH-RECOVERY: could not query current position, skipping"
+              << std::endl;
+    return false;
+  }
+
+  std::cout << "FLUSH-RECOVERY: seeking to current position ("
+            << (position / GST_SECOND) << "s) to unblock stuck playback"
+            << std::endl;
+
+  // GST_SEEK_FLAG_FLUSH forces upstream + downstream to flush any queued
+  // buffers before resuming. GST_SEEK_FLAG_KEY_UNIT lands the seek on the
+  // nearest keyframe so the decoder has a clean start. On a live stream the
+  // exact byte-position doesn't matter — playback will land on the closest
+  // available segment.
+  const bool ok = gst_element_seek(
+      gst_.pipeline, playback_rate_, GST_FORMAT_TIME,
+      static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+      GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_SET, GST_CLOCK_TIME_NONE);
+
+  if (!ok) {
+    std::cerr << "FLUSH-RECOVERY: gst_element_seek failed" << std::endl;
+    return false;
+  }
+
+  std::cout << "FLUSH-RECOVERY: seek posted successfully" << std::endl;
+  return true;
 }
 
 void GstVideoPlayer::StartWatchdog() {
@@ -1506,6 +1599,48 @@ void GstVideoPlayer::StartWatchdog() {
         std::cout << "WATCHDOG: PLAYING but no video frame for " << frozen_secs
                   << "s" << std::endl;
       }
+
+      // Intermediate stuck-recovery: at 8 seconds of no-frame-advance, if the
+      // network is measurably healthy AND we haven't done a flush recently,
+      // try a flush-seek to unblock the pipeline. Device 2026-08-03 14:14-14:20
+      // showed 6+ minutes of stuck-at-9s-buffer playback on a single-quality
+      // stream with the network delivering 5-30 Mbps throughout. The pipeline
+      // could not recover on its own. A flush at the 8-second mark gives us
+      // one recovery attempt before the 30-second full-reconnect fires.
+      //
+      // Guards:
+      // - frozen_secs in [kFlushRecoveryAfterSecs, kFrameStallTimeoutSecs):
+      //   only in the middle window, not right after a stall starts.
+      // - Recent throughput sample >= kFlushRecoveryHealthyKbps: pipe is fine.
+      // - >= 30 s since our last flush: don't spam if the first didn't take.
+      constexpr int kFlushRecoveryAfterSecs = 8;
+      constexpr int kFlushRecoveryCooldownSecs = 30;
+      constexpr double kFlushRecoveryHealthyKbps = 1000.0;
+      if (frozen_secs >= kFlushRecoveryAfterSecs &&
+          frozen_secs < kFrameStallTimeoutSecs) {
+        double recent_bps = 0.0;
+        {
+          std::lock_guard<std::mutex> lock(abr_mutex_);
+          recent_bps = last_segment_throughput_bps_;
+        }
+        const double recent_kbps = recent_bps / 1000.0;
+        const bool cooldown_served =
+            last_flush_recovery_time_.time_since_epoch().count() == 0 ||
+            now - last_flush_recovery_time_ >
+                std::chrono::seconds(kFlushRecoveryCooldownSecs);
+        if (recent_kbps >= kFlushRecoveryHealthyKbps && cooldown_served) {
+          std::cout << "WATCHDOG: attempting flush recovery — frozen_secs="
+                    << frozen_secs << " recent_throughput=" << recent_kbps
+                    << "kbps" << std::endl;
+          last_flush_recovery_time_ = now;
+          TryFlushRecovery();
+          // Don't reset last_frame_advance_time here — the seek is
+          // asynchronous, so HandoffHandler bumping frames_handed_off_ is what
+          // will confirm recovery on the next tick. If frames still don't
+          // advance, we fall through to the 30 s reconnect path.
+        }
+      }
+
       if (frozen_secs >= kFrameStallTimeoutSecs) {
         std::string msg = "Playback frozen: no video frame for " +
                           std::to_string(frozen_secs) + "s while PLAYING";
@@ -1787,6 +1922,7 @@ void GstVideoPlayer::AbrTick() {
     reason = "first estimate";
     abr_drop_ticks_ = 0;
     abr_undershoot_ticks_ = 0;
+    abr_trapped_ticks_ = 0;
   } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
     // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
     // the only instant down-switch path. Deliberately does NOT stamp
@@ -1795,6 +1931,7 @@ void GstVideoPlayer::AbrTick() {
     reason = "buffer emergency";
     abr_drop_ticks_ = 0;
     abr_undershoot_ticks_ = 0;
+    abr_trapped_ticks_ = 0;
   } else if (is_drop && buffer_secs < kHealthyBufferSecs) {
     // The buffer has meaningfully drained AND the estimate is >=20% down —
     // a real decline. Still require it to persist a few ticks so a single
@@ -1804,6 +1941,7 @@ void GstVideoPlayer::AbrTick() {
       reason = "bandwidth drop";
       abr_drop_ticks_ = 0;
       abr_undershoot_ticks_ = 0;
+      abr_trapped_ticks_ = 0;
       last_downswitch_time_ = now;
     } else {
       std::cout << "ABR: drop deferred (" << abr_drop_ticks_ << "/"
@@ -1834,6 +1972,7 @@ void GstVideoPlayer::AbrTick() {
     // 18:22:11-18:23:41 held 1091 kbps published while predicted was
     // 446/517/257/307 kbps — clearly under published, four ticks in a row.
     abr_drop_ticks_ = 0;
+    abr_trapped_ticks_ = 0;  // predicted below published — not trapped-low
     if (++abr_undershoot_ticks_ >= kSustainedUndershootTicks) {
       publish = true;
       reason = "sustained undershoot";
@@ -1847,10 +1986,42 @@ void GstVideoPlayer::AbrTick() {
                 << static_cast<int>(buffer_secs) << "s" << std::endl;
     }
   } else {
-    // No drop and predicted meets or exceeds published — reset both drop
-    // counters and consider an up-switch.
+    // No drop and predicted meets or exceeds published — reset drop counters
+    // and consider an up-switch or trapped-rate escape.
     abr_drop_ticks_ = 0;
     abr_undershoot_ticks_ = 0;
+
+    // TRAPPED-RATE ESCAPE. If predicted is far above published for several
+    // consecutive ticks, the currently-published rate is starving the
+    // pipeline. The buffer can't reach the healthy line because published is
+    // too low; the normal up-switch gate never opens. Force an up-switch
+    // regardless of buffer state. Device log 2026-08-03 14:14 held 177 kbps
+    // for 6+ minutes while predicted was 6-18 Mbps — this branch would have
+    // published a proper rate within ~5 seconds of the network recovering.
+    //
+    // Publish target_kbps directly (predicted × safety) rather than jumping
+    // to full predicted — we want to escape the trap, not overshoot into a
+    // rung the buffer can't afford yet.
+    if (predicted_bps / 1000.0 >=
+        static_cast<double>(published_kbps_) * kTrappedRateMultiplier) {
+      if (++abr_trapped_ticks_ >= kTrappedRateTicks) {
+        publish = true;
+        reason = "trapped-rate escape";
+        abr_trapped_ticks_ = 0;
+        last_upswitch_time_ = now;
+      } else {
+        std::cout << "ABR: trapped (" << abr_trapped_ticks_ << "/"
+                  << kTrappedRateTicks << ") predicted="
+                  << static_cast<int>(predicted_bps / 1000) << "kbps published="
+                  << published_kbps_ << "kbps buffer="
+                  << static_cast<int>(buffer_secs) << "s" << std::endl;
+      }
+    } else {
+      abr_trapped_ticks_ = 0;
+    }
+    // Fall through to normal up-switch consideration below. If the trapped
+    // escape published, its `publish=true` still holds; the normal up-switch
+    // conditions won't re-fire because `publish` is already set.
     // Anti-thrash gate: after a non-emergency down-switch, hold the new rung
     // for kPostDownDwellSecs regardless of estimate before letting it climb
     // again. On device (11:20:29 drop -> 11:20:30 up-switch) the two decisions
@@ -1871,7 +2042,8 @@ void GstVideoPlayer::AbrTick() {
     const bool big_jump_up = target_kbps >= published_kbps_ * 2;
     const bool up_dwell_served =
         now - last_upswitch_time_ > std::chrono::seconds(30);
-    if (target_kbps * 4 >= published_kbps_ * 5 &&
+    if (!publish &&
+        target_kbps * 4 >= published_kbps_ * 5 &&
         buffer_secs >= kHealthyBufferSecs &&
         (up_dwell_served || big_jump_up) &&
         post_down_dwell_served) {

@@ -100,6 +100,11 @@ class GstVideoPlayer {
   void GetVideoSize(int32_t& width, int32_t& height);
   void StartWatchdog();
   void StopWatchdog();
+  // Force a pipeline flush + seek to current position. Used by the watchdog
+  // when playback has been stuck (no frames advancing) for several seconds
+  // but the network is healthy and the buffer isn't draining — a state the
+  // pipeline can't recover from on its own. See the call site for the guards.
+  bool TryFlushRecovery();
   // Fire OnNotifyError at most once (matches the watchdog/error single-fire
   // guard) and stop the watchdog. Used by both the fatal-error path and the
   // entitlement-unavailable path so they never double-notify.
@@ -175,6 +180,14 @@ class GstVideoPlayer {
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
   std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer
+  // Previous tick's buffer_health_secs, used by LogPlaybackHealth to detect a
+  // sharp collapse (e.g. buffer dropping from 30s to 2s in one tick, which we
+  // have seen but never captured the cause of). Only touched from the watchdog
+  // thread. -1.0 means "no previous sample yet."
+  double prev_buffer_health_secs_ = -1.0;
+  // Last time we did a stuck-recovery flush. Guards against firing again too
+  // quickly if the first flush didn't take. Set by the watchdog thread.
+  std::chrono::steady_clock::time_point last_flush_recovery_time_;
   std::mutex watchdog_mutex_;
   std::condition_variable watchdog_cv_;
 
@@ -230,6 +243,13 @@ class GstVideoPlayer {
   // predicted was 446/517/257/307 kbps across four ticks (with buffer still
   // healthy) — the ABR should have already been on a lower rung.
   int abr_undershoot_ticks_ = 0;
+  // Consecutive AbrTick cycles the predicted throughput has been very much
+  // HIGHER than the currently-published rate (>=5x). Mirror of undershoot.
+  // Fires when the buffer is stuck low and the normal up-switch gate can't
+  // open. Device log 2026-08-03 14:14 saw published held at 177 kbps for 6+
+  // minutes while predicted showed 6-18 Mbps — the buffer never reached
+  // 15 s because 177 kbps starves the pipeline, so up-switch never fired.
+  int abr_trapped_ticks_ = 0;
 
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video
