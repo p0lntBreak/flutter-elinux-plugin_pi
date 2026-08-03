@@ -1477,49 +1477,90 @@ void GstVideoPlayer::LogPlaybackHealth(
       }
       gst_object_unref(demux);
     }
+
+    // Dump the ring of recent bus messages. The event that caused the flush
+    // is almost certainly in the last few — SEGMENT_START, STREAM_START, an
+    // ELEMENT message from hlsdemux, or similar. Device 2026-08-03 16:43:05
+    // captured the collapse with no context; this makes the next occurrence
+    // self-explanatory.
+    DumpBusMsgRing();
   }
   prev_buffer_health_secs_ = buffer_health_secs;
 }
 
+void GstVideoPlayer::PushBusMsgRing(const std::string& type,
+                                     const std::string& src_name,
+                                     const std::string& extra) {
+  std::lock_guard<std::mutex> lock(bus_msg_ring_mutex_);
+  bus_msg_ring_.push_back(
+      {std::chrono::steady_clock::now(), type, src_name, extra});
+  // Cap at 20 — enough to see the immediate lead-up to a collapse, small
+  // enough that the dump is readable and the streaming-thread mutex stays fast.
+  while (bus_msg_ring_.size() > 20) {
+    bus_msg_ring_.pop_front();
+  }
+}
+
+void GstVideoPlayer::DumpBusMsgRing() {
+  std::deque<BusMsgEntry> snapshot;
+  {
+    std::lock_guard<std::mutex> lock(bus_msg_ring_mutex_);
+    snapshot = bus_msg_ring_;
+  }
+  if (snapshot.empty()) {
+    std::cout << "BUS-RING: (empty)" << std::endl;
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::cout << "BUS-RING: last " << snapshot.size()
+            << " bus messages (most recent first):" << std::endl;
+  // Print newest-first so the collapse trigger is on the first line.
+  for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) {
+    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - it->when).count();
+    std::cout << "BUS-RING:   -" << age_ms << "ms " << it->type
+              << " src=" << it->src_name;
+    if (!it->extra.empty()) std::cout << " " << it->extra;
+    std::cout << std::endl;
+  }
+}
+
 bool GstVideoPlayer::TryFlushRecovery() {
-  // Called by the watchdog when playback has been stuck but the network and
-  // buffer look fine. Force a flush-seek to the current playback position so
-  // downstream elements resync from a clean state. The user sees a brief cut;
-  // the alternative is endless stutter until the 30 s watchdog trips a full
-  // reconnect.
+  // Called by the watchdog when playback has been stuck for ~8 s but the
+  // network and buffer look fine. Cycle PAUSED -> PLAYING to force the
+  // pipeline's state machine to tick — this often clears a stuck internal
+  // state without requiring a seek.
   //
-  // Guarded by null-pipeline check and by the watchdog's caller having a live
-  // reference to gst_.pipeline. If the seek fails, we return false and the
-  // caller escalates to the reconnect path on its own timeline.
+  // The prior seek-based approach (74ad4f9) returned false on device
+  // 2026-08-03 16:43:20 (`FLUSH-RECOVERY: gst_element_seek failed`), which
+  // matches the general expectation that live HLS pipelines don't accept
+  // seeks in their default configuration. State-cycle recovery is cheaper
+  // and doesn't depend on seekability.
+  //
+  // If the pipeline still doesn't produce frames after this, the watchdog's
+  // 30 s escalation to full reconnect catches it.
   if (!gst_.pipeline) return false;
 
-  gint64 position = 0;
-  if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
-    std::cerr << "FLUSH-RECOVERY: could not query current position, skipping"
-              << std::endl;
+  std::cout << "FLUSH-RECOVERY: cycling PAUSED -> PLAYING to unblock stuck "
+               "playback" << std::endl;
+
+  // Move to PAUSED. If the pipeline was truly stuck, downstream elements will
+  // flush their internal state during this transition.
+  auto pause_result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
+  if (pause_result == GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "FLUSH-RECOVERY: failed to enter PAUSED" << std::endl;
     return false;
   }
 
-  std::cout << "FLUSH-RECOVERY: seeking to current position ("
-            << (position / GST_SECOND) << "s) to unblock stuck playback"
-            << std::endl;
-
-  // GST_SEEK_FLAG_FLUSH forces upstream + downstream to flush any queued
-  // buffers before resuming. GST_SEEK_FLAG_KEY_UNIT lands the seek on the
-  // nearest keyframe so the decoder has a clean start. On a live stream the
-  // exact byte-position doesn't matter — playback will land on the closest
-  // available segment.
-  const bool ok = gst_element_seek(
-      gst_.pipeline, playback_rate_, GST_FORMAT_TIME,
-      static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-      GST_SEEK_TYPE_SET, position, GST_SEEK_TYPE_SET, GST_CLOCK_TIME_NONE);
-
-  if (!ok) {
-    std::cerr << "FLUSH-RECOVERY: gst_element_seek failed" << std::endl;
+  // Immediately request PLAYING again. We don't block waiting for PAUSED to
+  // finish transitioning — the state-change to PLAYING will queue after it.
+  auto play_result = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
+  if (play_result == GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "FLUSH-RECOVERY: failed to re-enter PLAYING" << std::endl;
     return false;
   }
 
-  std::cout << "FLUSH-RECOVERY: seek posted successfully" << std::endl;
+  std::cout << "FLUSH-RECOVERY: state cycle posted" << std::endl;
   return true;
 }
 
@@ -2076,7 +2117,36 @@ void GstVideoPlayer::AbrTick() {
 GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
                                                  GstMessage* message,
                                                  gpointer user_data) {
-  switch (GST_MESSAGE_TYPE(message)) {
+  // Capture every bus message into the ring buffer for post-collapse dumps.
+  // Skip a couple of very-high-frequency types to keep the buffer meaningful —
+  // BUFFERING fires many times per second on some streams and would flood the
+  // ring, and QOS is nearly-per-frame. Everything else is worth remembering.
+  const GstMessageType msg_type = GST_MESSAGE_TYPE(message);
+  if (msg_type != GST_MESSAGE_BUFFERING && msg_type != GST_MESSAGE_QOS) {
+    auto* outer_self = reinterpret_cast<GstVideoPlayer*>(user_data);
+    const gchar* type_name = gst_message_type_get_name(msg_type);
+    const gchar* src_name_c = GST_MESSAGE_SRC(message)
+        ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message))
+        : "(none)";
+    std::string extra;
+    if (msg_type == GST_MESSAGE_ELEMENT) {
+      const GstStructure* s = gst_message_get_structure(message);
+      if (s) {
+        const gchar* struct_name = gst_structure_get_name(s);
+        if (struct_name) extra = std::string("name=") + struct_name;
+      }
+    } else if (msg_type == GST_MESSAGE_STATE_CHANGED &&
+               GST_MESSAGE_SRC(message) == GST_OBJECT(outer_self->gst_.pipeline)) {
+      GstState old_s, new_s, pending_s;
+      gst_message_parse_state_changed(message, &old_s, &new_s, &pending_s);
+      extra = std::string(gst_element_state_get_name(old_s)) + "->" +
+              gst_element_state_get_name(new_s);
+    }
+    outer_self->PushBusMsgRing(type_name ? type_name : "?",
+                                src_name_c ? src_name_c : "?", extra);
+  }
+
+  switch (msg_type) {
     case GST_MESSAGE_EOS: {
       auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       // A LIVE stream has no end and must never "complete". souphttpsrc can

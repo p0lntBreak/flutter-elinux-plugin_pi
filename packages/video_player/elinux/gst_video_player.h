@@ -100,11 +100,19 @@ class GstVideoPlayer {
   void GetVideoSize(int32_t& width, int32_t& height);
   void StartWatchdog();
   void StopWatchdog();
-  // Force a pipeline flush + seek to current position. Used by the watchdog
-  // when playback has been stuck (no frames advancing) for several seconds
-  // but the network is healthy and the buffer isn't draining — a state the
-  // pipeline can't recover from on its own. See the call site for the guards.
+  // Force pipeline recovery when stuck (frames not advancing for several
+  // seconds, network healthy, buffer stable). Cycles PAUSED -> PLAYING rather
+  // than attempting a seek — the seek-based approach in 74ad4f9 returned
+  // false on device 2026-08-03, likely because live HLS pipelines don't
+  // accept seek events in their default configuration.
   bool TryFlushRecovery();
+  // Append a bus-message summary to bus_msg_ring_. Called from
+  // HandleGstMessage on every message. Trims to the last 20 entries.
+  void PushBusMsgRing(const std::string& type, const std::string& src_name,
+                      const std::string& extra);
+  // Print the current bus-message ring buffer to stdout. Called from
+  // LogPlaybackHealth when a buffer collapse is detected.
+  void DumpBusMsgRing();
   // Fire OnNotifyError at most once (matches the watchdog/error single-fire
   // guard) and stop the watchdog. Used by both the fatal-error path and the
   // entitlement-unavailable path so they never double-notify.
@@ -185,6 +193,21 @@ class GstVideoPlayer {
   // have seen but never captured the cause of). Only touched from the watchdog
   // thread. -1.0 means "no previous sample yet."
   double prev_buffer_health_secs_ = -1.0;
+  // Ring buffer of recent bus messages, dumped when a buffer collapse fires.
+  // Purpose: identify which bus event caused the collapse (manifest refresh,
+  // discontinuity, flush-start, stream-start, etc.) rather than guessing.
+  // Written from the streaming thread inside HandleGstMessage; read from the
+  // watchdog thread inside LogPlaybackHealth. Protected by bus_msg_ring_mutex_.
+  // Kept small (last 20) so the streaming thread stays fast and the log dump
+  // stays readable.
+  struct BusMsgEntry {
+    std::chrono::steady_clock::time_point when;
+    std::string type;      // e.g. "STATE_CHANGED", "ELEMENT", "SEGMENT_DONE"
+    std::string src_name;  // element that emitted it, e.g. "hlsdemux0"
+    std::string extra;     // small type-specific detail (may be empty)
+  };
+  std::deque<BusMsgEntry> bus_msg_ring_;
+  std::mutex bus_msg_ring_mutex_;
   // Last time we did a stuck-recovery flush. Guards against firing again too
   // quickly if the first flush didn't take. Set by the watchdog thread.
   std::chrono::steady_clock::time_point last_flush_recovery_time_;
