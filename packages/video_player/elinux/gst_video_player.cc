@@ -1794,19 +1794,28 @@ void GstVideoPlayer::AbrTick() {
                 << static_cast<int>(buffer_secs) << "s cv="
                 << static_cast<int>(cv * 100) << "%" << std::endl;
     }
-  } else if (target_kbps < published_kbps_) {
-    // Sustained-undershoot down-switch. Predicted throughput is below the
-    // currently-published rate, but the buffer is still healthy (otherwise
-    // one of the branches above would have fired). Old behaviour was to
-    // trust the buffer and absorb the variance. That's fine for noise, but
-    // when the network has GENUINELY declined the predicted throughput sits
-    // below published for many consecutive ticks and the buffer eventually
-    // drains anyway — by which time we're reacting late. Track consecutive
-    // undershoot ticks; when it hits kSustainedUndershootTicks, down-switch
-    // proactively regardless of buffer state. Device evidence: 2026-07-31
+  } else if (predicted_bps / 1000.0 < static_cast<double>(published_kbps_)) {
+    // Sustained-undershoot down-switch. Raw predicted throughput (NOT the
+    // safety-adjusted target) is below the currently-published rate. The
+    // buffer is still healthy — one of the branches above would have fired
+    // otherwise — so old behaviour was to trust the buffer and absorb the
+    // variance. That's fine for noise; not fine when the network has
+    // GENUINELY declined and predicted sits below published for many
+    // consecutive ticks. The buffer eventually drains anyway; by then
+    // we're reacting late.
+    //
+    // Compare predicted vs published (NOT target vs published). target =
+    // predicted × safety_multiplier, and safety is 0.85 at healthy buffer.
+    // So target is always ~15% below predicted, and target < published
+    // would fire spuriously whenever predicted is anywhere below ~115% of
+    // published — even when the network is actually adequate. Device 2026-
+    // 08-03 13:04:45 saw predicted=5242, published=4498 (predicted > published)
+    // trip the undershoot counter, then "sustained undershoot" fired and
+    // cascaded into a bandwidth drop chain ending in a 240p S_FMT crash.
+    //
+    // Device evidence for the branch working correctly: 2026-07-31
     // 18:22:11-18:23:41 held 1091 kbps published while predicted was
-    // 446/517/257/307 kbps for four ticks; buffer drained on the fifth and
-    // preroll never recovered.
+    // 446/517/257/307 kbps — clearly under published, four ticks in a row.
     abr_drop_ticks_ = 0;
     if (++abr_undershoot_ticks_ >= kSustainedUndershootTicks) {
       publish = true;
