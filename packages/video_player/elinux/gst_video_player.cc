@@ -6,14 +6,18 @@
 
 #include "logging.h"
 
+#include <fcntl.h>
 #include <glob.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 constexpr double kBufferTargetSecs = 30.0;
@@ -110,6 +114,16 @@ constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 // because retrying against the same slow link will keep failing the same way.
 constexpr char kNetworkTooSlowPrefix[] = "NETWORK_TOO_SLOW: ";
 
+// Stable machine prefix on the error string handed to Flutter when the channel
+// is not currently broadcasting — i.e. the origin serves a 200 but the body is
+// empty or truncated so GStreamer cannot detect a container type. On device
+// this manifests as "ERROR from typefindelementN: Stream doesn't contain
+// enough data." (device log 2026-08-03 19:46:50-19:46:51). Distinct from the
+// network error case: retrying with the same network won't help, because it's
+// the origin/channel that has no signal to serve. Dart side renders a
+// "This channel is currently not available" screen instead of the network UI.
+constexpr char kChannelUnavailablePrefix[] = "CHANNEL_UNAVAILABLE: ";
+
 // Pathological-preroll detector. Fires when total bytes fetched at the http
 // source pad grew by less than kPathologicalPrerollMinDeltaBytes over
 // kPathologicalPrerollNoProgressSecs of wallclock. Bytes-based instead of
@@ -145,6 +159,111 @@ bool IsHttpUnavailable(GError* error, const gchar* debug) {
     if (text.find(token) != std::string::npos) return true;
   }
   return false;
+}
+
+// True when a GStreamer error indicates the origin returned an empty or
+// truncated body such that GStreamer's typefind step could not detect a
+// container type. On device the channel-not-broadcasting case shows up as
+// a GST_STREAM_ERROR_TYPE_NOT_FOUND from the typefind element with message
+// "Stream doesn't contain enough data." — different signal from a network
+// fault (network is fine, origin is fine, but the channel has no bytes).
+bool IsChannelUnavailable(GstMessage* message, GError* error,
+                          const gchar* debug) {
+  if (error && error->domain == GST_STREAM_ERROR &&
+      error->code == GST_STREAM_ERROR_TYPE_NOT_FOUND) {
+    return true;
+  }
+  const gchar* src_name =
+      GST_MESSAGE_SRC(message) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message))
+                               : nullptr;
+  if (src_name && std::string(src_name).find("typefind") != std::string::npos) {
+    return true;
+  }
+  std::string text;
+  if (error && error->message) text += error->message;
+  if (debug) {
+    text += ' ';
+    text += debug;
+  }
+  if (text.find("doesn't contain enough data") != std::string::npos ||
+      text.find("Can't typefind stream") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
+// Dump kernel/hardware state at freeze time. Baked in so we don't have to ask
+// the user to run diagnostic shell commands after each freeze — the log
+// contains the pre-crash kernel state on its own. Called from the watchdog
+// thread right before the 30 s reconnect fires.
+//
+// Reads three sources, each cheap and non-blocking:
+//  - /dev/kmsg: last ~80 lines of kernel ring buffer. Non-blocking O_RDONLY.
+//    bcm2835-codec driver failures ("bcm2835-codec: OUTPUT queue starved",
+//    VCHIQ mailbox timeouts, v4l2-mem2mem job-queue stalls) log here; a
+//    silent decoder freeze usually leaves a fingerprint in the last few
+//    entries.
+//  - /sys/class/thermal/thermal_zone0/temp: current SoC temperature in
+//    millidegrees C. Sustained 720p decode on a Pi 4 in an enclosed case can
+//    push the SoC into thermal throttling, which can lock up the codec.
+//  - vcgencmd get_throttled: reports current throttle flags (undervoltage,
+//    thermal, frequency-capped). Read via popen — bounded output, small.
+void DumpKernelFreezeDiagnostic() {
+  std::cout << "FREEZE-DIAG: capturing kernel/hardware state" << std::endl;
+
+  // /dev/kmsg: read last ~80 entries. The kmsg interface returns one record
+  // per read() and never blocks when opened O_NONBLOCK. We collect all
+  // available records, then print the tail.
+  std::vector<std::string> kmsg_lines;
+  int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+  if (fd >= 0) {
+    lseek(fd, 0, SEEK_DATA);  // start from the current tail, not the beginning
+    char buf[8192];
+    for (int i = 0; i < 512; ++i) {
+      ssize_t n = read(fd, buf, sizeof(buf) - 1);
+      if (n <= 0) break;
+      buf[n] = '\0';
+      kmsg_lines.emplace_back(buf, n);
+    }
+    close(fd);
+    constexpr size_t kMaxLines = 80;
+    size_t start = kmsg_lines.size() > kMaxLines
+                       ? kmsg_lines.size() - kMaxLines
+                       : 0;
+    std::cout << "FREEZE-DIAG: /dev/kmsg last "
+              << (kmsg_lines.size() - start) << " lines:" << std::endl;
+    for (size_t i = start; i < kmsg_lines.size(); ++i) {
+      // Each record is "<priority>,<seq>,<time>,<flags>;<text>\n<key=val>*"
+      // Only print up to the first newline for brevity.
+      std::string& line = kmsg_lines[i];
+      auto nl = line.find('\n');
+      std::cout << "FREEZE-DIAG:   " << line.substr(0, nl) << std::endl;
+    }
+  } else {
+    std::cout << "FREEZE-DIAG: /dev/kmsg unavailable (errno=" << errno << ")"
+              << std::endl;
+  }
+
+  // Thermal zone (temperature in millidegrees C).
+  std::ifstream tf("/sys/class/thermal/thermal_zone0/temp");
+  if (tf.is_open()) {
+    int millideg = 0;
+    tf >> millideg;
+    std::cout << "FREEZE-DIAG: SoC temperature: " << (millideg / 1000.0)
+              << " C" << std::endl;
+  }
+
+  // vcgencmd get_throttled: reports throttling flags. Bounded, short output.
+  FILE* fp = popen("vcgencmd get_throttled 2>/dev/null", "r");
+  if (fp) {
+    char line[256];
+    if (fgets(line, sizeof(line), fp)) {
+      std::string s(line);
+      if (!s.empty() && s.back() == '\n') s.pop_back();
+      std::cout << "FREEZE-DIAG: " << s << std::endl;
+    }
+    pclose(fp);
+  }
 }
 }  // namespace
 
@@ -1572,7 +1691,13 @@ void GstVideoPlayer::StartWatchdog() {
   }
   watchdog_thread_ = std::thread([this]() {
     constexpr auto kCheckInterval = std::chrono::seconds(1);
-    constexpr int kFrameStallTimeoutSecs = 30;  // PLAYING but no frame this long
+    // 10 s (down from 30 s): silent reconnect UX holds the last frame while
+    // the Dart side spins up a replacement player, so a shorter freeze window
+    // is invisible to the user and cuts recovery latency by 20 s. Empirically
+    // the intermediate flush-recovery at 8 s has never resumed frames on
+    // device (device logs 2026-08-03), so there is no benefit to waiting past
+    // the flush-recovery window before triggering the full reconnect.
+    constexpr int kFrameStallTimeoutSecs = 10;  // PLAYING but no frame this long
 
     // Frame-arrival baseline. Locals: touched only by this thread.
     uint64_t last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
@@ -1687,6 +1812,7 @@ void GstVideoPlayer::StartWatchdog() {
                           std::to_string(frozen_secs) + "s while PLAYING";
         std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init"
                   << std::endl;
+        DumpKernelFreezeDiagnostic();
         watchdog_running_.store(false);
         bool expected = false;
         if (error_notified_.compare_exchange_strong(expected, true)) {
@@ -2274,6 +2400,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       std::cout << std::endl;
       if (IsHttpUnavailable(error, debug)) {
         error_msg = std::string(kStreamUnavailablePrefix) + error_msg;
+      } else if (IsChannelUnavailable(message, error, debug)) {
+        error_msg = std::string(kChannelUnavailablePrefix) + error_msg;
       }
       g_free(debug);
       g_error_free(error);
