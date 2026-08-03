@@ -948,7 +948,24 @@ bool GstVideoPlayer::CreatePipeline() {
   // A/V in sync. async=TRUE (default): fakesink participates in preroll,
   // which is what we want — Init() waits for the first decoded frame before
   // calling OnNotifyInitialized().
-  g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
+  //
+  // qos=TRUE + max-lateness=500ms: after a decoder stall the sink would
+  // otherwise try to render every buffered late frame, producing a burst of
+  // stutter and apparent speed-up as it catches up to the audio clock.
+  // Device 2026-08-03 13:28:28-13:28:57 saw three separate stall windows
+  // (5s, 3s, 7s) with a healthy buffer/network; each recovery was a visible
+  // stutter cascade. With max-lateness=500ms the sink drops any frame more
+  // than half a second late instead of racing to render it. Recovery
+  // becomes: freeze on last good frame, then jump forward to the current
+  // audio-clock position, then normal playback. Small max-lateness = quick
+  // clean resume. This is the interim fix; the gold-standard approach is
+  // manual pipeline-clock control (stall both audio and video together so
+  // there's nothing to catch up to) — see roadmap in project memory.
+  g_object_set(G_OBJECT(gst_.video_sink),
+               "sync", TRUE,
+               "qos", TRUE,
+               "max-lateness", (gint64)(500 * GST_MSECOND),
+               NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
