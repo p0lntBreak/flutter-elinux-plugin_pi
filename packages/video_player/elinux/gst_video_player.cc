@@ -666,6 +666,25 @@ bool GstVideoPlayer::SetSeek(int64_t position) {
   if (!gst_.pipeline) {
     return false;
   }
+  // Block ALL seeks on live streams. The base video_player package's
+  // VideoPlayerController.play() has a "if (value.position == value.duration)
+  // seekTo(0)" line that fires on the auto-resume after a spurious app-
+  // lifecycle pause (cage-less GBM backend on Pi4 emits AppLifecycleState.
+  // paused every ~28 s with no matching resume). On live HLS, seeking to 0
+  // with GST_SEEK_FLAG_FLUSH restarts hlsdemux at the earliest position in
+  // the sliding-window playlist — visible as the video "repeating itself"
+  // by 10-30 s. Different HLS servers/manifests fall back differently, which
+  // is why the bug is channel-specific.
+  //
+  // A live stream has no seekable timeline anyway (the "duration" reported by
+  // playbin is the current sliding-window depth, not an addressable range),
+  // so rejecting the seek is the correct behavior — not a workaround.
+  // Returns true so the plugin API doesn't surface an error to Flutter.
+  if (is_live_) {
+    std::cout << "SetSeek ignored for live stream (position=" << position
+              << "ms)" << std::endl;
+    return true;
+  }
   auto nanosecond = position * 1000 * 1000;
   if (!gst_element_seek(
           gst_.pipeline, playback_rate_, GST_FORMAT_TIME,
