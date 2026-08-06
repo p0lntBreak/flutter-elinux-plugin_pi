@@ -280,6 +280,31 @@ GstVideoPlayer::GstVideoPlayer(
   gst_.buffer = nullptr;
 
   uri_ = ParseUri(uri);
+
+  // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
+  // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
+  // which flips is_live_=true there. But that only fires when the media
+  // playlist has an affirmative live marker (#EXT-X-PLAYLIST-TYPE:EVENT or
+  // similar). Our origin currently serves a playlist with a sliding
+  // #EXT-X-MEDIA-SEQUENCE (technically live) but NO affirmative type
+  // marker — device log /tmp/soatv.log 2026-08-06 confirmed hlsdemux
+  // classified it as VOD, is_live_ stayed false, and every live-guard
+  // (Pause block, SetSeek live-ignore, EOS drop) fell through. The
+  // pipeline paused on spurious lifecycle events, then hlsdemux
+  // re-selected the earliest segment in the sliding window on resume,
+  // visible as "video repeating".
+  //
+  // Trust the URL path when it contains /live/ (soatv's authenticated
+  // stream URL for a live channel always has this segment: e.g.
+  // https://ev-edgecache.soa.africa/edge/stream/live/<channel-id>...
+  // pattern). Preroll's NO_PREROLL check still runs and can also flip
+  // is_live_=true; whichever signal fires first wins.
+  if (uri_.find("/live/") != std::string::npos) {
+    is_live_ = true;
+    std::cout << "URI-LIVE-HINT: /live/ path detected — is_live_=true "
+                 "before preroll" << std::endl;
+  }
+
   if (!CreatePipeline()) {
     std::cerr << "Failed to create a pipeline" << std::endl;
     DestroyPipeline();
