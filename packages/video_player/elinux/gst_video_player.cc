@@ -1123,22 +1123,39 @@ bool GstVideoPlayer::CreatePipeline() {
   // which is what we want — Init() waits for the first decoded frame before
   // calling OnNotifyInitialized().
   //
-  // qos=TRUE + max-lateness=500ms: after a decoder stall the sink would
-  // otherwise try to render every buffered late frame, producing a burst of
-  // stutter and apparent speed-up as it catches up to the audio clock.
-  // Device 2026-08-03 13:28:28-13:28:57 saw three separate stall windows
-  // (5s, 3s, 7s) with a healthy buffer/network; each recovery was a visible
-  // stutter cascade. With max-lateness=500ms the sink drops any frame more
-  // than half a second late instead of racing to render it. Recovery
-  // becomes: freeze on last good frame, then jump forward to the current
-  // audio-clock position, then normal playback. Small max-lateness = quick
-  // clean resume. This is the interim fix; the gold-standard approach is
-  // manual pipeline-clock control (stall both audio and video together so
-  // there's nothing to catch up to) — see roadmap in project memory.
+  // qos=TRUE + max-lateness engaged POST-first-frame: after a decoder stall
+  // the sink would otherwise try to render every buffered late frame,
+  // producing a burst of stutter and apparent speed-up as it catches up to
+  // the audio clock. Device 2026-08-03 13:28:28-13:28:57 saw three separate
+  // stall windows (5s, 3s, 7s) with a healthy buffer/network; each recovery
+  // was a visible stutter cascade. With a 500ms cap the sink drops any
+  // frame more than half a second late instead of racing to render it —
+  // recovery becomes: freeze on last good frame, jump forward to current
+  // audio-clock position, normal playback resumes cleanly.
+  //
+  // BUT: engaging the cap at construction breaks preroll. On a fresh
+  // pipeline (initial init or post-reconnect), the videosink and the
+  // pipeline clock haven't settled into a common running time yet, and
+  // 500ms is small enough that arriving buffers can read as "too late"
+  // before they've had a chance to be scheduled. The sink then drops every
+  // frame, downstream fill stalls, the multiqueue plateaus at ~9s of
+  // pending data, `Buffered Until - Position` never crosses the 15s
+  // preroll gate, and playback deadlocks. Device log 2026-08-06 11:57:44 →
+  // 12:11:58 captured a 14-minute stuck-preroll after a decoder-freeze
+  // reconnect on talkSPORT, entirely from this mechanism.
+  //
+  // Fix: start with max-lateness=-1 (disabled — sink renders every frame
+  // regardless of lateness), then flip to 500ms in HandoffHandler on the
+  // very first delivered frame. Preroll is unblocked; steady-state stutter
+  // cascade bounding still fires as designed once real playback starts.
+  //
+  // The gold-standard approach is manual pipeline-clock control (stall
+  // both audio and video together so there's nothing to catch up to) —
+  // see [[gold-standard-playback-roadmap]].
   g_object_set(G_OBJECT(gst_.video_sink),
                "sync", TRUE,
                "qos", TRUE,
-               "max-lateness", (gint64)(500 * GST_MSECOND),
+               "max-lateness", (gint64)(-1),   // disabled during preroll
                NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
@@ -1469,8 +1486,19 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
     self->gst_.buffer = gst_buffer_ref(buf);
   }
 
-  // Wake Init()'s condition variable on the very first frame.
+  // Wake Init()'s condition variable on the very first frame. Also engage
+  // the video sink's max-lateness cap NOW that preroll is proven complete —
+  // it starts at -1 (disabled) so preroll can never be blocked by a
+  // frame-drop cascade, and flips to 500 ms here so subsequent decoder
+  // stalls in steady-state are still bounded per the original 0c891c3
+  // rationale. See CreatePipeline() comment for the full story.
   if (!self->first_frame_ready_.exchange(true)) {
+    if (self->gst_.video_sink) {
+      g_object_set(G_OBJECT(self->gst_.video_sink),
+                   "max-lateness", (gint64)(500 * GST_MSECOND), NULL);
+      std::cout << "MAX-LATENESS: engaged 500ms after first-frame delivery"
+                << std::endl;
+    }
     self->first_frame_cv_.notify_all();
   }
 
