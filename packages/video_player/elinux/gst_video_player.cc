@@ -1717,41 +1717,95 @@ void GstVideoPlayer::DumpBusMsgRing() {
 }
 
 bool GstVideoPlayer::TryFlushRecovery() {
-  // Called by the watchdog when playback has been stuck for ~8 s but the
-  // network and buffer look fine. Cycle PAUSED -> PLAYING to force the
-  // pipeline's state machine to tick — this often clears a stuck internal
-  // state without requiring a seek.
+  // Called by the watchdog at ~8 s of no-frame-advance. Attempts to unstick
+  // a wedged decoder WITHOUT the full pipeline teardown that OnNotifyError
+  // triggers. Every teardown invokes the bcm2835_codec.stop_streaming
+  // kernel bug (leaks 4-9 capture buffers per teardown — see
+  // reference_bcm2835_codec_kernel_bug memory) so avoiding a teardown
+  // preserves driver-side accounting.
   //
-  // The prior seek-based approach (74ad4f9) returned false on device
-  // 2026-08-03 16:43:20 (`FLUSH-RECOVERY: gst_element_seek failed`), which
-  // matches the general expectation that live HLS pipelines don't accept
-  // seeks in their default configuration. State-cycle recovery is cheaper
-  // and doesn't depend on seekability.
+  // TWO-STAGE RECOVERY:
+  //   1. flush-start + flush-stop events on the video sink pad. These
+  //      propagate UPSTREAM through v4l2convert, v4l2h264dec, and the
+  //      multiqueue. Each V4L2 element handles a flush by draining its
+  //      internal queues via VIDIOC_STREAMOFF + STREAMON — this is a
+  //      real driver-side reset, unlike a userspace state cycle. If the
+  //      wedge is in v4l2 accounting (typical Mode 2 signature — frame
+  //      counter stops, buffer stays healthy, no bus ERROR), the flush
+  //      unblocks it.
+  //   2. State-cycle PAUSED -> PLAYING as a nudge. If flush events alone
+  //      don't re-arm the sink, cycling the pipeline state triggers the
+  //      element state machines to tick. Was the old recovery mechanism;
+  //      kept as a fallback because it costs almost nothing.
   //
-  // If the pipeline still doesn't produce frames after this, the watchdog's
-  // 30 s escalation to full reconnect catches it.
-  if (!gst_.pipeline) return false;
+  // Prior mechanisms tried and empirically ineffective:
+  //   - gst_element_seek (74ad4f9): live HLS pipelines don't accept seek
+  //     ("gst_element_seek failed" 2026-08-03).
+  //   - State-cycle alone (88ba0b8): 100% failure rate across ~40 device
+  //     freezes, all fell through to full reconnect.
+  //   - Full teardown + reconnect (current fallback): works but triggers
+  //     the kernel driver bug, so we minimize how often it fires.
+  //
+  // If frames still don't advance within ~2 s of this call, the watchdog
+  // escalates to OnNotifyError at 10 s.
+  if (!gst_.pipeline || !gst_.video_sink) return false;
 
-  std::cout << "FLUSH-RECOVERY: cycling PAUSED -> PLAYING to unblock stuck "
-               "playback" << std::endl;
+  std::cout << "FLUSH-RECOVERY: sending flush-start/stop to video sink pad "
+               "(attempting decoder unstick without teardown)" << std::endl;
 
-  // Move to PAUSED. If the pipeline was truly stuck, downstream elements will
-  // flush their internal state during this transition.
+  // Get the video sink's sink pad. That's the input side of the sink,
+  // where flush events sent UPSTREAM will propagate back to v4l2convert
+  // and then to v4l2h264dec.
+  GstPad* sink_pad = gst_element_get_static_pad(gst_.video_sink, "sink");
+  if (!sink_pad) {
+    std::cerr << "FLUSH-RECOVERY: failed to get video sink pad" << std::endl;
+    return false;
+  }
+
+  // flush-start: elements stop pushing/pulling and prepare for reset.
+  // gst_event_new_flush_start() takes no args; propagates upstream.
+  GstEvent* start_ev = gst_event_new_flush_start();
+  gboolean start_ok = gst_pad_send_event(sink_pad, start_ev);
+  if (!start_ok) {
+    std::cerr << "FLUSH-RECOVERY: flush-start event rejected by sink pad"
+              << std::endl;
+    gst_object_unref(sink_pad);
+    return false;
+  }
+
+  // flush-stop with reset_time=TRUE: elements resume normal streaming and
+  // reset their internal timestamps to the next running-time observation.
+  GstEvent* stop_ev = gst_event_new_flush_stop(TRUE);
+  gboolean stop_ok = gst_pad_send_event(sink_pad, stop_ev);
+  gst_object_unref(sink_pad);
+  if (!stop_ok) {
+    std::cerr << "FLUSH-RECOVERY: flush-stop event rejected by sink pad"
+              << std::endl;
+    return false;
+  }
+
+  std::cout << "FLUSH-RECOVERY: flush events dispatched, now cycling "
+               "PAUSED -> PLAYING as backup nudge" << std::endl;
+
+  // State-cycle backup. If the flush events alone didn't re-arm the sink,
+  // cycling the pipeline through PAUSED often kicks stuck state machines.
+  // Cheap; runs unconditionally after the flush.
   auto pause_result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
   if (pause_result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "FLUSH-RECOVERY: failed to enter PAUSED" << std::endl;
+    std::cerr << "FLUSH-RECOVERY: failed to enter PAUSED (backup nudge)"
+              << std::endl;
     return false;
   }
 
-  // Immediately request PLAYING again. We don't block waiting for PAUSED to
-  // finish transitioning — the state-change to PLAYING will queue after it.
   auto play_result = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
   if (play_result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "FLUSH-RECOVERY: failed to re-enter PLAYING" << std::endl;
+    std::cerr << "FLUSH-RECOVERY: failed to re-enter PLAYING (backup nudge)"
+              << std::endl;
     return false;
   }
 
-  std::cout << "FLUSH-RECOVERY: state cycle posted" << std::endl;
+  std::cout << "FLUSH-RECOVERY: flush + state cycle posted; watching for "
+               "frame advance in the next 2 s" << std::endl;
   return true;
 }
 
@@ -1838,18 +1892,21 @@ void GstVideoPlayer::StartWatchdog() {
                   << "s" << std::endl;
       }
 
-      // Intermediate stuck-recovery: at 8 seconds of no-frame-advance, if the
-      // network is measurably healthy AND we haven't done a flush recently,
-      // try a flush-seek to unblock the pipeline. Device 2026-08-03 14:14-14:20
-      // showed 6+ minutes of stuck-at-9s-buffer playback on a single-quality
-      // stream with the network delivering 5-30 Mbps throughout. The pipeline
-      // could not recover on its own. A flush at the 8-second mark gives us
-      // one recovery attempt before the 30-second full-reconnect fires.
+      // Intermediate soft-recovery attempt (task #29). At 8 s of no-frame-
+      // advance with a healthy network, try to unstick the wedged decoder
+      // via TryFlushRecovery() — flush-start/flush-stop events on the video
+      // sink pad, followed by a state-cycle nudge. This attempts recovery
+      // WITHOUT the full pipeline teardown that OnNotifyError triggers.
+      // Every teardown invokes the bcm2835_codec kernel bug that leaks
+      // capture buffers; avoiding teardown preserves driver-side accounting.
+      // Falls through to the 10 s OnNotifyError path if frames don't
+      // resume — same total user-visible timeout as before.
       //
       // Guards:
       // - frozen_secs in [kFlushRecoveryAfterSecs, kFrameStallTimeoutSecs):
       //   only in the middle window, not right after a stall starts.
-      // - Recent throughput sample >= kFlushRecoveryHealthyKbps: pipe is fine.
+      // - Recent throughput sample >= kFlushRecoveryHealthyKbps: no point
+      //   flushing if there's no data upstream to decode.
       // - >= 30 s since our last flush: don't spam if the first didn't take.
       constexpr int kFlushRecoveryAfterSecs = 8;
       constexpr int kFlushRecoveryCooldownSecs = 30;
