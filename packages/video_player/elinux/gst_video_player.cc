@@ -1717,95 +1717,53 @@ void GstVideoPlayer::DumpBusMsgRing() {
 }
 
 bool GstVideoPlayer::TryFlushRecovery() {
-  // Called by the watchdog at ~8 s of no-frame-advance. Attempts to unstick
-  // a wedged decoder WITHOUT the full pipeline teardown that OnNotifyError
-  // triggers. Every teardown invokes the bcm2835_codec.stop_streaming
-  // kernel bug (leaks 4-9 capture buffers per teardown — see
-  // reference_bcm2835_codec_kernel_bug memory) so avoiding a teardown
-  // preserves driver-side accounting.
+  // Called by the watchdog when playback has been stuck for ~8 s but the
+  // network and buffer look fine. Cycle PAUSED -> PLAYING to force the
+  // pipeline's state machine to tick — this often clears a stuck internal
+  // state without requiring a seek.
   //
-  // TWO-STAGE RECOVERY:
-  //   1. flush-start + flush-stop events on the video sink pad. These
-  //      propagate UPSTREAM through v4l2convert, v4l2h264dec, and the
-  //      multiqueue. Each V4L2 element handles a flush by draining its
-  //      internal queues via VIDIOC_STREAMOFF + STREAMON — this is a
-  //      real driver-side reset, unlike a userspace state cycle. If the
-  //      wedge is in v4l2 accounting (typical Mode 2 signature — frame
-  //      counter stops, buffer stays healthy, no bus ERROR), the flush
-  //      unblocks it.
-  //   2. State-cycle PAUSED -> PLAYING as a nudge. If flush events alone
-  //      don't re-arm the sink, cycling the pipeline state triggers the
-  //      element state machines to tick. Was the old recovery mechanism;
-  //      kept as a fallback because it costs almost nothing.
+  // The prior seek-based approach (74ad4f9) returned false on device
+  // 2026-08-03 16:43:20 (`FLUSH-RECOVERY: gst_element_seek failed`), which
+  // matches the general expectation that live HLS pipelines don't accept
+  // seeks in their default configuration. State-cycle recovery is cheaper
+  // and doesn't depend on seekability.
   //
-  // Prior mechanisms tried and empirically ineffective:
-  //   - gst_element_seek (74ad4f9): live HLS pipelines don't accept seek
-  //     ("gst_element_seek failed" 2026-08-03).
-  //   - State-cycle alone (88ba0b8): 100% failure rate across ~40 device
-  //     freezes, all fell through to full reconnect.
-  //   - Full teardown + reconnect (current fallback): works but triggers
-  //     the kernel driver bug, so we minimize how often it fires.
+  // Note: an earlier attempt (2026-08-12 706a167) tried sending flush-start
+  // + flush-stop(reset_time=TRUE) events on the video sink pad BEFORE this
+  // state cycle. Device evidence showed those flush events combined with
+  // the state-cycle wedged the pipeline in PAUSED indefinitely — the ASYNC
+  // PLAYING transition never completed. Reverted here. If a flush-based
+  // recovery is retried in future, it needs to (a) NOT use reset_time=TRUE
+  // on live pipelines (it resets running-time to 0 while the source keeps
+  // producing at high timestamps, causing all buffers to be dropped as
+  // "too late"), and (b) NOT be combined with a state cycle in the same
+  // recovery attempt.
   //
-  // If frames still don't advance within ~2 s of this call, the watchdog
-  // escalates to OnNotifyError at 10 s.
-  if (!gst_.pipeline || !gst_.video_sink) return false;
+  // If the pipeline still doesn't produce frames after this, the watchdog's
+  // 10 s escalation to full reconnect catches it — now state-agnostic
+  // (see StartWatchdog fatal-timeout branch).
+  if (!gst_.pipeline) return false;
 
-  std::cout << "FLUSH-RECOVERY: sending flush-start/stop to video sink pad "
-               "(attempting decoder unstick without teardown)" << std::endl;
+  std::cout << "FLUSH-RECOVERY: cycling PAUSED -> PLAYING to unblock stuck "
+               "playback" << std::endl;
 
-  // Get the video sink's sink pad. That's the input side of the sink,
-  // where flush events sent UPSTREAM will propagate back to v4l2convert
-  // and then to v4l2h264dec.
-  GstPad* sink_pad = gst_element_get_static_pad(gst_.video_sink, "sink");
-  if (!sink_pad) {
-    std::cerr << "FLUSH-RECOVERY: failed to get video sink pad" << std::endl;
-    return false;
-  }
-
-  // flush-start: elements stop pushing/pulling and prepare for reset.
-  // gst_event_new_flush_start() takes no args; propagates upstream.
-  GstEvent* start_ev = gst_event_new_flush_start();
-  gboolean start_ok = gst_pad_send_event(sink_pad, start_ev);
-  if (!start_ok) {
-    std::cerr << "FLUSH-RECOVERY: flush-start event rejected by sink pad"
-              << std::endl;
-    gst_object_unref(sink_pad);
-    return false;
-  }
-
-  // flush-stop with reset_time=TRUE: elements resume normal streaming and
-  // reset their internal timestamps to the next running-time observation.
-  GstEvent* stop_ev = gst_event_new_flush_stop(TRUE);
-  gboolean stop_ok = gst_pad_send_event(sink_pad, stop_ev);
-  gst_object_unref(sink_pad);
-  if (!stop_ok) {
-    std::cerr << "FLUSH-RECOVERY: flush-stop event rejected by sink pad"
-              << std::endl;
-    return false;
-  }
-
-  std::cout << "FLUSH-RECOVERY: flush events dispatched, now cycling "
-               "PAUSED -> PLAYING as backup nudge" << std::endl;
-
-  // State-cycle backup. If the flush events alone didn't re-arm the sink,
-  // cycling the pipeline through PAUSED often kicks stuck state machines.
-  // Cheap; runs unconditionally after the flush.
+  // Move to PAUSED. If the pipeline was truly stuck, downstream elements will
+  // flush their internal state during this transition.
   auto pause_result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
   if (pause_result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "FLUSH-RECOVERY: failed to enter PAUSED (backup nudge)"
-              << std::endl;
+    std::cerr << "FLUSH-RECOVERY: failed to enter PAUSED" << std::endl;
     return false;
   }
 
+  // Immediately request PLAYING again. We don't block waiting for PAUSED to
+  // finish transitioning — the state-change to PLAYING will queue after it.
   auto play_result = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
   if (play_result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "FLUSH-RECOVERY: failed to re-enter PLAYING (backup nudge)"
-              << std::endl;
+    std::cerr << "FLUSH-RECOVERY: failed to re-enter PLAYING" << std::endl;
     return false;
   }
 
-  std::cout << "FLUSH-RECOVERY: flush + state cycle posted; watching for "
-               "frame advance in the next 2 s" << std::endl;
+  std::cout << "FLUSH-RECOVERY: state cycle posted" << std::endl;
   return true;
 }
 
@@ -1828,6 +1786,11 @@ void GstVideoPlayer::StartWatchdog() {
     // Frame-arrival baseline. Locals: touched only by this thread.
     uint64_t last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
     auto last_frame_advance_time = std::chrono::steady_clock::now();
+    // Set once the pipeline reaches PLAYING at least once. Gates the state-
+    // agnostic wedge escalation below — during initial preroll the pipeline
+    // is legitimately in PAUSED for many seconds, so we only start escalating
+    // on non-PLAYING wedges AFTER we've seen a successful PLAYING transition.
+    bool has_reached_playing = false;
 
     while (true) {
       std::chrono::steady_clock::time_point progress_snap;
@@ -1869,13 +1832,51 @@ void GstVideoPlayer::StartWatchdog() {
       gst_element_get_state(gst_.pipeline, &state, nullptr, 0);
       uint64_t frames = frames_handed_off_.load(std::memory_order_relaxed);
       if (state != GST_STATE_PLAYING) {
-        // Paused / seeking / not playing — re-baseline so a legitimate pause
-        // doesn't look like a freeze when playback resumes.
+        // Re-baseline the frame-arrival counter unless we've previously
+        // reached PLAYING AND playback is currently requested. This is
+        // the state-agnostic wedge escalation: if we've been playing
+        // successfully before, and the user hasn't paused, but state has
+        // fallen back to something other than PLAYING for the full
+        // timeout, the pipeline is wedged and must reconnect. Two
+        // observed wedge classes this covers:
+        //   - SoftRecover state-cycle stuck in PAUSED forever (device
+        //     log 2026-08-12 16:44).
+        //   - Stuck-init when Play() returned ASYNC and state stayed
+        //     READY (task #42, 2026-08-12 14:23). Note: THIS class isn't
+        //     covered by has_reached_playing — we've never been PLAYING
+        //     in that case. Task #42 stays open for that scenario.
+        // Legitimate reasons state isn't PLAYING that must NOT escalate:
+        //   - Initial preroll (haven't reached PLAYING yet)
+        //   - User-requested pause (play_state_requested_ == false)
+        if (has_reached_playing && play_state_requested_.load()) {
+          LogPlaybackHealth(state, frames, now, last_frame_advance_time);
+          auto wedged_secs = std::chrono::duration_cast<std::chrono::seconds>(
+              now - last_frame_advance_time).count();
+          if (wedged_secs >= kFrameStallTimeoutSecs) {
+            std::string msg = "Playback wedged: play requested but state=" +
+                              std::string(gst_element_state_get_name(state)) +
+                              " for " + std::to_string(wedged_secs) + "s";
+            std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init"
+                      << std::endl;
+            DumpKernelFreezeDiagnostic();
+            watchdog_running_.store(false);
+            bool expected = false;
+            if (error_notified_.compare_exchange_strong(expected, true)) {
+              last_error_ = msg;
+              stream_handler_->OnNotifyError(msg);
+            }
+            break;
+          }
+          continue;
+        }
+        // Legitimate non-PLAYING (initial preroll or user pause) — baseline.
         last_seen_frames = frames;
         last_frame_advance_time = now;
         LogPlaybackHealth(state, frames, now, last_frame_advance_time);
         continue;
       }
+      // We've observed state=PLAYING at least once.
+      has_reached_playing = true;
 
       if (frames != last_seen_frames) {
         last_seen_frames = frames;
