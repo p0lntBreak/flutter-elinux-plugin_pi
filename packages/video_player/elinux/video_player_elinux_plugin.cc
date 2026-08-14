@@ -79,8 +79,13 @@ class VideoPlayerPlugin : public flutter::Plugin {
       DisposePlayer(texture_id);
     }
     // Every GstVideoPlayer was destroyed synchronously inside DisposePlayer;
-    // the retired shells hold no GStreamer objects, so drop them now, before
-    // the library unload.
+    // the retired shells hold no GStreamer objects. Unregister the textures
+    // now (deferred at dispose per task #38) before dropping the shells and
+    // unloading the library — at shutdown there is no raster thread still
+    // rendering to race against, so it is safe to unregister immediately.
+    for (auto& retired : retired_players_) {
+      texture_registrar_->UnregisterTexture(retired.second->texture_id);
+    }
     retired_players_.clear();
     GstVideoPlayer::GstLibraryUnload();
   }
@@ -320,6 +325,12 @@ void VideoPlayerPlugin::HandleInitializeMethodCall(
 void VideoPlayerPlugin::HandleCreateMethodCall(
     const flutter::EncodableValue& message,
     flutter::MessageReply<flutter::EncodableValue> reply) {
+  // Sweep any retired players whose 5 s deferred-UnregisterTexture window
+  // has elapsed. On a normal reconnect flow this fires shortly after
+  // DisposePlayer (Create is typically called ~3 s after Dispose), so
+  // retired entries get cleaned up promptly on natural user activity.
+  ReapRetiredPlayers();
+
   auto meta = CreateMessage::FromMap(message);
   std::string uri;
   if (!meta.GetAsset().empty()) {
@@ -796,12 +807,6 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
     player->event_channel->SetStreamHandler(nullptr);
   }
 
-  // Ask the engine to stop sampling this texture. This client wrapper only
-  // exposes the deprecated synchronous UnregisterTexture(int64_t), which
-  // returns BEFORE the raster thread has necessarily finished a copy in flight
-  // (or one it is about to start), so it does not by itself make teardown safe.
-  texture_registrar_->UnregisterTexture(texture_id);
-
   // Tear down the GstVideoPlayer now (stops the pipeline and frees its
   // CMA-backed buffers, which must not linger across reconnects) but UNDER
   // buffer_mutex: if the raster thread is mid-copy, the copy callback holds the
@@ -813,12 +818,29 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
     player->player = nullptr;
   }
 
-  // Do NOT destroy the FlutterVideoPlayer shell here. A copy the raster thread
-  // already scheduled can still fire after UnregisterTexture() returns, and it
-  // dereferences this object (and its buffer_mutex). Keep the shell alive —
-  // `player` is now null, so the callback returns nullptr immediately — and
-  // reclaim it once the raster thread has certainly drained. This closes the
-  // use-after-free that segfaulted on reconnect teardown.
+  // DEFERRED UNREGISTER (task #38, 2026-08-13). Do NOT call
+  // texture_registrar_->UnregisterTexture(texture_id) here. Two crashes
+  // proven via gdb core dump on 2026-08-10 (rapid reconnect churn) and
+  // 2026-08-13 (FAITH TV, single reconnect after 1h stable playback) both
+  // segfaulted inside flutter::ExternalTexturePixelBuffer::CopyPixelBuffer,
+  // one via null-deref of a corrupted vtable, the other via blr on a
+  // vtable slot pointing at unmapped memory. Both are use-after-free of
+  // the ENGINE's ExternalTexturePixelBuffer object.
+  //
+  // The synchronous UnregisterTexture(int64_t) tears down that engine
+  // object BEFORE the raster thread stops holding references from
+  // in-flight render passes. Our existing buffer_mutex + retired_players_
+  // pattern protects OUR FlutterVideoPlayer shell but NOT the engine's
+  // texture wrapper. Deferring UnregisterTexture by the same 5 s window
+  // keeps the engine's wrapper alive long enough for any raster-thread
+  // reference to drain. During that window our callback returns nullptr
+  // (player is null), so engine renders black for that texture — same
+  // behavior as before, just with a live wrapper object.
+  //
+  // 2026-08-13 FAITH TV crash was triggered by ONE reconnect (not the 8+
+  // reconnect churn of 2026-08-10) — the RepaintBoundary snapshot from
+  // silent-reconnect UX (PR #37) held an extra texture reference during
+  // dispose. Deferring here breaks that race regardless of trigger.
   ReapRetiredPlayers();
   retired_players_.emplace_back(std::chrono::steady_clock::now(),
                                 std::move(player));
@@ -830,6 +852,11 @@ void VideoPlayerPlugin::ReapRetiredPlayers() {
     // 5 s is far longer than the few frames the engine needs to stop invoking
     // an unregistered texture's callback, so the shell is safe to free.
     if (now - it->first > std::chrono::seconds(5)) {
+      // Deferred UnregisterTexture (task #38). This is the actual call to
+      // the engine that tears down its ExternalTexturePixelBuffer wrapper.
+      // Delayed 5 s past DisposePlayer so raster-thread references from
+      // in-flight render passes have drained.
+      texture_registrar_->UnregisterTexture(it->second->texture_id);
       it = retired_players_.erase(it);
     } else {
       ++it;
