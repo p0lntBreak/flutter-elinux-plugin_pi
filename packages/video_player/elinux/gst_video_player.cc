@@ -2351,13 +2351,54 @@ void GstVideoPlayer::AbrTick() {
   }
 
   if (publish) {
-    SetConnectionSpeedKbps(demux, target_kbps);
+    // SCOPE 1 (task #37, 2026-08-15): route any DOWN-switch through
+    // ABR_RESTART instead of in-place SetConnectionSpeedKbps. The
+    // bcm2835-codec V4L2 capture pool cannot shrink in place — hlsdemux
+    // switching to a lower rung triggers a v4l2convert S_FMT that the
+    // driver rejects with EINVAL ("Call to S_FMT failed for YU12 @ WxH:
+    // Invalid argument", kmsg "Current buffer size X < min buf size Y —
+    // driver mismatch to MMAL"). GStreamer's default retry logic then
+    // fires 4-8 more failed S_FMT attempts, producing a retry storm that
+    // burns GStreamer/V4L2 element state until an eventual segfault
+    // (BBC News 2026-08-15 log: 49 S_FMT crashes across 11 reconnects →
+    // segfault deep in libgstreamer at pipeline build #59). Solution:
+    // publish the new rate for internal accounting, but do NOT call
+    // SetConnectionSpeedKbps. Instead emit ABR_RESTART: down-switch,
+    // which soatv treats as a controlled reconnect (bypasses unproductive-
+    // reconnect counter, threads the target rung as a URI fragment). One
+    // clean rebuild replaces the retry-storm entirely.
+    //
+    // Up-switches remain in-place: they GROW the pool, which the driver
+    // handles fine, and they benefit from playbin's live continuity.
+    //
+    // Exclude first-estimate (published_kbps_ was 0 before this tick's
+    // update) because that's the initial-connect publish path, not a
+    // switch. Also exclude same-rate republish (target_kbps ==
+    // published_kbps_) — shouldn't happen in practice but harmless.
+    const bool is_down_switch =
+        published_kbps_ > 0 && target_kbps < published_kbps_;
     published_kbps_ = target_kbps;
-    std::cout << "ABR: " << reason << " — connection-speed=" << target_kbps
-              << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
-              << "kbps cv=" << static_cast<int>(cv * 100) << "% buffer="
-              << static_cast<int>(buffer_secs) << "s safety=" << safety << ")"
-              << std::endl;
+    if (is_down_switch) {
+      std::string msg = "ABR_RESTART: down-switch to " +
+                        std::to_string(target_kbps) + "kbps (" + reason +
+                        ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
+                        "s)";
+      std::cout << "ABR: " << reason
+                << " — routing as ABR_RESTART instead of in-place S_FMT: "
+                << msg << std::endl;
+      bool expected = false;
+      if (error_notified_.compare_exchange_strong(expected, true)) {
+        last_error_ = msg;
+        stream_handler_->OnNotifyError(msg);
+      }
+    } else {
+      SetConnectionSpeedKbps(demux, target_kbps);
+      std::cout << "ABR: " << reason << " — connection-speed=" << target_kbps
+                << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
+                << "kbps cv=" << static_cast<int>(cv * 100) << "% buffer="
+                << static_cast<int>(buffer_secs) << "s safety=" << safety << ")"
+                << std::endl;
+    }
   } else if (++abr_heartbeat_counter_ % 30 == 0) {
     std::cout << "ABR: holding " << published_kbps_ << "kbps (predicted="
               << static_cast<int>(predicted_bps / 1000) << "kbps cv="
