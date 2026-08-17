@@ -69,6 +69,55 @@ constexpr double kTrappedRateMultiplier = 5.0;
 // let it climb again.
 constexpr int kPostDownDwellSecs = 20;
 
+// --- ABR calm-mode tunables (task #46, 2026-08-17) ---
+//
+// Post-ABR-decision cooldown: after ANY ABR decision (first-estimate,
+// up-switch, down-switch, emergency, undershoot, trapped-rate escape),
+// no new ABR decision fires for this many seconds. Prevents the feedback
+// loop where a rebuild's cold-start throughput samples fire a new decision
+// on stale/jumpy data. BBC News 2026-08-17 log showed 30 restarts in 37 min
+// (one every 74s) driving a 19x buffer-collapse rate vs single-variant
+// baseline; median gap between BBC collapses was 84s — almost the exact
+// ABR cadence. 60s is a segment × ~5, long enough for throughput sampling
+// to stabilise, short enough that a genuine sustained decline still gets
+// acted on within a segment.
+constexpr int kPostAbrDecisionCooldownSecs = 60;
+
+// Up-switch dwell: minimum interval between successive up-switches. Was
+// 30s. Bumped to 90s so a brief upward network spike doesn't jump rung
+// and immediately regret it on the next dip. 90s ≈ 9 typical HLS segments,
+// long enough that the current rung has proven stable before climbing.
+constexpr int kUpSwitchDwellSecs = 90;
+
+// Fragile-pipeline window: an up-switch that fires within this many seconds
+// of first-publish gets routed through ABR_RESTART instead of in-place
+// SetConnectionSpeedKbps. The BBC News 2026-08-17 10:47 crash happened on
+// an in-place up-switch to a pipeline barely 55s old that had just
+// completed an in-place rendition renegotiation from 360p to 720p 4s
+// earlier. libstdc++/libc heap primitive was called with a corrupted
+// size argument (0xffffffffffffdea2) — consistent with a UAF or double-
+// free in the GStreamer inputselector re-plug path. Redirecting fragile
+// up-switches through the same clean-rebuild path Scope 1 uses for
+// down-switches removes the race.
+constexpr int kFragilePipelineSecs = 60;
+
+// Post-BUFFER-COLLAPSE quiet window: an up-switch fired within this many
+// seconds of the last BUFFER-COLLAPSE is considered "during recovery" and
+// gets routed through ABR_RESTART. Same rationale as fragile-pipeline: a
+// pipeline that just recovered from a collapse is in a re-plugging state
+// where in-place variant switches are unsafe.
+constexpr int kPostCollapseQuietSecs = 30;
+
+// Up-switch stability requirement: coefficient of variation ceiling.
+// Above this value, network is too jittery to be publishing rendition
+// changes safely — an up-switch to a higher rung on top of unstable
+// throughput samples typically triggers a buffer emergency within
+// seconds. BBC News 2026-08-17 10:47:05 up-switch was decided at cv=87%,
+// crashed immediately. cv=60% is a reasonable ceiling: above it, defer
+// the up-switch. Down-switches under high cv are still allowed because
+// they're moving toward safety, not away from it.
+constexpr double kUpSwitchMaxCv = 0.60;
+
 // Cold-start rung hint (kbps) fed to hlsdemux as "connection-speed". Sized
 // so hlsdemux picks 360p on this project's manifest (960 kbps rendition):
 // 1500 leaves headroom above 360p's 960 but stays below 480p's 1800. A
@@ -1651,6 +1700,15 @@ void GstVideoPlayer::LogPlaybackHealth(
               << "s pct=" << pct
               << "% state=" << gst_element_state_get_name(state) << std::endl;
 
+    // Stamp for the ABR calm-mode gate (task #46, 2026-08-17). Any up-switch
+    // firing within kPostCollapseQuietSecs of this timestamp gets routed
+    // through ABR_RESTART instead of in-place SetConnectionSpeedKbps —
+    // the recovery-from-collapse window has re-plugging inputselectors
+    // and in-place variant switches during that window crashed the app.
+    last_buffer_collapse_ns_.store(
+        std::chrono::steady_clock::now().time_since_epoch().count(),
+        std::memory_order_relaxed);
+
     // Dump hlsdemux's current-bitrate — if it changed at the moment of the
     // drop, a manifest refresh / rendition selection is likely the trigger.
     GstElement* demux = nullptr;
@@ -2214,18 +2272,35 @@ void GstVideoPlayer::AbrTick() {
   const char* reason = "";
   const bool is_drop = target_kbps * 5 <= published_kbps_ * 4;  // >=20% below
 
+  // Calm-mode global cooldown (task #46, 2026-08-17). After ANY ABR decision,
+  // block the next decision for kPostAbrDecisionCooldownSecs. Buffer-emergency
+  // is exempt: buffer < 6 s is survival, cooldown does not apply.
+  const bool cooldown_served =
+      last_abr_decision_time_.time_since_epoch().count() == 0 ||
+      now - last_abr_decision_time_ >
+          std::chrono::seconds(kPostAbrDecisionCooldownSecs);
+
   if (published_kbps_ == 0) {
     publish = true;
     reason = "first estimate";
     abr_drop_ticks_ = 0;
     abr_undershoot_ticks_ = 0;
     abr_trapped_ticks_ = 0;
+    first_publish_time_ = now;
   } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
     // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
-    // the only instant down-switch path. Deliberately does NOT stamp
-    // last_downswitch_time_: survival beats the anti-thrash dwell.
+    // the only instant down-switch path AND the only branch exempt from the
+    // calm-mode cooldown. Deliberately does NOT stamp last_downswitch_time_:
+    // survival beats the anti-thrash dwell.
     publish = true;
     reason = "buffer emergency";
+    abr_drop_ticks_ = 0;
+    abr_undershoot_ticks_ = 0;
+    abr_trapped_ticks_ = 0;
+  } else if (!cooldown_served) {
+    // Global calm-mode cooldown active: skip all non-emergency decisions.
+    // Reset counters so they don't over-accumulate during the quiet window
+    // and produce a false "sustained" signal the moment cooldown clears.
     abr_drop_ticks_ = 0;
     abr_undershoot_ticks_ = 0;
     abr_trapped_ticks_ = 0;
@@ -2246,28 +2321,31 @@ void GstVideoPlayer::AbrTick() {
                 << static_cast<int>(buffer_secs) << "s cv="
                 << static_cast<int>(cv * 100) << "%" << std::endl;
     }
-  } else if (predicted_bps / 1000.0 < static_cast<double>(published_kbps_)) {
-    // Sustained-undershoot down-switch. Raw predicted throughput (NOT the
-    // safety-adjusted target) is below the currently-published rate. The
-    // buffer is still healthy — one of the branches above would have fired
-    // otherwise — so old behaviour was to trust the buffer and absorb the
-    // variance. That's fine for noise; not fine when the network has
-    // GENUINELY declined and predicted sits below published for many
-    // consecutive ticks. The buffer eventually drains anyway; by then
-    // we're reacting late.
+  } else if (predicted_bps / 1000.0 < static_cast<double>(published_kbps_) * 0.7
+             && buffer_secs < kHealthyBufferSecs) {
+    // Sustained-undershoot down-switch (task #46 tightened). Two gates:
+    //   1. Predicted must be at least 30% below published (was any-below).
+    //      A 5% dip on a jittery cv=90% link is noise; only a meaningful
+    //      gap justifies rebuilding.
+    //   2. Buffer must be below the healthy line. If the buffer is >= 15 s
+    //      the current rung is empirically sustainable regardless of what
+    //      predicted says — the samples might be off but the buffer is
+    //      ground truth for what's actually being served. Suppressing this
+    //      here is the biggest ABR-churn reduction in the calm-mode
+    //      package. BBC News 2026-08-17 log showed 18 sustained-undershoot
+    //      restarts, most with buffer=25-30s: under this rule, zero would
+    //      have fired.
     //
     // Compare predicted vs published (NOT target vs published). target =
     // predicted × safety_multiplier, and safety is 0.85 at healthy buffer.
     // So target is always ~15% below predicted, and target < published
     // would fire spuriously whenever predicted is anywhere below ~115% of
-    // published — even when the network is actually adequate. Device 2026-
-    // 08-03 13:04:45 saw predicted=5242, published=4498 (predicted > published)
-    // trip the undershoot counter, then "sustained undershoot" fired and
-    // cascaded into a bandwidth drop chain ending in a 240p S_FMT crash.
+    // published — even when the network is actually adequate.
     //
     // Device evidence for the branch working correctly: 2026-07-31
     // 18:22:11-18:23:41 held 1091 kbps published while predicted was
-    // 446/517/257/307 kbps — clearly under published, four ticks in a row.
+    // 446/517/257/307 kbps — 41-47% below published for four ticks with
+    // draining buffer. Both new gates still fire on that scenario.
     abr_drop_ticks_ = 0;
     abr_trapped_ticks_ = 0;  // predicted below published — not trapped-low
     if (++abr_undershoot_ticks_ >= kSustainedUndershootTicks) {
@@ -2283,8 +2361,8 @@ void GstVideoPlayer::AbrTick() {
                 << static_cast<int>(buffer_secs) << "s" << std::endl;
     }
   } else {
-    // No drop and predicted meets or exceeds published — reset drop counters
-    // and consider an up-switch or trapped-rate escape.
+    // No drop and predicted meets or exceeds 70% of published — reset drop
+    // counters and consider an up-switch or trapped-rate escape.
     abr_drop_ticks_ = 0;
     abr_undershoot_ticks_ = 0;
 
@@ -2328,25 +2406,39 @@ void GstVideoPlayer::AbrTick() {
     const bool post_down_dwell_served =
         last_downswitch_time_.time_since_epoch().count() == 0 ||
         now - last_downswitch_time_ > std::chrono::seconds(kPostDownDwellSecs);
-    // A "big jump" up-switch bypasses the 30 s dwell so we don't walk through
-    // every intermediate rung (240p → 360p → 480p → 720p) on a first-connect
-    // where each intermediate step is visible on screen. If the estimate says
-    // we can afford well over 2x the currently-published rate, that's not a
-    // gentle climb — that's the estimator catching up to a link the previous
-    // publish underestimated. Take the jump directly. Still requires a healthy
-    // buffer + post-down dwell served, so this can't accidentally re-enter
-    // up-switch behavior on a jittery down-then-up.
+    // A "big jump" up-switch bypasses the up-switch dwell so we don't walk
+    // through every intermediate rung (240p → 360p → 480p → 720p) on a
+    // first-connect. Even here the calm-mode cooldown still applies (we
+    // wouldn't have reached this branch if it hadn't been served).
     const bool big_jump_up = target_kbps >= published_kbps_ * 2;
     const bool up_dwell_served =
-        now - last_upswitch_time_ > std::chrono::seconds(30);
+        now - last_upswitch_time_ > std::chrono::seconds(kUpSwitchDwellSecs);
+    // Calm-mode cv gate: network too jittery to safely commit to a higher
+    // rung. Applies only to up-switches; down-switches under high cv are
+    // still fine (they move toward safety). BBC News 2026-08-17 10:47:05
+    // fired an up-switch at cv=87% and crashed inside libc/libstdc++
+    // during the in-place variant switch. cv=60% is the ceiling.
+    const bool cv_stable_enough = cv <= kUpSwitchMaxCv;
     if (!publish &&
         target_kbps * 4 >= published_kbps_ * 5 &&
         buffer_secs >= kHealthyBufferSecs &&
         (up_dwell_served || big_jump_up) &&
-        post_down_dwell_served) {
-      publish = true;  // >=25% headroom, healthy buffer, dwell served (or big jump)
+        post_down_dwell_served &&
+        cv_stable_enough) {
+      publish = true;  // >=25% headroom, healthy buffer, dwell served (or big jump), stable network
       reason = big_jump_up ? "up-switch (big jump)" : "up-switch";
       last_upswitch_time_ = now;
+    } else if (!publish && !cv_stable_enough &&
+               target_kbps * 4 >= published_kbps_ * 5 &&
+               buffer_secs >= kHealthyBufferSecs &&
+               (up_dwell_served || big_jump_up) &&
+               post_down_dwell_served &&
+               ++abr_heartbeat_counter_ % 10 == 0) {
+      std::cout << "ABR: up-switch deferred — cv=" << static_cast<int>(cv * 100)
+                << "% exceeds " << static_cast<int>(kUpSwitchMaxCv * 100)
+                << "% ceiling (target=" << target_kbps << "kbps published="
+                << published_kbps_ << "kbps buffer="
+                << static_cast<int>(buffer_secs) << "s)" << std::endl;
     }
   }
 
@@ -2355,29 +2447,74 @@ void GstVideoPlayer::AbrTick() {
     // ABR_RESTART instead of in-place SetConnectionSpeedKbps. The
     // bcm2835-codec V4L2 capture pool cannot shrink in place — hlsdemux
     // switching to a lower rung triggers a v4l2convert S_FMT that the
-    // driver rejects with EINVAL ("Call to S_FMT failed for YU12 @ WxH:
-    // Invalid argument", kmsg "Current buffer size X < min buf size Y —
-    // driver mismatch to MMAL"). GStreamer's default retry logic then
-    // fires 4-8 more failed S_FMT attempts, producing a retry storm that
-    // burns GStreamer/V4L2 element state until an eventual segfault
-    // (BBC News 2026-08-15 log: 49 S_FMT crashes across 11 reconnects →
-    // segfault deep in libgstreamer at pipeline build #59). Solution:
-    // publish the new rate for internal accounting, but do NOT call
-    // SetConnectionSpeedKbps. Instead emit ABR_RESTART: down-switch,
-    // which soatv treats as a controlled reconnect (bypasses unproductive-
-    // reconnect counter, threads the target rung as a URI fragment). One
-    // clean rebuild replaces the retry-storm entirely.
+    // driver rejects with EINVAL. GStreamer's default retry logic then
+    // fires 4-8 more failed S_FMT attempts. One clean rebuild replaces
+    // the retry-storm entirely.
     //
-    // Up-switches remain in-place: they GROW the pool, which the driver
-    // handles fine, and they benefit from playbin's live continuity.
+    // TASK #46 (2026-08-17) extends this to route FRAGILE up-switches
+    // through ABR_RESTART too. BBC News 2026-08-17 10:47:05 crashed
+    // inside libc/libstdc++ heap primitives during an in-place up-
+    // switch that fired on a pipeline barely 55 s old, 4 s after a
+    // BUFFER-COLLAPSE. The GStreamer inputselector re-plug during the
+    // in-place variant switch corrupted an internal std::string/vector
+    // whose length was later handed to memcpy as an unsigned that had
+    // been computed as end - start where end < start (register showed
+    // x2 = 0xffffffffffffdea2 at crash — negative-cast-to-size_t).
+    //
+    // A pipeline is "fragile" if any of:
+    //   - Age < kFragilePipelineSecs (60 s): cold-start throughput
+    //     samples still stabilising, playbin's inner state still
+    //     settling from preroll.
+    //   - Recent BUFFER-COLLAPSE within kPostCollapseQuietSecs (30 s):
+    //     playbin's inputselectors are re-plugging, in-place variant
+    //     switches during that window race the re-plug.
+    //
+    // For fragile up-switches, route through ABR_RESTART. For steady-
+    // state up-switches (mature pipeline, no recent collapse), remain
+    // in-place — they benefit from playbin's live continuity and pool
+    // growth works fine.
+    //
+    // Down-switches always route through ABR_RESTART regardless of
+    // fragility (Scope 1 rule).
     //
     // Exclude first-estimate (published_kbps_ was 0 before this tick's
     // update) because that's the initial-connect publish path, not a
-    // switch. Also exclude same-rate republish (target_kbps ==
-    // published_kbps_) — shouldn't happen in practice but harmless.
+    // switch. Also exclude same-rate republish.
     const bool is_down_switch =
         published_kbps_ > 0 && target_kbps < published_kbps_;
+    const bool is_up_switch =
+        published_kbps_ > 0 && target_kbps > published_kbps_;
+    // Fragile-up-switch check (only computed for up-switches).
+    bool up_is_fragile = false;
+    std::string fragile_reason;
+    if (is_up_switch) {
+      // Pipeline age.
+      if (first_publish_time_.time_since_epoch().count() > 0 &&
+          now - first_publish_time_ <
+              std::chrono::seconds(kFragilePipelineSecs)) {
+        up_is_fragile = true;
+        fragile_reason = "young pipeline";
+      }
+      // Recent BUFFER-COLLAPSE.
+      const int64_t collapse_ns =
+          last_buffer_collapse_ns_.load(std::memory_order_relaxed);
+      if (collapse_ns > 0) {
+        const auto collapse_tp =
+            std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(collapse_ns));
+        if (now - collapse_tp <
+            std::chrono::seconds(kPostCollapseQuietSecs)) {
+          up_is_fragile = true;
+          fragile_reason = fragile_reason.empty()
+              ? "recent buffer-collapse"
+              : fragile_reason + " + recent buffer-collapse";
+        }
+      }
+    }
+
     published_kbps_ = target_kbps;
+    last_abr_decision_time_ = now;
+
     if (is_down_switch) {
       std::string msg = "ABR_RESTART: down-switch to " +
                         std::to_string(target_kbps) + "kbps (" + reason +
@@ -2386,6 +2523,21 @@ void GstVideoPlayer::AbrTick() {
       std::cout << "ABR: " << reason
                 << " — routing as ABR_RESTART instead of in-place S_FMT: "
                 << msg << std::endl;
+      bool expected = false;
+      if (error_notified_.compare_exchange_strong(expected, true)) {
+        last_error_ = msg;
+        stream_handler_->OnNotifyError(msg);
+      }
+    } else if (is_up_switch && up_is_fragile) {
+      // Task #46 fragile up-switch redirect.
+      std::string msg = "ABR_RESTART: up-switch to " +
+                        std::to_string(target_kbps) + "kbps (" + reason +
+                        ", fragile: " + fragile_reason +
+                        ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
+                        "s cv=" + std::to_string(static_cast<int>(cv * 100)) + "%)";
+      std::cout << "ABR: " << reason
+                << " — routing as ABR_RESTART (fragile: " << fragile_reason
+                << "): " << msg << std::endl;
       bool expected = false;
       if (error_notified_.compare_exchange_strong(expected, true)) {
         last_error_ = msg;
