@@ -274,6 +274,29 @@ class GstVideoPlayer {
   // 15 s because 177 kbps starves the pipeline, so up-switch never fired.
   int abr_trapped_ticks_ = 0;
 
+  // --- ABR calm-mode state (task #46, 2026-08-17) ---
+  //
+  // Timestamp of when this pipeline first reached PLAYING with frames. Set
+  // once from the ABR thread on the first tick where published_kbps_ moves
+  // from 0 to non-zero. Used by the fragile-up-switch gate to route the
+  // first up-switch through ABR_RESTART if it fires within a young-pipeline
+  // window (see kFragilePipelineSecs). Never touches anything else.
+  std::chrono::steady_clock::time_point first_publish_time_;
+  // Timestamp of the most recent BUFFER-COLLAPSE, set from the watchdog
+  // thread's LogPlaybackHealth. Atomic because ABR reads it cross-thread.
+  // Time-since-epoch of 0 means "never collapsed since pipeline start".
+  // Used to gate up-switches during the recovery-from-collapse window
+  // (BBC News 2026-08-17 10:47 crashed on an in-place up-switch 4s after
+  // a BUFFER-COLLAPSE while playbin was still re-plugging inputselectors).
+  std::atomic<int64_t> last_buffer_collapse_ns_{0};
+  // Timestamp of the most recent ABR decision of any kind (first-estimate,
+  // up-switch, down-switch, emergency, undershoot, trapped-rate escape).
+  // Enforces a global post-decision cooldown so we can't fire two ABR
+  // decisions in rapid succession. BBC News 2026-08-17 log showed 30 ABR
+  // restarts in 37 minutes, driving a 19x buffer-collapse rate vs the
+  // FAITH TV single-variant baseline (which had zero switches).
+  std::chrono::steady_clock::time_point last_abr_decision_time_;
+
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video
   // dimensions are known before OnNotifyInitialized() is called.
