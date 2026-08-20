@@ -2515,7 +2515,22 @@ void GstVideoPlayer::AbrTick() {
     published_kbps_ = target_kbps;
     last_abr_decision_time_ = now;
 
-    if (is_down_switch) {
+    // VOD safety gate (task #47, 2026-08-20). ABR_RESTART emission is only
+    // safe when the consumer (soatv) has a reconnect + snapshot handler.
+    // live_tv_player_widget has one; movie_and_tv_shows_player_widget does
+    // NOT — it just prints '❌ Movie error' and never rebuilds. If we
+    // emitted ABR_RESTART on VOD, playback would die silently on any
+    // down-switch or fragile up-switch. Route VOD switches in-place
+    // instead: bcm2835-codec's pool-shrink crash class is far less
+    // frequent on VOD (CDN-served pre-encoded segments, low cv, stable
+    // buffer) than on live, and the VOD user experience of a smooth
+    // in-place variant switch is what user tested and validated 2026-
+    // 08-20. If we later ship ABR_RESTART handling on the VOD widget
+    // (proper snapshot + position preservation), this gate can be
+    // relaxed.
+    const bool allow_abr_restart = is_live_;
+
+    if (is_down_switch && allow_abr_restart) {
       std::string msg = "ABR_RESTART: down-switch to " +
                         std::to_string(target_kbps) + "kbps (" + reason +
                         ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
@@ -2528,8 +2543,8 @@ void GstVideoPlayer::AbrTick() {
         last_error_ = msg;
         stream_handler_->OnNotifyError(msg);
       }
-    } else if (is_up_switch && up_is_fragile) {
-      // Task #46 fragile up-switch redirect.
+    } else if (is_up_switch && up_is_fragile && allow_abr_restart) {
+      // Task #46 fragile up-switch redirect (live-only after task #47).
       std::string msg = "ABR_RESTART: up-switch to " +
                         std::to_string(target_kbps) + "kbps (" + reason +
                         ", fragile: " + fragile_reason +
@@ -2544,11 +2559,15 @@ void GstVideoPlayer::AbrTick() {
         stream_handler_->OnNotifyError(msg);
       }
     } else {
+      // In-place variant switch: safe on VOD (pool-shrink crash class is
+      // rare with CDN-stable segments) and used for mature-pipeline steady-
+      // state up-switches on live too.
       SetConnectionSpeedKbps(demux, target_kbps);
       std::cout << "ABR: " << reason << " — connection-speed=" << target_kbps
                 << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
                 << "kbps cv=" << static_cast<int>(cv * 100) << "% buffer="
                 << static_cast<int>(buffer_secs) << "s safety=" << safety << ")"
+                << (allow_abr_restart ? "" : " [VOD in-place]")
                 << std::endl;
     }
   } else if (++abr_heartbeat_counter_ % 30 == 0) {
