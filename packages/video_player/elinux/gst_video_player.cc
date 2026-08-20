@@ -330,6 +330,48 @@ GstVideoPlayer::GstVideoPlayer(
 
   uri_ = ParseUri(uri);
 
+  // Cold-start rung hint. soatv appends `#soatv:startup_kbps=N` to the URL
+  // to thread either (a) a measured throughput sample from its auth GET
+  // (essentially free measurement — see StreamAuthenticationService), or
+  // (b) the specific rung an earlier ABR_RESTART decided on. Parse the
+  // fragment, strip it from the URI before playbin sees it. See
+  // startup_kbps_hint_ comment in the header for the full protocol.
+  //
+  // Parse manually rather than pulling in a full URI library — the
+  // fragment format is stable and simple, and this runs exactly once per
+  // player construction.
+  {
+    const std::string kMarker = "#soatv:startup_kbps=";
+    const auto pos = uri_.find(kMarker);
+    if (pos != std::string::npos) {
+      const auto value_start = pos + kMarker.size();
+      // Read digits until end-of-string or the next fragment/query separator.
+      std::string digits;
+      for (size_t i = value_start; i < uri_.size(); ++i) {
+        const char c = uri_[i];
+        if (c >= '0' && c <= '9') {
+          digits += c;
+        } else {
+          break;
+        }
+      }
+      if (!digits.empty()) {
+        try {
+          startup_kbps_hint_ = static_cast<guint64>(std::stoull(digits));
+          std::cout << "URI-STARTUP-HINT: soatv:startup_kbps="
+                    << startup_kbps_hint_ << " parsed from URI fragment"
+                    << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "URI-STARTUP-HINT: failed to parse '" << digits
+                    << "': " << e.what() << std::endl;
+        }
+      }
+      // Strip the fragment: whether we parsed it or not, playbin doesn't
+      // need to see this private URI extension.
+      uri_.resize(pos);
+    }
+  }
+
   // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
   // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
   // which flips is_live_=true there. But that only fires when the media
@@ -1300,10 +1342,23 @@ bool GstVideoPlayer::CreatePipeline() {
   // shrink the ISP can absorb via the pinned 1280x720 output geometry (see
   // the sink-bin comment). If the ABR engine never gets samples (e.g. probe
   // yields nothing) hlsdemux simply stays on the top rung.
+  // Cold-start rung. If soatv threaded a `#soatv:startup_kbps=N` hint
+  // through the URI fragment (from auth-GET throughput probe or a
+  // preceding ABR_RESTART decision), honor it. Otherwise fall back to
+  // the fixed default. Task #48 (2026-08-20) added the auth-probe path
+  // so cold-starts now match the actual network instead of always
+  // starting at 1500 kbps.
+  const guint64 cold_start_kbps =
+      startup_kbps_hint_ > 0 ? startup_kbps_hint_ : kColdStartConnSpeedKbps;
+  if (startup_kbps_hint_ > 0) {
+    std::cout << "STARTUP-RUNG: honoring soatv hint " << startup_kbps_hint_
+              << "kbps (instead of default " << kColdStartConnSpeedKbps
+              << "kbps)" << std::endl;
+  }
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
                "buffer-duration", kBufferTargetNs,        // 30 s
-               "connection-speed", kColdStartConnSpeedKbps,
+               "connection-speed", cold_start_kbps,
                NULL);
 
   // Audio: audioconvert -> audioresample -> volume -> alsasink
