@@ -1252,32 +1252,49 @@ bool GstVideoPlayer::CreatePipeline() {
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
 
-  // queue -> v4l2convert -> video/x-raw,format=RGBA,1280x720 -> fakesink
+  // queue -> v4l2convert -> video/x-raw,format=RGBA,1920x1080 -> fakesink
   //
   // SEAMLESS ABR SWITCHING (fix8-ABR): pin the converter's OUTPUT geometry to a
-  // FIXED 1280x720 RGBA and let the HW ISP scale whatever the decoder produces
-  // up/down to it. This mirrors how phones/TVs/browsers switch renditions
-  // without a hitch: the display surface is a constant size and the scaler
-  // absorbs the input resolution change.
+  // FIXED size and let the HW ISP scale whatever the decoder produces up/down to
+  // it. This mirrors how phones/TVs/browsers switch renditions without a hitch:
+  // the display surface is a constant size and the scaler absorbs the input
+  // resolution change.
   //
-  // Why this fixes the crash: previously the output caps constrained only the
-  // format (RGBA), so the output resolution TRACKED the input. An ABR
-  // down-switch (720p->480p) therefore changed the ISP's OUTPUT format
-  // mid-stream, forcing a VIDIOC_S_FMT for AB24 @ 854x480 that a V4L2 M2M
-  // device rejects while streaming (EINVAL) -> pipeline error -> reconnect
-  // churn -> crash. With a fixed output geometry the output S_FMT is programmed
-  // ONCE at preroll and never renegotiated; only the ISP's INPUT (capture-side
-  // NV12) changes on a switch, which the decoder drives via the standard V4L2
-  // source-change flow. Bonus: HandoffHandler's width_/height_ now never change
-  // after preroll, so the Flutter pixel buffer is allocated once (no per-switch
-  // texture resize). Both rungs are 16:9 (854x480 and 1280x720) so upscaling
-  // introduces no aspect distortion.
+  // Why the FIXED output prevents the S_FMT crash on down-switch: previously
+  // the output caps constrained only the format (RGBA), so the output
+  // resolution TRACKED the input. An ABR down-switch (720p->480p) therefore
+  // changed the ISP's OUTPUT format mid-stream, forcing a VIDIOC_S_FMT for
+  // AB24 @ 854x480 that a V4L2 M2M device rejects while streaming (EINVAL)
+  // -> pipeline error -> reconnect churn -> crash. With a fixed output
+  // geometry the output S_FMT is programmed ONCE at preroll and never
+  // renegotiated; only the ISP's INPUT (capture-side NV12) changes on a
+  // switch, which the decoder drives via the standard V4L2 source-change
+  // flow. Bonus: HandoffHandler's width_/height_ never change after preroll,
+  // so the Flutter pixel buffer is allocated once (no per-switch texture
+  // resize). All ladder rungs are 16:9 so upscaling introduces no aspect
+  // distortion.
   //
-  // NOTE (verify on build host): this assumes the Pi's v4l2convert can scale to
-  // a fixed output. It does (the ISP is a scaler). If a future build's HW
-  // convert cannot scale, this filtered link will fail negotiation and Init()
-  // returns false -> would then need a HW-scale-capable element or an SW
-  // videoscale (the SW colour-convert path was already proven too slow at 720p).
+  // Why 1920x1080 and not 1280x720 (task #39, 2026-08-20): the device screen
+  // is 1920x1080 anyway (see Device-Info screen size in every session). When
+  // the pin was 1280x720, the ISP was a 1x passthrough on the top-rung
+  // (1280x720) input — no scale operation, so a stale crop-rectangle from
+  // an earlier smaller input geometry carried over on in-place up-switches.
+  // Users saw the 720p output as visibly cropped after a big-jump up-switch
+  // (e.g. cold-start 240p → 720p, three rungs skipped, each rung's stale
+  // crop state accumulated). Session 2026-08-20 12:41:37 reproduced this
+  // exactly with a 426x240 → 1280x720 in-place S_FMT.
+  //
+  // Pinning to 1920x1080 forces the ISP to always be an active scaler,
+  // regardless of input rendition. Every in-place S_FMT triggers a real
+  // scale operation, which resets the crop-rectangle to full input
+  // dimensions. Also avoids a downstream compositor scale from 720 to
+  // 1080 — one scale total instead of two.
+  //
+  // NOTE (verify on build host): the Pi's v4l2convert is a hardware scaler.
+  // Upscale to 1080p is essentially free. If a future build's HW convert
+  // cannot scale to 1080p, this filtered link will fail negotiation and
+  // Init() returns false -> would then need a HW-scale-capable element or
+  // an SW videoscale.
   gst_bin_add_many(GST_BIN(gst_.output), video_queue, gst_.video_convert,
                    gst_.video_sink, NULL);
   if (!gst_element_link(video_queue, gst_.video_convert)) {
@@ -1285,7 +1302,7 @@ bool GstVideoPlayer::CreatePipeline() {
     return false;
   }
   auto* caps = gst_caps_from_string(
-      "video/x-raw,format=RGBA,width=1280,height=720");
+      "video/x-raw,format=RGBA,width=1920,height=1080");
   auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
   gst_caps_unref(caps);
   if (!link_ok) {
