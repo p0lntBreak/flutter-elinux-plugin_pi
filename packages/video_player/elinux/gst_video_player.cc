@@ -330,6 +330,48 @@ GstVideoPlayer::GstVideoPlayer(
 
   uri_ = ParseUri(uri);
 
+  // Cold-start rung hint. soatv appends `#soatv:startup_kbps=N` to the URL
+  // to thread either (a) a measured throughput sample from its auth GET
+  // (essentially free measurement — see StreamAuthenticationService), or
+  // (b) the specific rung an earlier ABR_RESTART decided on. Parse the
+  // fragment, strip it from the URI before playbin sees it. See
+  // startup_kbps_hint_ comment in the header for the full protocol.
+  //
+  // Parse manually rather than pulling in a full URI library — the
+  // fragment format is stable and simple, and this runs exactly once per
+  // player construction.
+  {
+    const std::string kMarker = "#soatv:startup_kbps=";
+    const auto pos = uri_.find(kMarker);
+    if (pos != std::string::npos) {
+      const auto value_start = pos + kMarker.size();
+      // Read digits until end-of-string or the next fragment/query separator.
+      std::string digits;
+      for (size_t i = value_start; i < uri_.size(); ++i) {
+        const char c = uri_[i];
+        if (c >= '0' && c <= '9') {
+          digits += c;
+        } else {
+          break;
+        }
+      }
+      if (!digits.empty()) {
+        try {
+          startup_kbps_hint_ = static_cast<guint64>(std::stoull(digits));
+          std::cout << "URI-STARTUP-HINT: soatv:startup_kbps="
+                    << startup_kbps_hint_ << " parsed from URI fragment"
+                    << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "URI-STARTUP-HINT: failed to parse '" << digits
+                    << "': " << e.what() << std::endl;
+        }
+      }
+      // Strip the fragment: whether we parsed it or not, playbin doesn't
+      // need to see this private URI extension.
+      uri_.resize(pos);
+    }
+  }
+
   // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
   // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
   // which flips is_live_=true there. But that only fires when the media
@@ -1300,10 +1342,23 @@ bool GstVideoPlayer::CreatePipeline() {
   // shrink the ISP can absorb via the pinned 1280x720 output geometry (see
   // the sink-bin comment). If the ABR engine never gets samples (e.g. probe
   // yields nothing) hlsdemux simply stays on the top rung.
+  // Cold-start rung. If soatv threaded a `#soatv:startup_kbps=N` hint
+  // through the URI fragment (from auth-GET throughput probe or a
+  // preceding ABR_RESTART decision), honor it. Otherwise fall back to
+  // the fixed default. Task #48 (2026-08-20) added the auth-probe path
+  // so cold-starts now match the actual network instead of always
+  // starting at 1500 kbps.
+  const guint64 cold_start_kbps =
+      startup_kbps_hint_ > 0 ? startup_kbps_hint_ : kColdStartConnSpeedKbps;
+  if (startup_kbps_hint_ > 0) {
+    std::cout << "STARTUP-RUNG: honoring soatv hint " << startup_kbps_hint_
+              << "kbps (instead of default " << kColdStartConnSpeedKbps
+              << "kbps)" << std::endl;
+  }
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
                "buffer-duration", kBufferTargetNs,        // 30 s
-               "connection-speed", kColdStartConnSpeedKbps,
+               "connection-speed", cold_start_kbps,
                NULL);
 
   // Audio: audioconvert -> audioresample -> volume -> alsasink
@@ -2515,7 +2570,22 @@ void GstVideoPlayer::AbrTick() {
     published_kbps_ = target_kbps;
     last_abr_decision_time_ = now;
 
-    if (is_down_switch) {
+    // VOD safety gate (task #47, 2026-08-20). ABR_RESTART emission is only
+    // safe when the consumer (soatv) has a reconnect + snapshot handler.
+    // live_tv_player_widget has one; movie_and_tv_shows_player_widget does
+    // NOT — it just prints '❌ Movie error' and never rebuilds. If we
+    // emitted ABR_RESTART on VOD, playback would die silently on any
+    // down-switch or fragile up-switch. Route VOD switches in-place
+    // instead: bcm2835-codec's pool-shrink crash class is far less
+    // frequent on VOD (CDN-served pre-encoded segments, low cv, stable
+    // buffer) than on live, and the VOD user experience of a smooth
+    // in-place variant switch is what user tested and validated 2026-
+    // 08-20. If we later ship ABR_RESTART handling on the VOD widget
+    // (proper snapshot + position preservation), this gate can be
+    // relaxed.
+    const bool allow_abr_restart = is_live_;
+
+    if (is_down_switch && allow_abr_restart) {
       std::string msg = "ABR_RESTART: down-switch to " +
                         std::to_string(target_kbps) + "kbps (" + reason +
                         ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
@@ -2528,8 +2598,8 @@ void GstVideoPlayer::AbrTick() {
         last_error_ = msg;
         stream_handler_->OnNotifyError(msg);
       }
-    } else if (is_up_switch && up_is_fragile) {
-      // Task #46 fragile up-switch redirect.
+    } else if (is_up_switch && up_is_fragile && allow_abr_restart) {
+      // Task #46 fragile up-switch redirect (live-only after task #47).
       std::string msg = "ABR_RESTART: up-switch to " +
                         std::to_string(target_kbps) + "kbps (" + reason +
                         ", fragile: " + fragile_reason +
@@ -2544,11 +2614,15 @@ void GstVideoPlayer::AbrTick() {
         stream_handler_->OnNotifyError(msg);
       }
     } else {
+      // In-place variant switch: safe on VOD (pool-shrink crash class is
+      // rare with CDN-stable segments) and used for mature-pipeline steady-
+      // state up-switches on live too.
       SetConnectionSpeedKbps(demux, target_kbps);
       std::cout << "ABR: " << reason << " — connection-speed=" << target_kbps
                 << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
                 << "kbps cv=" << static_cast<int>(cv * 100) << "% buffer="
                 << static_cast<int>(buffer_secs) << "s safety=" << safety << ")"
+                << (allow_abr_restart ? "" : " [VOD in-place]")
                 << std::endl;
     }
   } else if (++abr_heartbeat_counter_ % 30 == 0) {
