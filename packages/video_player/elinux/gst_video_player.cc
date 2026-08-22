@@ -2147,6 +2147,23 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
       self->hls_demux_ = GST_ELEMENT(gst_object_ref(element));
     }
     std::cout << "ABR: found hlsdemux element: " << name << std::endl;
+    // Task #50 (2026-08-22): remove hlsdemux's default 0.8 safety multiplier
+    // on connection-speed. hlsdemux picks the highest rendition whose bandwidth
+    // is <= connection-speed * bitrate-limit. With the default 0.8, our
+    // published connection-speed (already safety-shaved by AbrTick's 0.85
+    // multiplier) gets shaved AGAIN, so a published 2124 kbps effectively
+    // becomes 1699 kbps — awkwardly close to the 1800 kbps 480p rung boundary,
+    // producing unpredictable rung picks on borderline decisions. Setting
+    // bitrate-limit=1.0 makes our published ceiling map directly to rung
+    // boundaries. Does NOT disable hlsdemux's own per-segment ABR
+    // measurements — it still picks the min of (its own estimate,
+    // connection-speed). This is a small alignment tuning, not a hard lock.
+    GObjectClass* klass = G_OBJECT_GET_CLASS(element);
+    if (g_object_class_find_property(klass, "bitrate-limit")) {
+      g_object_set(element, "bitrate-limit", 1.0f, NULL);
+      std::cout << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
+                << std::endl;
+    }
   } else if (name && (g_str_has_prefix(name, "souphttpsrc") ||
                       g_str_has_prefix(name, "curlhttpsrc"))) {
     // Segments DO cross the http source's src pad — probe here for real
