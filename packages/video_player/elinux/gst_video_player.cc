@@ -20,19 +20,27 @@
 #include <vector>
 
 namespace {
-constexpr double kBufferTargetSecs = 30.0;
-constexpr gint64 kBufferTargetNs = 30000000000LL;
+// Buffer discipline retune (task #60, 2026-08-29). Doubled from 30 to 60 s to
+// give the multiqueue more headroom against jitter on marginal networks. The
+// ABR gates below (kHealthyBufferSecs, hardcoded 6 s / 15 s thresholds in
+// AbrTick) are ALSO doubled so ABR behavior semantics are preserved — the
+// gates fire at the same *fraction* of target, just with more absolute
+// cushion. Cache-target on the downstream multiqueue is separately widened at
+// DeepElementAddedHandler; kBufferTargetSecs is the display+ABR-scale target,
+// not the queue-size setting.
+constexpr double kBufferTargetSecs = 60.0;
+constexpr gint64 kBufferTargetNs = 60000000000LL;
 
 // --- Anti-flap ABR tuning ---
 // The "healthy buffer" line, in seconds. A buffer at/above this PROVES the
 // current rung is sustainable, so (a) a low bandwidth estimate (this link's
 // estimate is very noisy — cv routinely >100%) must NOT drop the rung above it
 // (the buffer absorbs the variance — otherwise pure quality pumping), and
-// (b) up-switching is only allowed at/above it. Set to 15s to match the code's
-// "comfortable" safety zone AND to stay BELOW the real live-edge buffer plateau
-// (which can sit ~17s, not the 30s target) — a 20s line was unreachable at the
-// live edge, trapping playback on the lowest rung with no way to climb back.
-constexpr double kHealthyBufferSecs = 15.0;
+// (b) up-switching is only allowed at/above it. Scaled 15 -> 30 s alongside
+// the kBufferTargetSecs doubling (task #60) so this stays at 50% of target —
+// the "comfortable" zone. Still well below the true live-edge plateau (the
+// multiqueue can hold roughly 60 s of content on cache-target=60s).
+constexpr double kHealthyBufferSecs = 30.0;
 // Even below the floor, require a >=20% drop to persist across this many 1 s
 // AbrTick cycles before acting, so a single dipped sample can't flap the rung.
 constexpr int kSustainedDropTicks = 3;
@@ -137,11 +145,15 @@ constexpr double kUpSwitchMaxCv = 0.60;
 constexpr guint64 kColdStartConnSpeedKbps = 1500;
 
 // Cold-start preroll target (seconds of buffered content required before Init()
-// returns success). Matches kHealthyBufferSecs on purpose: it's the same "this
-// rung is sustainable" line the ABR engine uses. Deliberately no wall-clock
-// cap — spinner takes as long as needed; only a hard error (HTTP timeout,
-// EOS, resource failure) ends the wait early.
-constexpr double kColdStartPrerollSecs = 15.0;
+// returns success). Dropped 15 -> 5 s (task #60, 2026-08-29) to prioritise
+// picture-first UX: user sees the first frame within ~5 s of a channel tap,
+// even on marginal links. The multiqueue keeps filling behind the picture up
+// to the 60 s cache-target, so the ABR still gets a proper cushion — the
+// difference is where the spinner ends: at 5 s of buffered content rather
+// than 15 s. Deliberately no wall-clock cap on the preroll wait — a hard
+// error (HTTP timeout, EOS, pathological-preroll NETWORK_TOO_SLOW) ends it
+// early; otherwise the spinner waits as long as needed.
+constexpr double kColdStartPrerollSecs = 5.0;
 
 // Poll interval for the preroll wait. Fast enough to feel responsive on a good
 // link; slow enough not to spam gst_query_new_buffering().
@@ -1374,7 +1386,7 @@ bool GstVideoPlayer::CreatePipeline() {
   }
   g_object_set(gst_.playbin,
                "buffer-size",     (gint)10485760,         // 10 MiB
-               "buffer-duration", kBufferTargetNs,        // 30 s
+               "buffer-duration", kBufferTargetNs,        // 60 s (task #60)
                "connection-speed", cold_start_kbps,
                NULL);
 
@@ -2333,15 +2345,18 @@ void GstVideoPlayer::AbrTick() {
   double predicted_bps = std::min(fast, harmonic);
   predicted_bps *= std::min(1.0, std::max(0.5, 1.0 - 0.5 * cv));
 
-  // --- Buffer health (percent of the 30 s buffering target) ---
+  // --- Buffer health (percent of the kBufferTargetSecs buffering target) ---
   const int pct = last_buffering_percent_.load();
-  const double buffer_secs = pct < 0 ? 10.0 :
+  const double buffer_secs = pct < 0 ? 20.0 :
       (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
 
+  // Scaled alongside kBufferTargetSecs 30 -> 60 (task #60). Emergency zone
+  // now 0-12 s (was 0-6), cautious 12-30 (was 6-15), comfortable >= 30
+  // (was >= 15). Same fractions of the target — same ABR discipline.
   double safety;
-  if (buffer_secs < 6.0) {
+  if (buffer_secs < 12.0) {
     safety = 0.50;  // emergency: survival beats quality
-  } else if (buffer_secs < 15.0) {
+  } else if (buffer_secs < 30.0) {
     safety = 0.65;  // cautious: rebuild cushion first
   } else {
     safety = 0.85;  // comfortable: ride quality close to the estimate
@@ -2363,7 +2378,8 @@ void GstVideoPlayer::AbrTick() {
 
   // Calm-mode global cooldown (task #46, 2026-08-17). After ANY ABR decision,
   // block the next decision for kPostAbrDecisionCooldownSecs. Buffer-emergency
-  // is exempt: buffer < 6 s is survival, cooldown does not apply.
+  // is exempt: buffer < 12 s (task #60 rescaled from 6 s) is survival,
+  // cooldown does not apply.
   const bool cooldown_served =
       last_abr_decision_time_.time_since_epoch().count() == 0 ||
       now - last_abr_decision_time_ >
@@ -2376,11 +2392,12 @@ void GstVideoPlayer::AbrTick() {
     abr_undershoot_ticks_ = 0;
     abr_trapped_ticks_ = 0;
     first_publish_time_ = now;
-  } else if (buffer_secs < 6.0 && target_kbps < published_kbps_) {
+  } else if (buffer_secs < 12.0 && target_kbps < published_kbps_) {
     // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
     // the only instant down-switch path AND the only branch exempt from the
     // calm-mode cooldown. Deliberately does NOT stamp last_downswitch_time_:
-    // survival beats the anti-thrash dwell.
+    // survival beats the anti-thrash dwell. Threshold scaled 6 -> 12 s
+    // (task #60) alongside the doubled kBufferTargetSecs.
     publish = true;
     reason = "buffer emergency";
     abr_drop_ticks_ = 0;
@@ -2781,7 +2798,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         if (buffering_left_ms > 0) {
           std::cout << " eta=" << (buffering_left_ms / 1000) << "s";
         }
-        std::cout << " cache-target=30s/10MiB from "
+        std::cout << " cache-target=" << static_cast<int>(kBufferTargetSecs)
+                  << "s/10MiB from "
                   << GST_MESSAGE_SRC_NAME(message) << std::endl;
       }
       break;
