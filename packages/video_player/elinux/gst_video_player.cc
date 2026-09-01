@@ -2002,11 +2002,15 @@ void GstVideoPlayer::StartWatchdog() {
                       << std::endl;
             DumpKernelFreezeDiagnostic();
             watchdog_running_.store(false);
-            bool expected = false;
-            if (error_notified_.compare_exchange_strong(expected, true)) {
-              last_error_ = msg;
-              stream_handler_->OnNotifyError(msg);
-            }
+            // Emit unconditionally (task #61) — see the "Playback frozen"
+            // branch below for full rationale. A watchdog fatal must always
+            // reach soatv even if an earlier soft-error already flipped
+            // error_notified_.
+            last_error_ = msg;
+            stream_handler_->OnNotifyError(msg);
+            error_notified_.store(true);
+            abr_running_.store(false);
+            abr_cv_.notify_all();
             break;
           }
           continue;
@@ -2086,11 +2090,20 @@ void GstVideoPlayer::StartWatchdog() {
                   << std::endl;
         DumpKernelFreezeDiagnostic();
         watchdog_running_.store(false);
-        bool expected = false;
-        if (error_notified_.compare_exchange_strong(expected, true)) {
-          last_error_ = msg;
-          stream_handler_->OnNotifyError(msg);
-        }
+        // Emit unconditionally (task #61). Device log 2026-08-29 01:58 showed a
+        // 4-hour zombie state: our ABR fired ABR_RESTART at 01:58:05 (setting
+        // error_notified_=true), soatv did not reconnect for reasons unknown,
+        // decoder wedged 8s later, and this compare_exchange_strong found the
+        // flag already true — OnNotifyError was silently skipped and no
+        // recovery path ever fired. A watchdog fatal must always reach soatv;
+        // duplicate reconnect events are safely deduped on the Dart side via
+        // _reconnectInFlight. Stop the ABR thread too so its heartbeat log
+        // spam stops on a dead pipeline.
+        last_error_ = msg;
+        stream_handler_->OnNotifyError(msg);
+        error_notified_.store(true);
+        abr_running_.store(false);
+        abr_cv_.notify_all();
         break;
       }
     }
