@@ -2389,6 +2389,28 @@ void GstVideoPlayer::AbrTick() {
   const char* reason = "";
   const bool is_drop = target_kbps * 5 <= published_kbps_ * 4;  // >=20% below
 
+  // Track whether the decoder is actively delivering frames. Used by the
+  // buffer-emergency branch (task #34) to skip a false ABR_RESTART when the
+  // multiqueue transiently drained but the decoder is still feeding frames
+  // from already-buffered content. If frames_handed_off_ advanced since the
+  // last tick, refresh the timestamp. Otherwise leave it — the age of the
+  // timestamp tells us how long since a frame last arrived.
+  const uint64_t frames_now =
+      frames_handed_off_.load(std::memory_order_relaxed);
+  if (frames_now != abr_last_seen_frames_) {
+    abr_last_seen_frames_ = frames_now;
+    abr_last_frame_advance_time_ = now;
+  }
+  // If we've never seen frames advance in AbrTick (first tick post-Init, or
+  // pipeline hasn't produced frames yet), treat as "very stale" so the
+  // buffer-emergency gate below doesn't defer on missing data.
+  constexpr int64_t kStaleFramesUnknownMs = 60000;
+  const int64_t frames_stale_ms =
+      abr_last_frame_advance_time_.time_since_epoch().count() == 0
+          ? kStaleFramesUnknownMs
+          : std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - abr_last_frame_advance_time_).count();
+
   // Calm-mode global cooldown (task #46, 2026-08-17). After ANY ABR decision,
   // block the next decision for kPostAbrDecisionCooldownSecs. Buffer-emergency
   // is exempt: buffer < 12 s (task #60 rescaled from 6 s) is survival,
@@ -2406,16 +2428,42 @@ void GstVideoPlayer::AbrTick() {
     abr_trapped_ticks_ = 0;
     first_publish_time_ = now;
   } else if (buffer_secs < 12.0 && target_kbps < published_kbps_) {
-    // Buffer emergency: cushion nearly gone — any reduction helps NOW. This is
-    // the only instant down-switch path AND the only branch exempt from the
-    // calm-mode cooldown. Deliberately does NOT stamp last_downswitch_time_:
-    // survival beats the anti-thrash dwell. Threshold scaled 6 -> 12 s
-    // (task #60) alongside the doubled kBufferTargetSecs.
-    publish = true;
-    reason = "buffer emergency";
-    abr_drop_ticks_ = 0;
-    abr_undershoot_ticks_ = 0;
-    abr_trapped_ticks_ = 0;
+    // Buffer emergency candidate. Frame-arrival gate (task #34, 2026-08-29):
+    // if the decoder is still delivering frames within the last 2 s, the
+    // buffer dip is transient — playbin's multiqueue drained briefly (e.g.
+    // hlsdemux HTTP source reconnected, manifest refresh, segment boundary)
+    // but the decoder is coping from already-buffered content while the
+    // queue refills. Firing ABR_RESTART here tears down a working pipeline
+    // for the visible ~15-20 s teardown cost the user sees as "sudden blank
+    // screen after buffer collapse."
+    //
+    // Device log 2026-08-29 01:58:04-06 captured this exactly:
+    //   01:58:04  Buffer 60s -> 5s (collapse)
+    //   01:58:05  ABR_RESTART fired, frames still advancing 68114
+    //   01:58:06  Frames 68174 (30 fps continuing through the "emergency")
+    //   Followed by preventable teardown.
+    //
+    // If frames stopped >=2 s ago, the pipeline really IS wedged and an
+    // ABR_RESTART is warranted (watchdog would fire at 10 s anyway).
+    if (frames_stale_ms < 2000) {
+      std::cout << "ABR: buffer emergency deferred — frames advancing "
+                << "(no_frame_ms=" << frames_stale_ms << ", buffer="
+                << static_cast<int>(buffer_secs) << "s)" << std::endl;
+      abr_drop_ticks_ = 0;
+      abr_undershoot_ticks_ = 0;
+      abr_trapped_ticks_ = 0;
+    } else {
+      // Buffer emergency: cushion nearly gone AND frames not arriving — the
+      // only instant down-switch path AND the only branch exempt from the
+      // calm-mode cooldown. Deliberately does NOT stamp last_downswitch_time_:
+      // survival beats the anti-thrash dwell. Threshold scaled 6 -> 12 s
+      // (task #60) alongside the doubled kBufferTargetSecs.
+      publish = true;
+      reason = "buffer emergency";
+      abr_drop_ticks_ = 0;
+      abr_undershoot_ticks_ = 0;
+      abr_trapped_ticks_ = 0;
+    }
   } else if (!cooldown_served) {
     // Global calm-mode cooldown active: skip all non-emergency decisions.
     // Reset counters so they don't over-accumulate during the quiet window

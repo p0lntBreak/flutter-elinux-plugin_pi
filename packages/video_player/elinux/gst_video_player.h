@@ -306,6 +306,20 @@ class GstVideoPlayer {
   // FAITH TV single-variant baseline (which had zero switches).
   std::chrono::steady_clock::time_point last_abr_decision_time_;
 
+  // --- Frame-arrival tracking for buffer-emergency defer (task #34) ---
+  //
+  // AbrTick observes frames_handed_off_ each tick and stamps the wall-clock
+  // when the count actually advanced. Used by the buffer-emergency branch
+  // to skip a false ABR_RESTART when frames are still flowing: a healthy
+  // decoder + a briefly-drained multiqueue is transient (the queue refills
+  // as bytes arrive), NOT a real emergency. Device log 2026-08-29 01:58:04
+  // captured the exact false-positive shape: buffer 60s -> 5s in one tick,
+  // decoder continued at 30 fps through the "emergency", ABR_RESTART tore
+  // down a pipeline that was actively delivering frames. Only touched from
+  // the ABR thread.
+  uint64_t abr_last_seen_frames_ = 0;
+  std::chrono::steady_clock::time_point abr_last_frame_advance_time_;
+
   // First-frame synchronisation: Init() advances to PLAYING then waits here
   // until HandoffHandler delivers the first decoded frame so that video
   // dimensions are known before OnNotifyInitialized() is called.
