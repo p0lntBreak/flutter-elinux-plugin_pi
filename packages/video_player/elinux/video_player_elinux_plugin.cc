@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <thread>
 
 #include "gst_video_player.h"
 #include "messages/messages.h"
@@ -106,6 +107,9 @@ class VideoPlayerPlugin : public flutter::Plugin {
     std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>>
         event_channel;
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink;
+    // Native startup runs asynchronously so Dart can subscribe to the event
+    // channel immediately after create() returns.
+    std::thread initialization_thread;
   };
 
   void HandleInitializeMethodCall(
@@ -520,41 +524,33 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   flutter::EncodableMap value;
   TextureMessage result;
 
-  players_[texture_id]->player->LogPlaybackStartup("plugin_init_call_started");
-  bool ok = players_[texture_id]->player->Init();
-  players_[texture_id]->player->LogPlaybackStartup(
-      "plugin_init_returned",
-      std::string("success=") + (ok ? "true" : "false"));
-  if (ok) {
-    result.SetTextureId(texture_id);
-    value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
-                  result.ToMap());
-  } else {
-    // Prefer the specific error surfaced from Init() (e.g. NETWORK_TOO_SLOW:,
-    // STREAM_UNAVAILABLE:) if one was recorded — the Dart side branches on
-    // those prefixes to render distinct UIs. Fall back to the generic
-    // texture-id message if nothing was recorded (e.g. a very early failure
-    // before any NotifyError path fired).
-    std::string specific = players_[texture_id]->player->GetLastError();
-    auto error_message =
-        !specific.empty()
-            ? specific
-            : ("Failed to initialize the player with texture id: " +
-               std::to_string(texture_id));
-    value.emplace(flutter::EncodableValue(kEncodableMapkeyError),
-                  flutter::EncodableValue(WrapError(error_message)));
-    // Init() failed. The texture was already registered and this entry
-    // already inserted into players_ above, but Dart's create() never
-    // returns a textureId on this branch (the Future rejects with
-    // PlatformException) — so Dart has no id to pass to dispose() later.
-    // Clean up here or the texture + player leak on every failed Init().
-    // DisposePlayer() erases from players_ itself.
-    DisposePlayer(texture_id);
-  }
-  if (ok) {
-    players_[texture_id]->player->LogPlaybackStartup(
-        "plugin_create_reply_ready");
-  }
+  auto player_entry = players_[texture_id];
+  player_entry->player->LogPlaybackStartup("plugin_create_reply_ready");
+  result.SetTextureId(texture_id);
+  value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
+                result.ToMap());
+
+  // Do not block the platform message handler on GStreamer preroll. The Dart
+  // video controller subscribes to the EventChannel only after this reply;
+  // keeping Init() synchronous created the multi-second event-channel gap.
+  player_entry->player->LogPlaybackStartup("plugin_init_call_started");
+  player_entry->initialization_thread = std::thread(
+      [this, player_entry, texture_id]() {
+        player_entry->player->LogPlaybackStartup("plugin_async_init_started");
+        const bool ok = player_entry->player->Init();
+        player_entry->player->LogPlaybackStartup(
+            "plugin_init_returned",
+            std::string("success=") + (ok ? "true" : "false"));
+        if (!ok) {
+          const std::string specific = player_entry->player->GetLastError();
+          const std::string error_message =
+              !specific.empty()
+                  ? specific
+                  : ("Failed to initialize the player with texture id: " +
+                     std::to_string(texture_id));
+          SendErrorEventMessage(texture_id, error_message);
+        }
+      });
   reply(flutter::EncodableValue(value));
 }
 
@@ -815,6 +811,12 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
   }
   std::shared_ptr<FlutterVideoPlayer> player = it->second;
   players_.erase(it);
+
+  // Init() runs asynchronously; finish it before releasing the Gst player.
+  if (player->initialization_thread.joinable() &&
+      player->initialization_thread.get_id() != std::this_thread::get_id()) {
+    player->initialization_thread.join();
+  }
 
   // Detach the Dart-facing channels (platform thread — safe).
   player->event_sink = nullptr;
