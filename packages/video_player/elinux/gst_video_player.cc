@@ -913,7 +913,13 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
 
 #ifdef USE_EGL_IMAGE_DMABUF
 void* GstVideoPlayer::GetEGLImage(void* egl_display, void* egl_context) {
-  std::shared_lock<std::shared_mutex> lock(mutex_buffer_);
+  // This runs from Flutter's raster thread. A frame handoff may briefly own
+  // the writer lock; dropping one presentation frame is preferable to
+  // blocking the entire UI (and delaying remote-driven overlays).
+  std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return nullptr;
+  }
   if (!gst_.buffer) {
     return nullptr;
   }
@@ -957,7 +963,13 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
   // Callers should use GetEGLImage instead.
   return nullptr;
 #else
-  std::shared_lock<std::shared_mutex> lock(mutex_buffer_);
+  // This runs from Flutter's raster thread. Never wait for the streaming
+  // thread to finish swapping buffers; skipping one texture refresh keeps
+  // input and overlays responsive and the next decoded frame retries.
+  std::shared_lock<std::shared_mutex> lock(mutex_buffer_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return nullptr;
+  }
   if (!gst_.buffer) {
     return nullptr;
   }

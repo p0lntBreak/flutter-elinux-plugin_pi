@@ -14,13 +14,14 @@
 #include <flutter/standard_method_codec.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <thread>
 
 #include "gst_video_player.h"
 #include "messages/messages.h"
@@ -101,6 +102,10 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // glTexImage2D read, released via the buffer's release_callback) against
     // DisposePlayer() tearing down `player`. See DisposePlayer().
     std::mutex buffer_mutex;
+    // Flutter posts both a raster task and a UI frame for every
+    // MarkTextureFrameAvailable call. Keep at most one notification in flight
+    // so a sustained live stream cannot build an input-blocking task backlog.
+    std::atomic<bool> texture_frame_pending{false};
 #ifdef USE_EGL_IMAGE_DMABUF
     std::unique_ptr<FlutterDesktopEGLImage> egl_image;
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -354,6 +359,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           [instance = instance.get()](
               size_t width, size_t height, void* egl_display,
               void* egl_context) -> const FlutterDesktopEGLImage* {
+            instance->texture_frame_pending.store(
+                false, std::memory_order_release);
             if (!instance->player) {
               return nullptr;
             }
@@ -369,6 +376,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
       std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
           [instance = instance.get()](
               size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
+            instance->texture_frame_pending.store(
+                false, std::memory_order_release);
             // Hold buffer_mutex across the whole copy AND the engine's later
             // glTexImage2D read: the engine reads the returned buffer after
             // this callback returns and signals completion via the buffer's
@@ -377,7 +386,13 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             // `player`, so the frame can't be freed mid-read; and the shell is
             // kept alive past dispose (retired_players_), so this never
             // dereferences freed memory even if it fires after dispose.
-            instance->buffer_mutex.lock();
+            // Never wait on the raster thread. If the engine still owns the
+            // previous pixel buffer, retain that frame and try again when the
+            // next decoded frame arrives. Blocking here delays every Flutter
+            // overlay, including remote-driven media controls.
+            if (!instance->buffer_mutex.try_lock()) {
+              return nullptr;
+            }
             if (!instance->player) {
               instance->buffer_mutex.unlock();
               return nullptr;
@@ -438,8 +453,17 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           host->SendInitializedEventMessage(texture_id);
         },
         // OnNotifyFrameDecoded
-        [texture_id, host = this]() {
-          host->texture_registrar_->MarkTextureFrameAvailable(texture_id);
+        [texture_id, instance = instance.get(), host = this]() {
+          bool expected = false;
+          if (!instance->texture_frame_pending.compare_exchange_strong(
+                  expected, true, std::memory_order_acq_rel)) {
+            return;
+          }
+          if (!host->texture_registrar_->MarkTextureFrameAvailable(
+                  texture_id)) {
+            instance->texture_frame_pending.store(
+                false, std::memory_order_release);
+          }
         },
         // OnNotifyCompleted
         [texture_id, host = this]() {
