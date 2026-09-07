@@ -466,6 +466,7 @@ bool GstVideoPlayer::Init() {
     DestroyPipeline();
     return false;
   }
+  LogPlaybackStartup("native_preroll_completed");
 
   // With sync=TRUE, fakesink only delivers frames once the pipeline clock is
   // running (PLAYING state). Live HLS prerolls with NO_PREROLL so sinks never
@@ -634,6 +635,9 @@ bool GstVideoPlayer::Init() {
       std::this_thread::sleep_for(std::chrono::milliseconds(kPrerollPollMs));
     }
   }
+  LogPlaybackStartup(
+      "startup_buffer_gate_completed",
+      "bufferPercent=" + std::to_string(last_buffering_percent_.load()));
 
   // Preroll aborted by a fatal bus error (e.g. HTTP 4xx, EOS on VOD manifest,
   // souphttpsrc inactivity timeout). Bail before the first-frame wait so we
@@ -658,6 +662,10 @@ bool GstVideoPlayer::Init() {
       return first_frame_ready_.load() || error_notified_.load();
     });
   }
+  LogPlaybackStartup(
+      "first_frame_wait_completed",
+      std::string("frameReady=") +
+          (first_frame_ready_.load() ? "true" : "false"));
 
   // Unmute audio only AFTER the first decoded frame has surfaced. Previously
   // the unmute happened when the preroll gate opened, which was too early:
@@ -700,6 +708,7 @@ bool GstVideoPlayer::Init() {
   // switch made safe, the engine can once again drop rungs on genuine sustained
   // congestion instead of rebuffering on the top rung.
   StartAbrEngine();
+  LogPlaybackStartup("native_init_completed");
   return true;
 }
 

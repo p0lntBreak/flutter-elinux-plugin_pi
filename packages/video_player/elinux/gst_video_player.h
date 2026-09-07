@@ -40,6 +40,9 @@ class GstVideoPlayer {
   static void GstLibraryLoad();
   static void GstLibraryUnload();
 
+  void LogPlaybackStartup(const char* stage,
+                          const std::string& details = "") const;
+
   bool Init();
   bool Play();
   bool Pause();
@@ -152,8 +155,6 @@ class GstVideoPlayer {
   std::atomic<bool> first_network_chunk_logged_{false};
   std::atomic<bool> first_http_burst_logged_{false};
   std::atomic<bool> hls_demux_ready_logged_{false};
-  void LogPlaybackStartup(const char* stage,
-                          const std::string& details = "") const;
   std::unique_ptr<uint32_t[]> pixels_;
   int32_t width_ = 0;
   int32_t height_ = 0;

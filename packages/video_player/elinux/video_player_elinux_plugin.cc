@@ -411,6 +411,10 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             -> std::unique_ptr<
                 flutter::StreamHandlerError<flutter::EncodableValue>> {
           instance->event_sink = std::move(events);
+          if (instance->player) {
+            instance->player->LogPlaybackStartup(
+                "plugin_event_channel_listening");
+          }
           host->SendInitializedEventMessage(instance->texture_id);
           return nullptr;
         },
@@ -516,7 +520,11 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   flutter::EncodableMap value;
   TextureMessage result;
 
+  players_[texture_id]->player->LogPlaybackStartup("plugin_init_call_started");
   bool ok = players_[texture_id]->player->Init();
+  players_[texture_id]->player->LogPlaybackStartup(
+      "plugin_init_returned",
+      std::string("success=") + (ok ? "true" : "false"));
   if (ok) {
     result.SetTextureId(texture_id);
     value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
@@ -542,6 +550,10 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
     // Clean up here or the texture + player leak on every failed Init().
     // DisposePlayer() erases from players_ itself.
     DisposePlayer(texture_id);
+  }
+  if (ok) {
+    players_[texture_id]->player->LogPlaybackStartup(
+        "plugin_create_reply_ready");
   }
   reply(flutter::EncodableValue(value));
 }
@@ -734,10 +746,15 @@ void VideoPlayerPlugin::HandleSeekToMethodCall(
 }
 
 void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
-  if (players_.find(texture_id) == players_.end() ||
-      !players_[texture_id]->event_sink) {
+  if (players_.find(texture_id) == players_.end()) {
     return;
   }
+
+  players_[texture_id]->player->LogPlaybackStartup(
+      "plugin_initialized_event_attempt",
+      std::string("sinkReady=") +
+          (players_[texture_id]->event_sink ? "true" : "false"));
+  if (!players_[texture_id]->event_sink) return;
 
   auto duration = players_[texture_id]->player->GetDuration();
   auto width = players_[texture_id]->player->GetWidth();
@@ -750,6 +767,8 @@ void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
       {flutter::EncodableValue("height"), flutter::EncodableValue(height)}};
   flutter::EncodableValue event(encodables);
   players_[texture_id]->event_sink->Success(event);
+  players_[texture_id]->player->LogPlaybackStartup(
+      "plugin_initialized_event_sent");
 }
 
 void VideoPlayerPlugin::SendPlayCompletedEventMessage(int64_t texture_id) {
