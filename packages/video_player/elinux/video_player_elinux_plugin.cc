@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -115,6 +116,7 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // Native startup runs asynchronously so Dart can subscribe to the event
     // channel immediately after create() returns.
     std::thread initialization_thread;
+    std::atomic<bool> initialized_event_sent{false};
   };
 
   void HandleInitializeMethodCall(
@@ -434,7 +436,12 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             instance->player->LogPlaybackStartup(
                 "plugin_event_channel_listening");
           }
-          host->SendInitializedEventMessage(instance->texture_id);
+          // If native initialization already completed before Dart attached,
+          // replay the event now. Otherwise Init() will send it when the first
+          // frame and startup buffer gate are ready.
+          if (instance->player->IsInitialized()) {
+            host->SendInitializedEventMessage(instance->texture_id);
+          }
           return nullptr;
         },
         [instance = instance.get()](const flutter::EncodableValue* arguments)
@@ -775,6 +782,12 @@ void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
       std::string("sinkReady=") +
           (players_[texture_id]->event_sink ? "true" : "false"));
   if (!players_[texture_id]->event_sink) return;
+  if (!players_[texture_id]->player->IsInitialized()) return;
+  bool expected = false;
+  if (!players_[texture_id]->initialized_event_sent.compare_exchange_strong(
+          expected, true)) {
+    return;
+  }
 
   auto duration = players_[texture_id]->player->GetDuration();
   auto width = players_[texture_id]->player->GetWidth();

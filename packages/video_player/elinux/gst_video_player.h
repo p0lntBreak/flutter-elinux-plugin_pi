@@ -67,6 +67,7 @@ class GstVideoPlayer {
 #endif  // USE_EGL_IMAGE_DMABUF
   int32_t GetWidth() const { return width_; };
   int32_t GetHeight() const { return height_; };
+  bool IsInitialized() const { return initialized_.load(); }
 
   // ADD THIS METHOD DECLARATION
   void SetAuthHeaders(const std::map<std::string, std::string>& headers);
