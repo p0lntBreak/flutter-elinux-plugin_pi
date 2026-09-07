@@ -342,8 +342,8 @@ GstVideoPlayer::GstVideoPlayer(
 
   uri_ = ParseUri(uri);
 
-  // Cold-start rung hint. soatv appends `#soatv:startup_kbps=N` to the URL
-  // to thread either (a) a measured throughput sample from its auth GET
+  // Private startup metadata. The fragment never reaches the origin. It can
+  // thread either (a) a measured throughput sample from its auth GET
   // (essentially free measurement — see StreamAuthenticationService), or
   // (b) the specific rung an earlier ABR_RESTART decided on. Parse the
   // fragment, strip it from the URI before playbin sees it. See
@@ -353,37 +353,43 @@ GstVideoPlayer::GstVideoPlayer(
   // fragment format is stable and simple, and this runs exactly once per
   // player construction.
   {
-    const std::string kMarker = "#soatv:startup_kbps=";
+    const std::string kMarker = "#soatv:";
     const auto pos = uri_.find(kMarker);
     if (pos != std::string::npos) {
-      const auto value_start = pos + kMarker.size();
-      // Read digits until end-of-string or the next fragment/query separator.
-      std::string digits;
-      for (size_t i = value_start; i < uri_.size(); ++i) {
-        const char c = uri_[i];
-        if (c >= '0' && c <= '9') {
-          digits += c;
-        } else {
-          break;
-        }
-      }
-      if (!digits.empty()) {
+      const std::string metadata = uri_.substr(pos + kMarker.size());
+      const auto value_for = [&metadata](const std::string& key) {
+        const std::string marker = key + "=";
+        const auto start = metadata.find(marker);
+        if (start == std::string::npos) return std::string();
+        const auto value_start = start + marker.size();
+        const auto end = metadata.find('&', value_start);
+        return metadata.substr(value_start, end - value_start);
+      };
+
+      const std::string startup_kbps = value_for("startup_kbps");
+      if (!startup_kbps.empty()) {
         try {
-          startup_kbps_hint_ = static_cast<guint64>(std::stoull(digits));
-          std::cout << "URI-STARTUP-HINT: soatv:startup_kbps="
-                    << startup_kbps_hint_ << " parsed from URI fragment"
-                    << std::endl;
+          startup_kbps_hint_ = static_cast<guint64>(std::stoull(startup_kbps));
         } catch (const std::exception& e) {
-          std::cerr << "URI-STARTUP-HINT: failed to parse '" << digits
+          std::cerr << "URI-STARTUP-HINT: failed to parse '" << startup_kbps
                     << "': " << e.what() << std::endl;
         }
       }
-      // Strip the fragment: whether we parsed it or not, playbin doesn't
-      // need to see this private URI extension.
+
+      const std::string trace = value_for("trace");
+      if (!trace.empty()) startup_trace_id_ = trace;
+      const std::string offset_ms = value_for("offset_ms");
+      if (!offset_ms.empty()) {
+        try {
+          startup_elapsed_offset_ms_ = std::stoll(offset_ms);
+        } catch (const std::exception& e) {
+          std::cerr << "URI-STARTUP-HINT: failed to parse offset '" << offset_ms
+                    << "': " << e.what() << std::endl;
+        }
+      }
       uri_.resize(pos);
     }
   }
-
   // URI-based live hint. Defense-in-depth: hlsdemux is supposed to classify
   // the stream as live during Preroll (returns GST_STATE_CHANGE_NO_PREROLL),
   // which flips is_live_=true there. But that only fires when the media
@@ -407,12 +413,27 @@ GstVideoPlayer::GstVideoPlayer(
     std::cout << "URI-LIVE-HINT: /live/ path detected — is_live_=true "
                  "before preroll" << std::endl;
   }
+  LogPlaybackStartup("native_initialization_started");
 
   if (!CreatePipeline()) {
     std::cerr << "Failed to create a pipeline" << std::endl;
     DestroyPipeline();
     return;
   }
+  LogPlaybackStartup("pipeline_created");
+}
+
+void GstVideoPlayer::LogPlaybackStartup(
+    const char* stage, const std::string& details) const {
+  const auto native_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - startup_started_at_).count();
+  std::cout << "[PlaybackStartup] trace=" << startup_trace_id_
+            << " stage=" << stage
+            << " totalMs=" << (startup_elapsed_offset_ms_ + native_elapsed)
+            << " nativeMs=" << native_elapsed
+            << " media=video stream=" << (is_live_ ? "live" : "onDemand");
+  if (!details.empty()) std::cout << " " << details;
+  std::cout << std::endl;
 }
 
 GstVideoPlayer::~GstVideoPlayer() {
@@ -433,6 +454,7 @@ void GstVideoPlayer::GstLibraryLoad() { gst_init(NULL, NULL); }
 void GstVideoPlayer::GstLibraryUnload() { gst_deinit(); }
 
 bool GstVideoPlayer::Init() {
+  LogPlaybackStartup("native_init_called");
   if (!gst_.pipeline) {
     return false;
   }
@@ -1626,6 +1648,9 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   // stalls in steady-state are still bounded per the original 0c891c3
   // rationale. See CreatePipeline() comment for the full story.
   if (!self->first_frame_ready_.exchange(true)) {
+    self->LogPlaybackStartup(
+        "first_frame", "width=" + std::to_string(width) +
+                           " height=" + std::to_string(height));
     if (self->gst_.video_sink) {
       g_object_set(G_OBJECT(self->gst_.video_sink),
                    "max-lateness", (gint64)(500 * GST_MSECOND), NULL);
@@ -2172,6 +2197,9 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
       self->hls_demux_ = GST_ELEMENT(gst_object_ref(element));
     }
     std::cout << "ABR: found hlsdemux element: " << name << std::endl;
+    if (!self->hls_demux_ready_logged_.exchange(true)) {
+      self->LogPlaybackStartup("hls_demux_ready");
+    }
     // Task #50 (2026-08-22): remove hlsdemux's default 0.8 safety multiplier
     // on connection-speed. hlsdemux picks the highest rendition whose bandwidth
     // is <= connection-speed * bitrate-limit. With the default 0.8, our
@@ -2231,6 +2259,10 @@ GstPadProbeReturn GstVideoPlayer::AbrThroughputProbe(GstPad* /*pad*/,
 
   const gsize size = gst_buffer_get_size(buf);
   const auto now = std::chrono::steady_clock::now();
+  if (!self->first_network_chunk_logged_.exchange(true)) {
+    self->LogPlaybackStartup(
+        "first_hls_network_chunk", "bytes=" + std::to_string(size));
+  }
 
   // Bump the monotonic total FIRST, outside the mutex. The preroll gate reads
   // this without contending for abr_mutex_ so it stays responsive even while
@@ -2270,6 +2302,12 @@ void GstVideoPlayer::CloseBurstLocked() {
               << static_cast<int>((static_cast<double>(burst_bytes_) / secs) / 1024.0)
               << " KB/s (" << static_cast<int>(throughput_bps / 1000.0)
               << " kbps)" << std::endl;
+    if (!first_http_burst_logged_.exchange(true)) {
+      LogPlaybackStartup(
+          "first_http_burst_complete",
+          "bytes=" + std::to_string(burst_bytes_) +
+              " downloadMs=" + std::to_string(static_cast<int64_t>(secs * 1000.0)));
+    }
   }
   burst_bytes_ = 0;
 }

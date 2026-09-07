@@ -141,15 +141,19 @@ class GstVideoPlayer {
   // element directly gives us a working mute during the preroll gate.
   GstElement* audio_volume_ = nullptr;
   std::string uri_;
-  // Cold-start rung hint parsed from a `#soatv:startup_kbps=N` fragment on
-  // the URI. When non-zero, overrides kColdStartConnSpeedKbps at pipeline
-  // construction so hlsdemux picks a rendition suited to the current
-  // network measurement (from soatv's auth-GET throughput probe) or the
-  // rung a preceding ABR_RESTART decided on. Zero means "no hint, use
-  // the fixed default". Stripped from uri_ before being handed to
-  // playbin — playbin doesn't need to see it (GStreamer would ignore
-  // it anyway, but keeping the URL clean avoids surprises).
+  // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
+  // selects the cold-start rung; trace and offset_ms join native diagnostics
+  // to the app-side startup timeline. The fragment is stripped before playbin.
   guint64 startup_kbps_hint_ = 0;
+  std::string startup_trace_id_ = "native";
+  int64_t startup_elapsed_offset_ms_ = 0;
+  std::chrono::steady_clock::time_point startup_started_at_ =
+      std::chrono::steady_clock::now();
+  std::atomic<bool> first_network_chunk_logged_{false};
+  std::atomic<bool> first_http_burst_logged_{false};
+  std::atomic<bool> hls_demux_ready_logged_{false};
+  void LogPlaybackStartup(const char* stage,
+                          const std::string& details = "") const;
   std::unique_ptr<uint32_t[]> pixels_;
   int32_t width_ = 0;
   int32_t height_ = 0;
