@@ -145,15 +145,12 @@ constexpr double kUpSwitchMaxCv = 0.60;
 constexpr guint64 kColdStartConnSpeedKbps = 1500;
 
 // Cold-start preroll target (seconds of buffered content required before Init()
-// returns success). Dropped 15 -> 5 s (task #60, 2026-08-29) to prioritise
-// picture-first UX: user sees the first frame within ~5 s of a channel tap,
-// even on marginal links. The multiqueue keeps filling behind the picture up
-// to the 60 s cache-target, so the ABR still gets a proper cushion — the
-// difference is where the spinner ends: at 5 s of buffered content rather
-// than 15 s. Deliberately no wall-clock cap on the preroll wait — a hard
-// error (HTTP timeout, EOS, pathological-preroll NETWORK_TOO_SLOW) ends it
-// early; otherwise the spinner waits as long as needed.
-constexpr double kColdStartPrerollSecs = 5.0;
+// returns success). Keep this short so the UI becomes ready quickly; the
+// multiqueue continues filling behind playback up to the 60 s cache target.
+// Deliberately no wall-clock cap on the preroll wait — a hard error (HTTP
+// timeout, EOS, pathological-preroll NETWORK_TOO_SLOW) ends it early;
+// otherwise the spinner waits as long as needed.
+constexpr double kColdStartPrerollSecs = 2.0;
 
 // Poll interval for the preroll wait. Fast enough to feel responsive on a good
 // link; slow enough not to spam gst_query_new_buffering().
