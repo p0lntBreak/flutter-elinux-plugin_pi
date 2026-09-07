@@ -113,6 +113,19 @@ class VideoPlayerPlugin : public flutter::Plugin {
     std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>>
         event_channel;
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink;
+    std::mutex error_delivery_mutex;
+    std::string pending_error;
+    std::atomic<bool> error_reported{false};
+
+    void DeliverError(const std::string& message) {
+      std::lock_guard<std::mutex> guard(error_delivery_mutex);
+      error_reported.store(true);
+      if (!event_sink) {
+        pending_error = message;
+        return;
+      }
+      event_sink->Error("VideoError", message);
+    }
     // Native startup runs asynchronously so Dart can subscribe to the event
     // channel immediately after create() returns.
     std::thread initialization_thread;
@@ -431,7 +444,16 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
                 events)
             -> std::unique_ptr<
                 flutter::StreamHandlerError<flutter::EncodableValue>> {
-          instance->event_sink = std::move(events);
+          bool replayed_error = false;
+          {
+            std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+            instance->event_sink = std::move(events);
+            if (!instance->pending_error.empty()) {
+              instance->event_sink->Error("VideoError", instance->pending_error);
+              instance->pending_error.clear();
+              replayed_error = true;
+            }
+          }
           if (instance->player) {
             instance->player->LogPlaybackStartup(
                 "plugin_event_channel_listening");
@@ -439,7 +461,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           // If native initialization already completed before Dart attached,
           // replay the event now. Otherwise Init() will send it when the first
           // frame and startup buffer gate are ready.
-          if (instance->player->IsInitialized()) {
+          if (!replayed_error && instance->player->IsInitialized()) {
             host->SendInitializedEventMessage(instance->texture_id);
           }
           return nullptr;
@@ -447,6 +469,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         [instance = instance.get()](const flutter::EncodableValue* arguments)
             -> std::unique_ptr<
                 flutter::StreamHandlerError<flutter::EncodableValue>> {
+          std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
           instance->event_sink = nullptr;
           return nullptr;
         });
@@ -579,7 +602,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
                   ? specific
                   : ("Failed to initialize the player with texture id: " +
                      std::to_string(texture_id));
-          SendErrorEventMessage(texture_id, error_message);
+          // The shared entry stays alive even if disposal removed its map key.
+          player_entry->DeliverError(error_message);
         }
       });
   reply(flutter::EncodableValue(value));
@@ -776,6 +800,9 @@ void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
   if (players_.find(texture_id) == players_.end()) {
     return;
   }
+  const auto instance = players_[texture_id];
+  std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+  if (instance->error_reported.load()) return;
 
   players_[texture_id]->player->LogPlaybackStartup(
       "plugin_initialized_event_attempt",
@@ -834,11 +861,11 @@ void VideoPlayerPlugin::SendIsPlayingStateUpdate(int64_t texture_id,
 
 void VideoPlayerPlugin::SendErrorEventMessage(int64_t texture_id,
                                               const std::string& message) {
-  if (players_.find(texture_id) == players_.end() ||
-      !players_[texture_id]->event_sink) {
-    return;
-  }
-  players_[texture_id]->event_sink->Error("VideoError", message);
+  const auto it = players_.find(texture_id);
+  if (it == players_.end()) return;
+  const auto instance = it->second;
+  // Init can fail before Dart subscribes. Retain errors until it attaches.
+  instance->DeliverError(message);
 }
 
 void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
@@ -856,7 +883,11 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
   }
 
   // Detach the Dart-facing channels (platform thread — safe).
-  player->event_sink = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(player->error_delivery_mutex);
+    player->event_sink = nullptr;
+    player->pending_error.clear();
+  }
   if (player->event_channel) {
     player->event_channel->SetStreamHandler(nullptr);
   }
