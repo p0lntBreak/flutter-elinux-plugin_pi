@@ -20,14 +20,14 @@ class VideoPlayerStreamHandlerImpl : public VideoPlayerStreamHandler {
   using OnNotifyBufferingUpdate = std::function<void(int)>;
   using OnNotifyBufferingEnd = std::function<void()>;
 
-  VideoPlayerStreamHandlerImpl(OnNotifyInitialized on_notify_initialized,
-                               OnNotifyFrameDecoded on_notify_frame_decoded,
-                               OnNotifyCompleted on_notify_completed,
-                               OnNotifyPlaying on_notify_playing,
-                               OnNotifyError on_notify_error,
-                               OnNotifyBufferingStart on_notify_buffering_start,
-                               OnNotifyBufferingUpdate on_notify_buffering_update,
-                               OnNotifyBufferingEnd on_notify_buffering_end)
+  VideoPlayerStreamHandlerImpl(
+      OnNotifyInitialized on_notify_initialized,
+      OnNotifyFrameDecoded on_notify_frame_decoded,
+      OnNotifyCompleted on_notify_completed, OnNotifyPlaying on_notify_playing,
+      OnNotifyError on_notify_error,
+      OnNotifyBufferingStart on_notify_buffering_start,
+      OnNotifyBufferingUpdate on_notify_buffering_update,
+      OnNotifyBufferingEnd on_notify_buffering_end)
       : on_notify_initialized_(on_notify_initialized),
         on_notify_frame_decoded_(on_notify_frame_decoded),
         on_notify_completed_(on_notify_completed),

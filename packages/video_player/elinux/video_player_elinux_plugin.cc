@@ -342,8 +342,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   }
 
   auto instance = std::make_unique<FlutterVideoPlayer>();
-  
-    
+
 #ifdef USE_EGL_IMAGE_DMABUF
   instance->egl_image = std::make_unique<FlutterDesktopEGLImage>();
   instance->texture =
@@ -468,9 +467,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             flutter::EncodableList ranges = {
                 flutter::EncodableValue(flutter::EncodableList{
                     flutter::EncodableValue(static_cast<int64_t>(0)),
-                    flutter::EncodableValue(buffered_end)
-                })
-            };
+                    flutter::EncodableValue(buffered_end)})};
             flutter::EncodableMap encodables = {
                 {flutter::EncodableValue("event"),
                  flutter::EncodableValue("bufferingUpdate")},
@@ -492,33 +489,31 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           }
         });
 
-      
     instance->player =
         std::make_unique<GstVideoPlayer>(uri, std::move(player_handler));
 
-      
-
-    //Extract and apply HTTP headers dynamically
+    // Extract and apply HTTP headers dynamically
     const auto& http_headers = meta.GetHttpHeaders();
     if (!http_headers.empty()) {
-      std::cout << "Received " << http_headers.size() << " HTTP headers from Flutter" << std::endl;
-      
+      std::cout << "Received " << http_headers.size()
+                << " HTTP headers from Flutter" << std::endl;
+
       // Log all headers
       for (const auto& [key, value] : http_headers) {
         std::cout << "  Header: " << key << " = " << value << std::endl;
       }
-      
+
       // Pass ALL headers to the player
       std::cout << "Setting ALL HTTP headers on player" << std::endl;
       instance->player->SetAuthHeaders(http_headers);
     } else {
       std::cout << "No HTTP headers provided from Flutter" << std::endl;
     }
-      
+
     players_[texture_id] = std::move(instance);
   }
 
-flutter::EncodableMap value;
+  flutter::EncodableMap value;
   TextureMessage result;
 
   bool ok = players_[texture_id]->player->Init();
@@ -533,10 +528,11 @@ flutter::EncodableMap value;
     // texture-id message if nothing was recorded (e.g. a very early failure
     // before any NotifyError path fired).
     std::string specific = players_[texture_id]->player->GetLastError();
-    auto error_message = !specific.empty()
-        ? specific
-        : ("Failed to initialize the player with texture id: " +
-           std::to_string(texture_id));
+    auto error_message =
+        !specific.empty()
+            ? specific
+            : ("Failed to initialize the player with texture id: " +
+               std::to_string(texture_id));
     value.emplace(flutter::EncodableValue(kEncodableMapkeyError),
                   flutter::EncodableValue(WrapError(error_message)));
     // Init() failed. The texture was already registered and this entry

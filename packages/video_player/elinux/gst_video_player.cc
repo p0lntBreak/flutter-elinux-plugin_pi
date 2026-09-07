@@ -4,8 +4,6 @@
 
 #include "gst_video_player.h"
 
-#include "logging.h"
-
 #include <fcntl.h>
 #include <glob.h>
 #include <unistd.h>
@@ -18,6 +16,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include "logging.h"
 
 namespace {
 // Buffer discipline retune (task #60, 2026-08-29). Doubled from 30 to 60 s to
@@ -160,10 +160,11 @@ constexpr double kColdStartPrerollSecs = 5.0;
 constexpr int kPrerollPollMs = 500;
 
 // Stable machine prefix on the error string handed to Flutter for a stream that
-// is unavailable due to entitlement (subscription lapsed / channel de-entitled),
-// as opposed to a transient/network error. The Dart side branches on this: it
-// must surface a "check your subscription" flow and NOT enter the reconnect
-// loop (reconnect just thrashes re-auth against a stream it can no longer play).
+// is unavailable due to entitlement (subscription lapsed / channel
+// de-entitled), as opposed to a transient/network error. The Dart side branches
+// on this: it must surface a "check your subscription" flow and NOT enter the
+// reconnect loop (reconnect just thrashes re-auth against a stream it can no
+// longer play).
 constexpr char kStreamUnavailablePrefix[] = "STREAM_UNAVAILABLE: ";
 
 // Stable machine prefix on the error string handed to Flutter when the preroll
@@ -234,9 +235,9 @@ bool IsChannelUnavailable(GstMessage* message, GError* error,
       error->code == GST_STREAM_ERROR_TYPE_NOT_FOUND) {
     return true;
   }
-  const gchar* src_name =
-      GST_MESSAGE_SRC(message) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message))
-                               : nullptr;
+  const gchar* src_name = GST_MESSAGE_SRC(message)
+                              ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message))
+                              : nullptr;
   if (src_name && std::string(src_name).find("typefind") != std::string::npos) {
     return true;
   }
@@ -288,11 +289,10 @@ void DumpKernelFreezeDiagnostic() {
     }
     close(fd);
     constexpr size_t kMaxLines = 80;
-    size_t start = kmsg_lines.size() > kMaxLines
-                       ? kmsg_lines.size() - kMaxLines
-                       : 0;
-    std::cout << "FREEZE-DIAG: /dev/kmsg last "
-              << (kmsg_lines.size() - start) << " lines:" << std::endl;
+    size_t start =
+        kmsg_lines.size() > kMaxLines ? kmsg_lines.size() - kMaxLines : 0;
+    std::cout << "FREEZE-DIAG: /dev/kmsg last " << (kmsg_lines.size() - start)
+              << " lines:" << std::endl;
     for (size_t i = start; i < kmsg_lines.size(); ++i) {
       // Each record is "<priority>,<seq>,<time>,<flags>;<text>\n<key=val>*"
       // Only print up to the first newline for brevity.
@@ -310,8 +310,8 @@ void DumpKernelFreezeDiagnostic() {
   if (tf.is_open()) {
     int millideg = 0;
     tf >> millideg;
-    std::cout << "FREEZE-DIAG: SoC temperature: " << (millideg / 1000.0)
-              << " C" << std::endl;
+    std::cout << "FREEZE-DIAG: SoC temperature: " << (millideg / 1000.0) << " C"
+              << std::endl;
   }
 
   // vcgencmd get_throttled: reports throttling flags. Bounded, short output.
@@ -411,7 +411,8 @@ GstVideoPlayer::GstVideoPlayer(
   if (uri_.find("/live/") != std::string::npos) {
     is_live_ = true;
     std::cout << "URI-LIVE-HINT: /live/ path detected — is_live_=true "
-                 "before preroll" << std::endl;
+                 "before preroll"
+              << std::endl;
   }
   LogPlaybackStartup("native_initialization_started");
 
@@ -423,10 +424,12 @@ GstVideoPlayer::GstVideoPlayer(
   LogPlaybackStartup("pipeline_created");
 }
 
-void GstVideoPlayer::LogPlaybackStartup(
-    const char* stage, const std::string& details) const {
-  const auto native_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - startup_started_at_).count();
+void GstVideoPlayer::LogPlaybackStartup(const char* stage,
+                                        const std::string& details) const {
+  const auto native_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - startup_started_at_)
+          .count();
   std::cout << "[PlaybackStartup] trace=" << startup_trace_id_
             << " stage=" << stage
             << " totalMs=" << (startup_elapsed_offset_ms_ + native_elapsed)
@@ -483,7 +486,8 @@ bool GstVideoPlayer::Init() {
   }
   play_state_requested_.store(true);
   if (is_live_) {
-    std::cout << "Init: live stream stays in PLAYING after preroll" << std::endl;
+    std::cout << "Init: live stream stays in PLAYING after preroll"
+              << std::endl;
   }
   if (gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING) ==
       GST_STATE_CHANGE_FAILURE) {
@@ -515,8 +519,8 @@ bool GstVideoPlayer::Init() {
     bool stall_check_armed = false;
     while (!error_notified_.load()) {
       gint64 position = 0;
-      const bool has_position = gst_element_query_position(
-          gst_.pipeline, GST_FORMAT_TIME, &position);
+      const bool has_position =
+          gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position);
 
       double buffer_health_secs = -1.0;
       bool used_estimate = true;
@@ -554,7 +558,8 @@ bool GstVideoPlayer::Init() {
 
       const auto now = std::chrono::steady_clock::now();
       const auto since_log = std::chrono::duration_cast<std::chrono::seconds>(
-          now - last_progress_log).count();
+                                 now - last_progress_log)
+                                 .count();
       // Log/publish every ~1s so Dart has a live pulse and the health log has
       // a trail. Also fire whenever the value moved by >=1s so a rapid climb
       // on a fast link isn't hidden behind the 1s throttle.
@@ -564,9 +569,8 @@ bool GstVideoPlayer::Init() {
            std::abs(buffer_health_secs - last_logged_secs) >= 1.0);
       if (since_log >= 1 || moved) {
         std::cout << "PREROLL_WAIT: buffered="
-                  << static_cast<int>(buffer_health_secs >= 0.0
-                                          ? buffer_health_secs
-                                          : 0.0)
+                  << static_cast<int>(
+                         buffer_health_secs >= 0.0 ? buffer_health_secs : 0.0)
                   << "s/" << static_cast<int>(kColdStartPrerollSecs)
                   << "s pct=" << pct << (used_estimate ? " (est)" : "")
                   << std::endl;
@@ -586,9 +590,11 @@ bool GstVideoPlayer::Init() {
       // dead (captive portal, DNS blackhole, sub-160 kbps sustained). Otherwise
       // advance the checkpoint. Fires NETWORK_TOO_SLOW so Dart can render the
       // check-connection UI.
-      const auto secs_since_start = std::chrono::duration_cast<std::chrono::seconds>(
-          now - preroll_start).count();
-      const uint64_t bytes_now = total_bytes_fetched_.load(std::memory_order_relaxed);
+      const auto secs_since_start =
+          std::chrono::duration_cast<std::chrono::seconds>(now - preroll_start)
+              .count();
+      const uint64_t bytes_now =
+          total_bytes_fetched_.load(std::memory_order_relaxed);
       if (secs_since_start >= kPathologicalPrerollWarmupSecs) {
         if (!stall_check_armed) {
           // Arm the first checkpoint at the end of the warmup window.
@@ -604,12 +610,14 @@ bool GstVideoPlayer::Init() {
           stall_check_time = now;
           stall_check_bytes = bytes_now;
         } else {
-          const auto stall_secs = std::chrono::duration_cast<std::chrono::seconds>(
-              now - stall_check_time).count();
+          const auto stall_secs =
+              std::chrono::duration_cast<std::chrono::seconds>(now -
+                                                               stall_check_time)
+                  .count();
           if (stall_secs >= kPathologicalPrerollNoProgressSecs) {
             const uint64_t bytes_this_window = bytes_now - stall_check_bytes;
-            std::string msg = std::string(kNetworkTooSlowPrefix) +
-                "preroll stalled — only " +
+            std::string msg =
+                std::string(kNetworkTooSlowPrefix) + "preroll stalled — only " +
                 std::to_string(bytes_this_window / 1024) +
                 "KB fetched in last " + std::to_string(stall_secs) + "s";
             std::cerr << msg << std::endl;
@@ -906,11 +914,12 @@ void* GstVideoPlayer::GetEGLImage(void* egl_display, void* egl_context) {
     UnrefEGLImage();
 
     gint fd = gst_dmabuf_memory_get_fd(memory);
-    gst_gl_display_egl_ =
-        gst_gl_display_egl_new_with_egl_display(reinterpret_cast<gpointer>(egl_display));
-    gst_gl_ctx_ = gst_gl_context_new_wrapped(
-        GST_GL_DISPLAY_CAST(gst_gl_display_egl_), reinterpret_cast<guintptr>(egl_context),
-        GST_GL_PLATFORM_EGL, GST_GL_API_GLES2);
+    gst_gl_display_egl_ = gst_gl_display_egl_new_with_egl_display(
+        reinterpret_cast<gpointer>(egl_display));
+    gst_gl_ctx_ =
+        gst_gl_context_new_wrapped(GST_GL_DISPLAY_CAST(gst_gl_display_egl_),
+                                   reinterpret_cast<guintptr>(egl_context),
+                                   GST_GL_PLATFORM_EGL, GST_GL_API_GLES2);
 
     gst_gl_context_activate(gst_gl_ctx_, TRUE);
 
@@ -987,14 +996,14 @@ static std::string PickAudioDevice() {
         char dev[32];
         std::snprintf(dev, sizeof(dev), "plughw:%d,0", card);
         std::cout << "PickAudioDevice: HDMI-A-" << hdmi_idx
-                  << " connected, ALSA card " << card << " (" << id
-                  << ") -> " << dev << std::endl;
+                  << " connected, ALSA card " << card << " (" << id << ") -> "
+                  << dev << std::endl;
         return dev;
       }
     }
     std::cerr << "PickAudioDevice: HDMI-A-" << hdmi_idx
-              << " connected but no ALSA card matching '" << target
-              << "' found" << std::endl;
+              << " connected but no ALSA card matching '" << target << "' found"
+              << std::endl;
   }
   std::cout << "PickAudioDevice: No connected HDMI, falling back to plughw:0,0"
             << std::endl;
@@ -1041,7 +1050,8 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
     // cannot detect or abort the dead socket; the fetch just hangs until the
     // blunt total timeout. A fresh connection per segment means a recycled
     // socket can never poison the stream, and a single bad fetch fails in
-    // isolation so hlsdemux can retry the next segment without a full reconnect.
+    // isolation so hlsdemux can retry the next segment without a full
+    // reconnect.
     //
     // timeout = CURLOPT_TIMEOUT: total transfer time per segment request.
     // Lowered 30s->12s so a hung fetch aborts and hlsdemux retries BEFORE the
@@ -1050,21 +1060,29 @@ static void SourceSetupCallback(GstElement* playbin, GstElement* source,
     g_object_set(source, "timeout", (gint)12, "compress", TRUE, "keep-alive",
                  FALSE, NULL);
 
-    // connect-timeout = CURLOPT_CONNECTTIMEOUT: not present in all GStreamer builds.
+    // connect-timeout = CURLOPT_CONNECTTIMEOUT: not present in all GStreamer
+    // builds.
     if (g_object_class_find_property(klass, "connect-timeout")) {
       g_object_set(source, "connect-timeout", (gint)10, NULL);
       std::cout << "SOURCE-SETUP: curlhttpsrc connect-timeout=10s" << std::endl;
     } else {
-      std::cout << "SOURCE-SETUP: curlhttpsrc connect-timeout unavailable (old version)" << std::endl;
+      std::cout << "SOURCE-SETUP: curlhttpsrc connect-timeout unavailable (old "
+                   "version)"
+                << std::endl;
     }
 
     // low-speed-limit / low-speed-time: abort if rate stays below 200 B/s for
     // 15 s — catches partial-body hangs that CURLOPT_TIMEOUT alone misses.
     if (g_object_class_find_property(klass, "low-speed-time")) {
-      g_object_set(source, "low-speed-time", (gint)15, "low-speed-limit", (glong)200, NULL);
-      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed: <200B/s for 15s = abort" << std::endl;
+      g_object_set(source, "low-speed-time", (gint)15, "low-speed-limit",
+                   (glong)200, NULL);
+      std::cout
+          << "SOURCE-SETUP: curlhttpsrc low-speed: <200B/s for 15s = abort"
+          << std::endl;
     } else {
-      std::cout << "SOURCE-SETUP: curlhttpsrc low-speed unavailable (old version)" << std::endl;
+      std::cout
+          << "SOURCE-SETUP: curlhttpsrc low-speed unavailable (old version)"
+          << std::endl;
     }
 
     gint t = 0;
@@ -1155,8 +1173,10 @@ bool GstVideoPlayer::CreatePipeline() {
   // starve the decoder = the recurring source stall). soup's earlier TLS
   // failure is worked around with ssl-strict=FALSE in SourceSetupCallback.
   // curl is kept as a LOWER-ranked fallback in case soup is unavailable.
-  GstPluginFeature* curl_feature = gst_registry_lookup_feature(registry, "curlhttpsrc");
-  GstPluginFeature* soup_feature = gst_registry_lookup_feature(registry, "souphttpsrc");
+  GstPluginFeature* curl_feature =
+      gst_registry_lookup_feature(registry, "curlhttpsrc");
+  GstPluginFeature* soup_feature =
+      gst_registry_lookup_feature(registry, "souphttpsrc");
   if (soup_feature) {
     gst_plugin_feature_set_rank(soup_feature, GST_RANK_PRIMARY + 300);
     gst_object_unref(soup_feature);
@@ -1171,7 +1191,8 @@ bool GstVideoPlayer::CreatePipeline() {
   }
 
   // Prefer hardware H.264 decode on the Pi.
-  GstPluginFeature* v4l2_h264 = gst_registry_lookup_feature(registry, "v4l2h264dec");
+  GstPluginFeature* v4l2_h264 =
+      gst_registry_lookup_feature(registry, "v4l2h264dec");
   if (v4l2_h264) {
     gst_plugin_feature_set_rank(v4l2_h264, GST_RANK_PRIMARY + 300);
     gst_object_unref(v4l2_h264);
@@ -1189,20 +1210,22 @@ bool GstVideoPlayer::CreatePipeline() {
     return false;
   }
 
-  g_signal_connect(gst_.playbin, "source-setup", G_CALLBACK(SourceSetupCallback), this);
+  g_signal_connect(gst_.playbin, "source-setup",
+                   G_CALLBACK(SourceSetupCallback), this);
 
   // ABR engine: catch hlsdemux as soon as decodebin creates it so the
   // throughput probe and connection-speed steering can attach to it.
   g_signal_connect(gst_.pipeline, "deep-element-added",
                    G_CALLBACK(DeepElementAddedHandler), this);
 
-  // Video converter: prefer v4l2convert (hardware-accelerated) with RGBA output,
-  // fall back to software videoconvert if unavailable. The HW ISP does BOTH
-  // colour conversion (NV12->RGBA) and scaling, which is what lets us pin a
-  // fixed output geometry below and survive ABR rendition switches.
+  // Video converter: prefer v4l2convert (hardware-accelerated) with RGBA
+  // output, fall back to software videoconvert if unavailable. The HW ISP does
+  // BOTH colour conversion (NV12->RGBA) and scaling, which is what lets us pin
+  // a fixed output geometry below and survive ABR rendition switches.
   gst_.video_convert = gst_element_factory_make("v4l2convert", "videoconvert");
   if (!gst_.video_convert) {
-    gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
+    gst_.video_convert =
+        gst_element_factory_make("videoconvert", "videoconvert");
   }
   if (!gst_.video_convert) {
     std::cerr << "Failed to create videoconvert" << std::endl;
@@ -1220,15 +1243,11 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to create video queue" << std::endl;
     return false;
   }
-  // Limit the queue size to prevent buffer accumulation after the hardware decoder,
-  // which otherwise exhausts the Raspberry Pi's CMA (Contiguous Memory Allocator)
-  // and floods the kernel with 'swiotlb buffer is full' errors.
-  g_object_set(G_OBJECT(video_queue),
-               "max-size-buffers", (guint)5,
-               "max-size-bytes",   (guint)0,
-               "max-size-time",    (guint64)0,
-               NULL);
-
+  // Limit the queue size to prevent buffer accumulation after the hardware
+  // decoder, which otherwise exhausts the Raspberry Pi's CMA (Contiguous Memory
+  // Allocator) and floods the kernel with 'swiotlb buffer is full' errors.
+  g_object_set(G_OBJECT(video_queue), "max-size-buffers", (guint)5,
+               "max-size-bytes", (guint)0, "max-size-time", (guint64)0, NULL);
 
   gst_.output = gst_bin_new("output");
   if (!gst_.output) {
@@ -1277,10 +1296,8 @@ bool GstVideoPlayer::CreatePipeline() {
   // The gold-standard approach is manual pipeline-clock control (stall
   // both audio and video together so there's nothing to catch up to) —
   // see [[gold-standard-playback-roadmap]].
-  g_object_set(G_OBJECT(gst_.video_sink),
-               "sync", TRUE,
-               "qos", TRUE,
-               "max-lateness", (gint64)(-1),   // disabled during preroll
+  g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", TRUE,
+               "max-lateness", (gint64)(-1),  // disabled during preroll
                NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
@@ -1289,10 +1306,10 @@ bool GstVideoPlayer::CreatePipeline() {
   // queue -> v4l2convert -> video/x-raw,format=RGBA,1920x1080 -> fakesink
   //
   // SEAMLESS ABR SWITCHING (fix8-ABR): pin the converter's OUTPUT geometry to a
-  // FIXED size and let the HW ISP scale whatever the decoder produces up/down to
-  // it. This mirrors how phones/TVs/browsers switch renditions without a hitch:
-  // the display surface is a constant size and the scaler absorbs the input
-  // resolution change.
+  // FIXED size and let the HW ISP scale whatever the decoder produces up/down
+  // to it. This mirrors how phones/TVs/browsers switch renditions without a
+  // hitch: the display surface is a constant size and the scaler absorbs the
+  // input resolution change.
   //
   // Why the FIXED output prevents the S_FMT crash on down-switch: previously
   // the output caps constrained only the format (RGBA), so the output
@@ -1335,9 +1352,10 @@ bool GstVideoPlayer::CreatePipeline() {
     std::cerr << "Failed to link queue to videoconvert" << std::endl;
     return false;
   }
-  auto* caps = gst_caps_from_string(
-      "video/x-raw,format=RGBA,width=1920,height=1080");
-  auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
+  auto* caps =
+      gst_caps_from_string("video/x-raw,format=RGBA,width=1920,height=1080");
+  auto link_ok =
+      gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
   gst_caps_unref(caps);
   if (!link_ok) {
     std::cerr << "Failed to link videoconvert to fakesink" << std::endl;
@@ -1367,11 +1385,11 @@ bool GstVideoPlayer::CreatePipeline() {
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
 
-  const gint GST_PLAY_FLAG_VIDEO        = 0x00000001;
-  const gint GST_PLAY_FLAG_AUDIO        = 0x00000002;
-  const gint GST_PLAY_FLAG_TEXT         = 0x00000004;
+  const gint GST_PLAY_FLAG_VIDEO = 0x00000001;
+  const gint GST_PLAY_FLAG_AUDIO = 0x00000002;
+  const gint GST_PLAY_FLAG_TEXT = 0x00000004;
   const gint GST_PLAY_FLAG_NATIVE_VIDEO = 0x00000800;
-  const gint GST_PLAY_FLAG_BUFFERING    = 0x00000080;
+  const gint GST_PLAY_FLAG_BUFFERING = 0x00000080;
 
   gint flags = GST_PLAY_FLAG_VIDEO | GST_PLAY_FLAG_AUDIO |
                GST_PLAY_FLAG_NATIVE_VIDEO | GST_PLAY_FLAG_BUFFERING;
@@ -1406,11 +1424,9 @@ bool GstVideoPlayer::CreatePipeline() {
               << "kbps (instead of default " << kColdStartConnSpeedKbps
               << "kbps)" << std::endl;
   }
-  g_object_set(gst_.playbin,
-               "buffer-size",     (gint)10485760,         // 10 MiB
-               "buffer-duration", kBufferTargetNs,        // 60 s (task #60)
-               "connection-speed", cold_start_kbps,
-               NULL);
+  g_object_set(gst_.playbin, "buffer-size", (gint)10485760,  // 10 MiB
+               "buffer-duration", kBufferTargetNs,           // 60 s (task #60)
+               "connection-speed", cold_start_kbps, NULL);
 
   // Audio: audioconvert -> audioresample -> volume -> alsasink
   // (HDMI auto-detected). Explicit alsasink is required because Buildroot
@@ -1422,11 +1438,12 @@ bool GstVideoPlayer::CreatePipeline() {
   // "No volume control found / Volume/mute is not available" on start),
   // so driving mute on this element is the only mute path that actually
   // silences audio.
-  GstElement* audio_bin  = gst_bin_new("audio_bin");
-  GstElement* conv       = gst_element_factory_make("audioconvert",  "audio_convert");
-  GstElement* resample   = gst_element_factory_make("audioresample", "audio_resample");
-  GstElement* volume     = gst_element_factory_make("volume",        "audio_volume");
-  GstElement* audio_sink = gst_element_factory_make("alsasink",      "audio_alsa");
+  GstElement* audio_bin = gst_bin_new("audio_bin");
+  GstElement* conv = gst_element_factory_make("audioconvert", "audio_convert");
+  GstElement* resample =
+      gst_element_factory_make("audioresample", "audio_resample");
+  GstElement* volume = gst_element_factory_make("volume", "audio_volume");
+  GstElement* audio_sink = gst_element_factory_make("alsasink", "audio_alsa");
 
   if (!audio_bin || !conv || !resample || !volume || !audio_sink) {
     std::cerr << "CreatePipeline: Failed to create audio elements" << std::endl;
@@ -1445,12 +1462,12 @@ bool GstVideoPlayer::CreatePipeline() {
     // robust default for Pi-class devices; adds ~400 ms audio-branch latency
     // which is imperceptible for live TV (no interactivity beyond channel
     // changes, which rebuild the pipeline anyway).
-    g_object_set(audio_sink,
-                 "latency-time", (gint64)100000,   // 100 ms
-                 "buffer-time",  (gint64)500000,   // 500 ms
+    g_object_set(audio_sink, "latency-time", (gint64)100000,  // 100 ms
+                 "buffer-time", (gint64)500000,               // 500 ms
                  NULL);
 
-    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, volume, audio_sink, NULL);
+    gst_bin_add_many(GST_BIN(audio_bin), conv, resample, volume, audio_sink,
+                     NULL);
     if (!gst_element_link(conv, resample) ||
         !gst_element_link(resample, volume) ||
         !gst_element_link(volume, audio_sink)) {
@@ -1462,7 +1479,8 @@ bool GstVideoPlayer::CreatePipeline() {
       gst_element_add_pad(audio_bin, ghost_apad);
       gst_object_unref(apad);
       g_object_set(gst_.playbin, "audio-sink", audio_bin, NULL);
-      audio_volume_ = volume;  // ref held via bin ownership; cleared in DestroyPipeline
+      audio_volume_ =
+          volume;  // ref held via bin ownership; cleared in DestroyPipeline
     }
   }
 
@@ -1484,8 +1502,9 @@ bool GstVideoPlayer::Preroll() {
   // so EOS handling never treats a live stream as "completed".
   if (result == GST_STATE_CHANGE_NO_PREROLL) {
     is_live_ = true;
-    std::cout << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
-              << std::endl;
+    std::cout
+        << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
+        << std::endl;
   }
   // Give GStreamer up to 5 s to settle before Init() advances to PLAYING.
   GstState state;
@@ -1636,8 +1655,7 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
       if (width > 0 && height > 0)
         self->pixels_.reset(new uint32_t[width * height]);
     }
-    if (self->gst_.buffer)
-      gst_buffer_unref(self->gst_.buffer);
+    if (self->gst_.buffer) gst_buffer_unref(self->gst_.buffer);
     self->gst_.buffer = gst_buffer_ref(buf);
   }
 
@@ -1649,11 +1667,11 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   // rationale. See CreatePipeline() comment for the full story.
   if (!self->first_frame_ready_.exchange(true)) {
     self->LogPlaybackStartup(
-        "first_frame", "width=" + std::to_string(width) +
-                           " height=" + std::to_string(height));
+        "first_frame",
+        "width=" + std::to_string(width) + " height=" + std::to_string(height));
     if (self->gst_.video_sink) {
-      g_object_set(G_OBJECT(self->gst_.video_sink),
-                   "max-lateness", (gint64)(500 * GST_MSECOND), NULL);
+      g_object_set(G_OBJECT(self->gst_.video_sink), "max-lateness",
+                   (gint64)(500 * GST_MSECOND), NULL);
       std::cout << "MAX-LATENESS: engaged 500ms after first-frame delivery"
                 << std::endl;
     }
@@ -1671,8 +1689,8 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
     // returned before this frame arrived, so we must unmute here or audio
     // stays silent for the rest of the session.
     if (self->audio_volume_) {
-      g_object_set(self->audio_volume_, "mute",
-                   self->mute_ ? TRUE : FALSE, NULL);
+      g_object_set(self->audio_volume_, "mute", self->mute_ ? TRUE : FALSE,
+                   NULL);
     }
   }
 
@@ -1682,7 +1700,6 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
 
   self->stream_handler_->OnNotifyFrameDecoded();
 }
-
 
 void GstVideoPlayer::LogPlaybackHealth(
     GstState state, uint64_t frames, std::chrono::steady_clock::time_point now,
@@ -1694,14 +1711,16 @@ void GstVideoPlayer::LogPlaybackHealth(
   // Buffered Until: 140 sec
   // Buffer Health: 20 sec
   // Network Throughput: 3500 kbps
-  // Actual measured throughput: throughput = segment_size_bytes / download_time_seconds
+  // Actual measured throughput: throughput = segment_size_bytes /
+  // download_time_seconds
 
   gint64 position = 0;
-  const bool has_position = gst_element_query_position(
-      gst_.pipeline, GST_FORMAT_TIME, &position);
-  const double position_secs = has_position
-      ? static_cast<double>(position) / static_cast<double>(GST_SECOND)
-      : -1.0;
+  const bool has_position =
+      gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position);
+  const double position_secs =
+      has_position
+          ? static_cast<double>(position) / static_cast<double>(GST_SECOND)
+          : -1.0;
 
   const int pct = last_buffering_percent_.load();
   double buffered_until_secs = -1.0;
@@ -1717,8 +1736,8 @@ void GstVideoPlayer::LogPlaybackHealth(
     gst_query_parse_buffering_range(query, &format, &start, &stop,
                                     &estimated_total);
     if (format == GST_FORMAT_TIME && has_position && stop >= position) {
-      buffered_until_secs = static_cast<double>(stop) /
-                            static_cast<double>(GST_SECOND);
+      buffered_until_secs =
+          static_cast<double>(stop) / static_cast<double>(GST_SECOND);
       buffer_health_secs = static_cast<double>(stop - position) /
                            static_cast<double>(GST_SECOND);
       used_estimate = false;
@@ -1741,8 +1760,10 @@ void GstVideoPlayer::LogPlaybackHealth(
     last_segment_bps = last_segment_throughput_bps_;
   }
 
-  const auto no_frame_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      now - last_frame_time).count();
+  const auto no_frame_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                            last_frame_time)
+          .count();
 
   std::cout << "HEALTH: state=" << gst_element_state_get_name(state)
             << " Current Position: ";
@@ -1775,14 +1796,14 @@ void GstVideoPlayer::LogPlaybackHealth(
   }
 
   std::cout << " Target Buffer: " << static_cast<int>(kBufferTargetSecs)
-            << " sec Frames: " << frames
-            << " No Frame For: " << no_frame_ms << " ms";
+            << " sec Frames: " << frames << " No Frame For: " << no_frame_ms
+            << " ms";
 
   if (last_segment_bytes > 0 && last_segment_secs > 0.0) {
     std::cout << " Network Throughput: "
               << static_cast<int>(last_segment_bps / 1000.0) << " kbps"
-              << " (segment=" << last_segment_bytes << "B/"
-              << last_segment_secs << "s)";
+              << " (segment=" << last_segment_bytes << "B/" << last_segment_secs
+              << "s)";
   } else {
     std::cout << " Network Throughput: unknown";
   }
@@ -1803,8 +1824,8 @@ void GstVideoPlayer::LogPlaybackHealth(
       prev_buffer_health_secs_ - buffer_health_secs >= 5.0) {
     // The delta itself is worth flagging even without more state.
     std::cout << "BUFFER-COLLAPSE: dropped from "
-              << static_cast<int>(prev_buffer_health_secs_)
-              << "s to " << static_cast<int>(buffer_health_secs)
+              << static_cast<int>(prev_buffer_health_secs_) << "s to "
+              << static_cast<int>(buffer_health_secs)
               << "s in one tick; pos=" << static_cast<int>(position_secs)
               << "s pct=" << pct
               << "% state=" << gst_element_state_get_name(state) << std::endl;
@@ -1847,8 +1868,8 @@ void GstVideoPlayer::LogPlaybackHealth(
 }
 
 void GstVideoPlayer::PushBusMsgRing(const std::string& type,
-                                     const std::string& src_name,
-                                     const std::string& extra) {
+                                    const std::string& src_name,
+                                    const std::string& extra) {
   std::lock_guard<std::mutex> lock(bus_msg_ring_mutex_);
   bus_msg_ring_.push_back(
       {std::chrono::steady_clock::now(), type, src_name, extra});
@@ -1874,8 +1895,9 @@ void GstVideoPlayer::DumpBusMsgRing() {
             << " bus messages (most recent first):" << std::endl;
   // Print newest-first so the collapse trigger is on the first line.
   for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) {
-    const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - it->when).count();
+    const auto age_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - it->when)
+            .count();
     std::cout << "BUS-RING:   -" << age_ms << "ms " << it->type
               << " src=" << it->src_name;
     if (!it->extra.empty()) std::cout << " " << it->extra;
@@ -1912,7 +1934,8 @@ bool GstVideoPlayer::TryFlushRecovery() {
   if (!gst_.pipeline) return false;
 
   std::cout << "FLUSH-RECOVERY: cycling PAUSED -> PLAYING to unblock stuck "
-               "playback" << std::endl;
+               "playback"
+            << std::endl;
 
   // Move to PAUSED. If the pipeline was truly stuck, downstream elements will
   // flush their internal state during this transition.
@@ -1935,7 +1958,7 @@ bool GstVideoPlayer::TryFlushRecovery() {
 }
 
 void GstVideoPlayer::StartWatchdog() {
-  if (watchdog_running_.exchange(true)) return; // already running
+  if (watchdog_running_.exchange(true)) return;  // already running
   {
     std::lock_guard<std::mutex> lock(watchdog_mutex_);
     last_buffering_progress_time_ = std::chrono::steady_clock::now();
@@ -1948,10 +1971,12 @@ void GstVideoPlayer::StartWatchdog() {
     // the intermediate flush-recovery at 8 s has never resumed frames on
     // device (device logs 2026-08-03), so there is no benefit to waiting past
     // the flush-recovery window before triggering the full reconnect.
-    constexpr int kFrameStallTimeoutSecs = 10;  // PLAYING but no frame this long
+    constexpr int kFrameStallTimeoutSecs =
+        10;  // PLAYING but no frame this long
 
     // Frame-arrival baseline. Locals: touched only by this thread.
-    uint64_t last_seen_frames = frames_handed_off_.load(std::memory_order_relaxed);
+    uint64_t last_seen_frames =
+        frames_handed_off_.load(std::memory_order_relaxed);
     auto last_frame_advance_time = std::chrono::steady_clock::now();
     // Set once the pipeline reaches PLAYING at least once. Gates the state-
     // agnostic wedge escalation below — during initial preroll the pipeline
@@ -1972,28 +1997,33 @@ void GstVideoPlayer::StartWatchdog() {
       const int pct = last_buffering_percent_.load();
 
       // --- Check 1 (DIAGNOSTIC ONLY — no longer reconnects): buffer-% plateau.
-      // A LIVE stream sitting at the live edge legitimately plateaus below 100%:
-      // the cache-target (e.g. 30s) is unsatisfiable because no segments beyond
-      // the live edge exist yet, so buffering messages just stop at ~91% with no
-      // % change. That is NOT a stall while frames keep arriving. Firing a full
-      // re-init here tore down healthy streams — device log 2026-06-22 showed 7
-      // reconnects, ALL buffer-% fires at 91-96%, with ZERO frame-arrival stalls
-      // (grep -c "no video frame" = 0). Genuine starvation that actually freezes
-      // playback is caught by the frame-arrival check below (Check 2), which is
-      // the ground truth. So: log and FALL THROUGH — do not break, do not
-      // re-baseline Check 2 (a live-edge plateau keeps the pipeline PLAYING and
-      // frames flowing, so Check 2 stays silent on its own). ---
+      // A LIVE stream sitting at the live edge legitimately plateaus below
+      // 100%: the cache-target (e.g. 30s) is unsatisfiable because no segments
+      // beyond the live edge exist yet, so buffering messages just stop at ~91%
+      // with no % change. That is NOT a stall while frames keep arriving.
+      // Firing a full re-init here tore down healthy streams — device log
+      // 2026-06-22 showed 7 reconnects, ALL buffer-% fires at 91-96%, with ZERO
+      // frame-arrival stalls (grep -c "no video frame" = 0). Genuine starvation
+      // that actually freezes playback is caught by the frame-arrival check
+      // below (Check 2), which is the ground truth. So: log and FALL THROUGH —
+      // do not break, do not re-baseline Check 2 (a live-edge plateau keeps the
+      // pipeline PLAYING and frames flowing, so Check 2 stays silent on its
+      // own). ---
       if (pct >= 0 && pct < 100 && play_state_requested_.load()) {
         auto stalled_secs = std::chrono::duration_cast<std::chrono::seconds>(
-            now - progress_snap).count();
+                                now - progress_snap)
+                                .count();
         if (stalled_secs >= kFrameStallTimeoutSecs) {
           std::cout << "WATCHDOG: buffer=" << pct << "% no %-change for "
-                    << stalled_secs << "s (diagnostic; not fatal — frame-arrival "
-                       "governs reconnect)" << std::endl;
+                    << stalled_secs
+                    << "s (diagnostic; not fatal — frame-arrival "
+                       "governs reconnect)"
+                    << std::endl;
         }
       }
 
-      // --- Check 2: Playback frozen (pipeline is PLAYING but no video frame advances) ---
+      // --- Check 2: Playback frozen (pipeline is PLAYING but no video frame
+      // advances) ---
       if (!gst_.pipeline) continue;  // safe: StopWatchdog joins before teardown
       GstState state = GST_STATE_VOID_PENDING;
       gst_element_get_state(gst_.pipeline, &state, nullptr, 0);
@@ -2018,13 +2048,14 @@ void GstVideoPlayer::StartWatchdog() {
         if (has_reached_playing && play_state_requested_.load()) {
           LogPlaybackHealth(state, frames, now, last_frame_advance_time);
           auto wedged_secs = std::chrono::duration_cast<std::chrono::seconds>(
-              now - last_frame_advance_time).count();
+                                 now - last_frame_advance_time)
+                                 .count();
           if (wedged_secs >= kFrameStallTimeoutSecs) {
             std::string msg = "Playback wedged: play requested but state=" +
                               std::string(gst_element_state_get_name(state)) +
                               " for " + std::to_string(wedged_secs) + "s";
-            std::cout << "WATCHDOG: " << msg << " — notifying Flutter to re-init"
-                      << std::endl;
+            std::cout << "WATCHDOG: " << msg
+                      << " — notifying Flutter to re-init" << std::endl;
             DumpKernelFreezeDiagnostic();
             watchdog_running_.store(false);
             // Emit unconditionally (task #61) — see the "Playback frozen"
@@ -2058,7 +2089,8 @@ void GstVideoPlayer::StartWatchdog() {
 
       LogPlaybackHealth(state, frames, now, last_frame_advance_time);
       auto frozen_secs = std::chrono::duration_cast<std::chrono::seconds>(
-          now - last_frame_advance_time).count();
+                             now - last_frame_advance_time)
+                             .count();
       if (frozen_secs > 0) {
         std::cout << "WATCHDOG: PLAYING but no video frame for " << frozen_secs
                   << "s" << std::endl;
@@ -2160,8 +2192,8 @@ namespace {
 // connection-speed is guint (kbps) on adaptivedemux-based hlsdemux but
 // guint64 on playbin — set it through GValue so the type always matches.
 void SetConnectionSpeedKbps(GstElement* element, guint64 kbps) {
-  GParamSpec* pspec = g_object_class_find_property(
-      G_OBJECT_GET_CLASS(element), "connection-speed");
+  GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(element),
+                                                   "connection-speed");
   if (!pspec) return;
   GValue v = G_VALUE_INIT;
   g_value_init(&v, pspec->value_type);
@@ -2186,11 +2218,11 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
   gchar* name = gst_element_get_name(element);
   if (name && g_str_has_prefix(name, "hlsdemux")) {
-    // Keep a ref for the ABR engine (connection-speed actuation). The throughput
-    // probe does NOT go here: hlsdemux's sink pad only carries the periodic
-    // manifest/playlist (a few KB) — the media segments are fetched by the
-    // demux's internal source and never cross this pad, so a probe here never
-    // measures a real segment (throughput read as "unknown").
+    // Keep a ref for the ABR engine (connection-speed actuation). The
+    // throughput probe does NOT go here: hlsdemux's sink pad only carries the
+    // periodic manifest/playlist (a few KB) — the media segments are fetched by
+    // the demux's internal source and never cross this pad, so a probe here
+    // never measures a real segment (throughput read as "unknown").
     {
       std::lock_guard<std::mutex> lock(self->abr_mutex_);
       if (self->hls_demux_) gst_object_unref(self->hls_demux_);
@@ -2214,8 +2246,9 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
     GObjectClass* klass = G_OBJECT_GET_CLASS(element);
     if (g_object_class_find_property(klass, "bitrate-limit")) {
       g_object_set(element, "bitrate-limit", 1.0f, NULL);
-      std::cout << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
-                << std::endl;
+      std::cout
+          << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
+          << std::endl;
     }
   } else if (name && (g_str_has_prefix(name, "souphttpsrc") ||
                       g_str_has_prefix(name, "curlhttpsrc"))) {
@@ -2223,8 +2256,8 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
     // per-segment throughput (size / download-time).
     GstPad* srcpad = gst_element_get_static_pad(element, "src");
     if (srcpad) {
-      gst_pad_add_probe(srcpad, GST_PAD_PROBE_TYPE_BUFFER,
-                        AbrThroughputProbe, self, NULL);
+      gst_pad_add_probe(srcpad, GST_PAD_PROBE_TYPE_BUFFER, AbrThroughputProbe,
+                        self, NULL);
       gst_object_unref(srcpad);
       std::cout << "ABR: attached throughput probe to source: " << name
                 << std::endl;
@@ -2238,11 +2271,10 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
     // cushion (device log 2026-07-31 09:37 saw pct stuck at ~17 for 25 s
     // on a >4 Mbps average link). Widen the limits to 60 s / 20 MB and
     // remove the buffer-count cap so time/bytes govern instead.
-    g_object_set(G_OBJECT(element),
-                 "max-size-buffers", (guint)0,          // unlimited count
-                 "max-size-bytes",   (guint)(20 * 1024 * 1024),
-                 "max-size-time",    (guint64)(60 * GST_SECOND),
-                 NULL);
+    g_object_set(G_OBJECT(element), "max-size-buffers",
+                 (guint)0,  // unlimited count
+                 "max-size-bytes", (guint)(20 * 1024 * 1024), "max-size-time",
+                 (guint64)(60 * GST_SECOND), NULL);
     std::cout << "MULTIQUEUE: widened limits on " << name
               << " (time=60s bytes=20MB buffers=unlimited)" << std::endl;
   }
@@ -2260,8 +2292,8 @@ GstPadProbeReturn GstVideoPlayer::AbrThroughputProbe(GstPad* /*pad*/,
   const gsize size = gst_buffer_get_size(buf);
   const auto now = std::chrono::steady_clock::now();
   if (!self->first_network_chunk_logged_.exchange(true)) {
-    self->LogPlaybackStartup(
-        "first_hls_network_chunk", "bytes=" + std::to_string(size));
+    self->LogPlaybackStartup("first_hls_network_chunk",
+                             "bytes=" + std::to_string(size));
   }
 
   // Bump the monotonic total FIRST, outside the mutex. The preroll gate reads
@@ -2289,7 +2321,8 @@ void GstVideoPlayer::CloseBurstLocked() {
   // Skip playlist refreshes and degenerate timings — only segment-sized
   // transfers measured over a meaningful window are useful samples.
   if (burst_bytes_ >= 64 * 1024 && secs > 0.05) {
-    const double throughput_bps = static_cast<double>(burst_bytes_) * 8.0 / secs;
+    const double throughput_bps =
+        static_cast<double>(burst_bytes_) * 8.0 / secs;
     last_segment_bytes_ = burst_bytes_;
     last_segment_download_secs_ = secs;
     last_segment_throughput_bps_ = throughput_bps;
@@ -2299,14 +2332,15 @@ void GstVideoPlayer::CloseBurstLocked() {
     std::cout << "NETWORK: Actual measured throughput: throughput = "
               << burst_bytes_ << " bytes / " << secs << " seconds"
               << " = "
-              << static_cast<int>((static_cast<double>(burst_bytes_) / secs) / 1024.0)
+              << static_cast<int>((static_cast<double>(burst_bytes_) / secs) /
+                                  1024.0)
               << " KB/s (" << static_cast<int>(throughput_bps / 1000.0)
               << " kbps)" << std::endl;
     if (!first_http_burst_logged_.exchange(true)) {
       LogPlaybackStartup(
           "first_http_burst_complete",
-          "bytes=" + std::to_string(burst_bytes_) +
-              " downloadMs=" + std::to_string(static_cast<int64_t>(secs * 1000.0)));
+          "bytes=" + std::to_string(burst_bytes_) + " downloadMs=" +
+              std::to_string(static_cast<int64_t>(secs * 1000.0)));
     }
   }
   burst_bytes_ = 0;
@@ -2398,8 +2432,8 @@ void GstVideoPlayer::AbrTick() {
 
   // --- Buffer health (percent of the kBufferTargetSecs buffering target) ---
   const int pct = last_buffering_percent_.load();
-  const double buffer_secs = pct < 0 ? 20.0 :
-      (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
+  const double buffer_secs =
+      pct < 0 ? 20.0 : (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
 
   // Scaled alongside kBufferTargetSecs 30 -> 60 (task #60). Emergency zone
   // now 0-12 s (was 0-6), cautious 12-30 (was 6-15), comfortable >= 30
@@ -2413,8 +2447,7 @@ void GstVideoPlayer::AbrTick() {
     safety = 0.85;  // comfortable: ride quality close to the estimate
   }
 
-  guint64 target_kbps =
-      static_cast<guint64>(predicted_bps * safety / 1000.0);
+  guint64 target_kbps = static_cast<guint64>(predicted_bps * safety / 1000.0);
   if (target_kbps < 100) target_kbps = 100;  // keep the lowest rung reachable
 
   // --- Anti-flap policy (buffer-aware) ---
@@ -2447,7 +2480,8 @@ void GstVideoPlayer::AbrTick() {
       abr_last_frame_advance_time_.time_since_epoch().count() == 0
           ? kStaleFramesUnknownMs
           : std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - abr_last_frame_advance_time_).count();
+                now - abr_last_frame_advance_time_)
+                .count();
 
   // Calm-mode global cooldown (task #46, 2026-08-17). After ANY ABR decision,
   // block the next decision for kPostAbrDecisionCooldownSecs. Buffer-emergency
@@ -2485,8 +2519,9 @@ void GstVideoPlayer::AbrTick() {
     // ABR_RESTART is warranted (watchdog would fire at 10 s anyway).
     if (frames_stale_ms < 2000) {
       std::cout << "ABR: buffer emergency deferred — frames advancing "
-                << "(no_frame_ms=" << frames_stale_ms << ", buffer="
-                << static_cast<int>(buffer_secs) << "s)" << std::endl;
+                << "(no_frame_ms=" << frames_stale_ms
+                << ", buffer=" << static_cast<int>(buffer_secs) << "s)"
+                << std::endl;
       abr_drop_ticks_ = 0;
       abr_undershoot_ticks_ = 0;
       abr_trapped_ticks_ = 0;
@@ -2522,12 +2557,13 @@ void GstVideoPlayer::AbrTick() {
       last_downswitch_time_ = now;
     } else {
       std::cout << "ABR: drop deferred (" << abr_drop_ticks_ << "/"
-                << kSustainedDropTicks << ") buffer="
-                << static_cast<int>(buffer_secs) << "s cv="
-                << static_cast<int>(cv * 100) << "%" << std::endl;
+                << kSustainedDropTicks
+                << ") buffer=" << static_cast<int>(buffer_secs)
+                << "s cv=" << static_cast<int>(cv * 100) << "%" << std::endl;
     }
-  } else if (predicted_bps / 1000.0 < static_cast<double>(published_kbps_) * 0.7
-             && buffer_secs < kHealthyBufferSecs) {
+  } else if (predicted_bps / 1000.0 <
+                 static_cast<double>(published_kbps_) * 0.7 &&
+             buffer_secs < kHealthyBufferSecs) {
     // Sustained-undershoot down-switch (task #46 tightened). Two gates:
     //   1. Predicted must be at least 30% below published (was any-below).
     //      A 5% dip on a jittery cv=90% link is noise; only a meaningful
@@ -2560,10 +2596,11 @@ void GstVideoPlayer::AbrTick() {
       last_downswitch_time_ = now;
     } else {
       std::cout << "ABR: undershoot (" << abr_undershoot_ticks_ << "/"
-                << kSustainedUndershootTicks << ") predicted="
-                << static_cast<int>(predicted_bps / 1000) << "kbps published="
-                << published_kbps_ << "kbps buffer="
-                << static_cast<int>(buffer_secs) << "s" << std::endl;
+                << kSustainedUndershootTicks
+                << ") predicted=" << static_cast<int>(predicted_bps / 1000)
+                << "kbps published=" << published_kbps_
+                << "kbps buffer=" << static_cast<int>(buffer_secs) << "s"
+                << std::endl;
     }
   } else {
     // No drop and predicted meets or exceeds 70% of published — reset drop
@@ -2591,10 +2628,11 @@ void GstVideoPlayer::AbrTick() {
         last_upswitch_time_ = now;
       } else {
         std::cout << "ABR: trapped (" << abr_trapped_ticks_ << "/"
-                  << kTrappedRateTicks << ") predicted="
-                  << static_cast<int>(predicted_bps / 1000) << "kbps published="
-                  << published_kbps_ << "kbps buffer="
-                  << static_cast<int>(buffer_secs) << "s" << std::endl;
+                  << kTrappedRateTicks
+                  << ") predicted=" << static_cast<int>(predicted_bps / 1000)
+                  << "kbps published=" << published_kbps_
+                  << "kbps buffer=" << static_cast<int>(buffer_secs) << "s"
+                  << std::endl;
       }
     } else {
       abr_trapped_ticks_ = 0;
@@ -2624,26 +2662,24 @@ void GstVideoPlayer::AbrTick() {
     // fired an up-switch at cv=87% and crashed inside libc/libstdc++
     // during the in-place variant switch. cv=60% is the ceiling.
     const bool cv_stable_enough = cv <= kUpSwitchMaxCv;
-    if (!publish &&
-        target_kbps * 4 >= published_kbps_ * 5 &&
-        buffer_secs >= kHealthyBufferSecs &&
-        (up_dwell_served || big_jump_up) &&
-        post_down_dwell_served &&
-        cv_stable_enough) {
-      publish = true;  // >=25% headroom, healthy buffer, dwell served (or big jump), stable network
+    if (!publish && target_kbps * 4 >= published_kbps_ * 5 &&
+        buffer_secs >= kHealthyBufferSecs && (up_dwell_served || big_jump_up) &&
+        post_down_dwell_served && cv_stable_enough) {
+      publish = true;  // >=25% headroom, healthy buffer, dwell served (or big
+                       // jump), stable network
       reason = big_jump_up ? "up-switch (big jump)" : "up-switch";
       last_upswitch_time_ = now;
     } else if (!publish && !cv_stable_enough &&
                target_kbps * 4 >= published_kbps_ * 5 &&
                buffer_secs >= kHealthyBufferSecs &&
-               (up_dwell_served || big_jump_up) &&
-               post_down_dwell_served &&
+               (up_dwell_served || big_jump_up) && post_down_dwell_served &&
                ++abr_heartbeat_counter_ % 10 == 0) {
       std::cout << "ABR: up-switch deferred — cv=" << static_cast<int>(cv * 100)
                 << "% exceeds " << static_cast<int>(kUpSwitchMaxCv * 100)
-                << "% ceiling (target=" << target_kbps << "kbps published="
-                << published_kbps_ << "kbps buffer="
-                << static_cast<int>(buffer_secs) << "s)" << std::endl;
+                << "% ceiling (target=" << target_kbps
+                << "kbps published=" << published_kbps_
+                << "kbps buffer=" << static_cast<int>(buffer_secs) << "s)"
+                << std::endl;
     }
   }
 
@@ -2704,15 +2740,13 @@ void GstVideoPlayer::AbrTick() {
       const int64_t collapse_ns =
           last_buffer_collapse_ns_.load(std::memory_order_relaxed);
       if (collapse_ns > 0) {
-        const auto collapse_tp =
-            std::chrono::steady_clock::time_point(
-                std::chrono::nanoseconds(collapse_ns));
-        if (now - collapse_tp <
-            std::chrono::seconds(kPostCollapseQuietSecs)) {
+        const auto collapse_tp = std::chrono::steady_clock::time_point(
+            std::chrono::nanoseconds(collapse_ns));
+        if (now - collapse_tp < std::chrono::seconds(kPostCollapseQuietSecs)) {
           up_is_fragile = true;
           fragile_reason = fragile_reason.empty()
-              ? "recent buffer-collapse"
-              : fragile_reason + " + recent buffer-collapse";
+                               ? "recent buffer-collapse"
+                               : fragile_reason + " + recent buffer-collapse";
         }
       }
     }
@@ -2736,10 +2770,10 @@ void GstVideoPlayer::AbrTick() {
     const bool allow_abr_restart = is_live_;
 
     if (is_down_switch && allow_abr_restart) {
-      std::string msg = "ABR_RESTART: down-switch to " +
-                        std::to_string(target_kbps) + "kbps (" + reason +
-                        ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
-                        "s)";
+      std::string msg =
+          "ABR_RESTART: down-switch to " + std::to_string(target_kbps) +
+          "kbps (" + reason +
+          ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) + "s)";
       std::cout << "ABR: " << reason
                 << " — routing as ABR_RESTART instead of in-place S_FMT: "
                 << msg << std::endl;
@@ -2750,11 +2784,11 @@ void GstVideoPlayer::AbrTick() {
       }
     } else if (is_up_switch && up_is_fragile && allow_abr_restart) {
       // Task #46 fragile up-switch redirect (live-only after task #47).
-      std::string msg = "ABR_RESTART: up-switch to " +
-                        std::to_string(target_kbps) + "kbps (" + reason +
-                        ", fragile: " + fragile_reason +
-                        ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
-                        "s cv=" + std::to_string(static_cast<int>(cv * 100)) + "%)";
+      std::string msg =
+          "ABR_RESTART: up-switch to " + std::to_string(target_kbps) +
+          "kbps (" + reason + ", fragile: " + fragile_reason +
+          ", buffer=" + std::to_string(static_cast<int>(buffer_secs)) +
+          "s cv=" + std::to_string(static_cast<int>(cv * 100)) + "%)";
       std::cout << "ABR: " << reason
                 << " — routing as ABR_RESTART (fragile: " << fragile_reason
                 << "): " << msg << std::endl;
@@ -2770,17 +2804,17 @@ void GstVideoPlayer::AbrTick() {
       SetConnectionSpeedKbps(demux, target_kbps);
       std::cout << "ABR: " << reason << " — connection-speed=" << target_kbps
                 << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
-                << "kbps cv=" << static_cast<int>(cv * 100) << "% buffer="
-                << static_cast<int>(buffer_secs) << "s safety=" << safety << ")"
-                << (allow_abr_restart ? "" : " [VOD in-place]")
-                << std::endl;
+                << "kbps cv=" << static_cast<int>(cv * 100)
+                << "% buffer=" << static_cast<int>(buffer_secs)
+                << "s safety=" << safety << ")"
+                << (allow_abr_restart ? "" : " [VOD in-place]") << std::endl;
     }
   } else if (++abr_heartbeat_counter_ % 30 == 0) {
-    std::cout << "ABR: holding " << published_kbps_ << "kbps (predicted="
-              << static_cast<int>(predicted_bps / 1000) << "kbps cv="
-              << static_cast<int>(cv * 100) << "% buffer="
-              << static_cast<int>(buffer_secs) << "s samples=" << n << ")"
-              << std::endl;
+    std::cout << "ABR: holding " << published_kbps_
+              << "kbps (predicted=" << static_cast<int>(predicted_bps / 1000)
+              << "kbps cv=" << static_cast<int>(cv * 100)
+              << "% buffer=" << static_cast<int>(buffer_secs)
+              << "s samples=" << n << ")" << std::endl;
   }
 
   gst_object_unref(demux);
@@ -2799,8 +2833,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
     auto* outer_self = reinterpret_cast<GstVideoPlayer*>(user_data);
     const gchar* type_name = gst_message_type_get_name(msg_type);
     const gchar* src_name_c = GST_MESSAGE_SRC(message)
-        ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message))
-        : "(none)";
+                                  ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message))
+                                  : "(none)";
     std::string extra;
     if (msg_type == GST_MESSAGE_ELEMENT) {
       const GstStructure* s = gst_message_get_structure(message);
@@ -2809,14 +2843,15 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         if (struct_name) extra = std::string("name=") + struct_name;
       }
     } else if (msg_type == GST_MESSAGE_STATE_CHANGED &&
-               GST_MESSAGE_SRC(message) == GST_OBJECT(outer_self->gst_.pipeline)) {
+               GST_MESSAGE_SRC(message) ==
+                   GST_OBJECT(outer_self->gst_.pipeline)) {
       GstState old_s, new_s, pending_s;
       gst_message_parse_state_changed(message, &old_s, &new_s, &pending_s);
       extra = std::string(gst_element_state_get_name(old_s)) + "->" +
               gst_element_state_get_name(new_s);
     }
     outer_self->PushBusMsgRing(type_name ? type_name : "?",
-                                src_name_c ? src_name_c : "?", extra);
+                               src_name_c ? src_name_c : "?", extra);
   }
 
   switch (msg_type) {
@@ -2838,7 +2873,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       // frame-arrival watchdog. On VOD: complete normally.
       if (self->is_live_) {
         std::cout << "EOS on LIVE stream — ignoring (no completion/seek-0; "
-                     "frame-arrival watchdog handles a real stop)" << std::endl;
+                     "frame-arrival watchdog handles a real stop)"
+                  << std::endl;
         break;
       }
       std::lock_guard<std::mutex> lock(self->mutex_event_completed_);
@@ -2856,7 +2892,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         // Reset watchdog stall timer on any percent change (= buffer progress).
         {
           std::lock_guard<std::mutex> lock(self->watchdog_mutex_);
-          self->last_buffering_progress_time_ = std::chrono::steady_clock::now();
+          self->last_buffering_progress_time_ =
+              std::chrono::steady_clock::now();
         }
         self->watchdog_cv_.notify_one();
 
@@ -2886,8 +2923,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
         gst_message_parse_buffering_stats(message, &mode, &avg_in_bps,
                                           &avg_out_bps, &buffering_left_ms);
 
-        std::cout << "BUFFERING: " << percent << "% elapsed="
-                  << elapsed.count() << "s";
+        std::cout << "BUFFERING: " << percent << "% elapsed=" << elapsed.count()
+                  << "s";
         if (has_position) {
           std::cout << " pos=" << (position / GST_SECOND) << "s";
         }
@@ -2898,22 +2935,23 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
           std::cout << " eta=" << (buffering_left_ms / 1000) << "s";
         }
         std::cout << " cache-target=" << static_cast<int>(kBufferTargetSecs)
-                  << "s/10MiB from "
-                  << GST_MESSAGE_SRC_NAME(message) << std::endl;
+                  << "s/10MiB from " << GST_MESSAGE_SRC_NAME(message)
+                  << std::endl;
       }
       break;
     }
     case GST_MESSAGE_STATE_CHANGED: {
-      // Log pipeline-level state transitions only (element noise is too verbose).
+      // Log pipeline-level state transitions only (element noise is too
+      // verbose).
       auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
       if (GST_MESSAGE_SRC(message) == GST_OBJECT(self->gst_.pipeline)) {
         GstState old_s, new_s, pending;
         gst_message_parse_state_changed(message, &old_s, &new_s, &pending);
-        std::cout << "PIPELINE-STATE: "
-                  << gst_element_state_get_name(old_s) << " -> "
-                  << gst_element_state_get_name(new_s);
+        std::cout << "PIPELINE-STATE: " << gst_element_state_get_name(old_s)
+                  << " -> " << gst_element_state_get_name(new_s);
         if (pending != GST_STATE_VOID_PENDING) {
-          std::cout << " (pending " << gst_element_state_get_name(pending) << ")";
+          std::cout << " (pending " << gst_element_state_get_name(pending)
+                    << ")";
         }
         std::cout << std::endl;
       }
@@ -2923,9 +2961,10 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
-      std::string error_msg = error->message ? error->message : "unknown warning";
-      std::cout << "WARNING from " << GST_OBJECT_NAME(message->src)
-                << ": " << error_msg;
+      std::string error_msg =
+          error->message ? error->message : "unknown warning";
+      std::cout << "WARNING from " << GST_OBJECT_NAME(message->src) << ": "
+                << error_msg;
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
       if (IsHttpUnavailable(error, debug)) {
@@ -2942,8 +2981,8 @@ GstBusSyncReply GstVideoPlayer::HandleGstMessage(GstBus* bus,
       GError* error;
       gst_message_parse_error(message, &error, &debug);
       std::string error_msg = error->message ? error->message : "unknown error";
-      std::cout << "ERROR from " << GST_OBJECT_NAME(message->src)
-                << ": " << error_msg;
+      std::cout << "ERROR from " << GST_OBJECT_NAME(message->src) << ": "
+                << error_msg;
       if (debug && debug[0]) std::cout << "\n  debug: " << debug;
       std::cout << std::endl;
       if (IsHttpUnavailable(error, debug)) {
