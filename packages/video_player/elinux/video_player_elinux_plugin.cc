@@ -589,7 +589,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   // keeping Init() synchronous created the multi-second event-channel gap.
   player_entry->player->LogPlaybackStartup("plugin_init_call_started");
   player_entry->initialization_thread = std::thread(
-      [this, player_entry, texture_id]() {
+      [player_entry, texture_id]() {
         player_entry->player->LogPlaybackStartup("plugin_async_init_started");
         const bool ok = player_entry->player->Init();
         player_entry->player->LogPlaybackStartup(
