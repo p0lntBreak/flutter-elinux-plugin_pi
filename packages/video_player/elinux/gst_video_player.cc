@@ -780,8 +780,12 @@ bool GstVideoPlayer::SetVolume(double volume) {
     return false;
   }
 
+  volume = std::clamp(volume, 0.0, 1.0);
   volume_ = volume;
   g_object_set(gst_.playbin, "volume", volume, NULL);
+  if (audio_volume_) {
+    g_object_set(audio_volume_, "volume", volume, NULL);
+  }
   return true;
 }
 
