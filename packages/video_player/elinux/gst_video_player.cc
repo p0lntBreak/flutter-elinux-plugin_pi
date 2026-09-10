@@ -144,13 +144,11 @@ constexpr double kUpSwitchMaxCv = 0.60;
 // preferable to never-starting; the root fix is on a separate branch.
 constexpr guint64 kColdStartConnSpeedKbps = 1500;
 
-// Cold-start preroll target (seconds of buffered content required before Init()
-// returns success). Keep this short so the UI becomes ready quickly; the
-// multiqueue continues filling behind playback up to the 60 s cache target.
-// Deliberately no wall-clock cap on the preroll wait — a hard error (HTTP
-// timeout, EOS, pathological-preroll NETWORK_TOO_SLOW) ends it early;
-// otherwise the spinner waits as long as needed.
-constexpr double kColdStartPrerollSecs = 2.0;
+// Startup readiness is based on a decoded video frame, not a buffering
+// percentage. A live playbin queue can reach 100% while the decoder or video
+// sink is still unable to deliver a frame, so keep startup bounded by a real
+// frame-arrival deadline instead of waiting on queue state.
+constexpr int kFirstFrameStartupTimeoutSecs = 10;
 
 // Poll interval for the preroll wait. Fast enough to feel responsive on a good
 // link; slow enough not to spam gst_query_new_buffering().
@@ -495,13 +493,11 @@ bool GstVideoPlayer::Init() {
     return false;
   }
 
-  // Preroll gate (task #8a — YouTube-pattern cold start): wait for
-  // kColdStartPrerollSecs of *real* buffered content before returning to
+  // Startup gate: wait for a real decoded video frame before returning to
   // Flutter. The pipeline is technically PLAYING here (fakesink+sync=TRUE
-  // needs it so HandoffHandler can capture first-frame dimensions), but Init()
-  // stays blocked and the Dart side keeps the spinner up. No wall-clock cap —
-  // only a hard error breaks the wait early. Query logic mirrors
-  // LogPlaybackHealth() exactly so both agree on "how much is buffered."
+  // needs it so HandoffHandler can capture first-frame dimensions), but queue
+  // buffering is only diagnostic. A full queue does not prove that the decoder
+  // or video sink is making progress.
   {
     auto last_progress_log = std::chrono::steady_clock::now();
     double last_logged_secs = -1.0;
@@ -540,21 +536,37 @@ bool GstVideoPlayer::Init() {
 
       const int pct = last_buffering_percent_.load();
       if (used_estimate && pct >= 0) {
-        // Fallback: percent-derived estimate. Also treat pct>=100 as threshold
-        // met — some live sources never emit a valid TIME buffering-range but
-        // do drive buffering percent to 100 once the playbin queue is full.
+        // Fallback: percent-derived estimate for diagnostics only. It must not
+        // decide startup readiness because a full queue does not prove that a
+        // decoded frame reached the video sink.
         buffer_health_secs =
             (static_cast<double>(pct) / 100.0) * kBufferTargetSecs;
       }
 
-      if (buffer_health_secs >= kColdStartPrerollSecs || pct >= 100) {
-        std::cout << "PREROLL_WAIT: threshold met — buffered="
+      const auto now = std::chrono::steady_clock::now();
+      if (first_frame_ready_.load(std::memory_order_relaxed)) {
+        std::cout << "PREROLL_WAIT: first video frame arrived — buffered="
                   << static_cast<int>(buffer_health_secs) << "s pct=" << pct
                   << (used_estimate ? " (est)" : "") << std::endl;
         break;
       }
 
-      const auto now = std::chrono::steady_clock::now();
+      const auto startup_secs =
+          std::chrono::duration_cast<std::chrono::seconds>(now - preroll_start)
+              .count();
+      if (startup_secs >= kFirstFrameStartupTimeoutSecs) {
+        std::string msg =
+            "Startup timeout: no decoded video frame within " +
+            std::to_string(kFirstFrameStartupTimeoutSecs) + "s";
+        std::cerr << msg << std::endl;
+        bool expected = false;
+        if (error_notified_.compare_exchange_strong(expected, true)) {
+          last_error_ = msg;
+          stream_handler_->OnNotifyError(msg);
+        }
+        break;
+      }
+
       const auto since_log = std::chrono::duration_cast<std::chrono::seconds>(
                                  now - last_progress_log)
                                  .count();
@@ -569,8 +581,8 @@ bool GstVideoPlayer::Init() {
         std::cout << "PREROLL_WAIT: buffered="
                   << static_cast<int>(
                          buffer_health_secs >= 0.0 ? buffer_health_secs : 0.0)
-                  << "s/" << static_cast<int>(kColdStartPrerollSecs)
-                  << "s pct=" << pct << (used_estimate ? " (est)" : "")
+                  << "s waiting-for-first-frame pct=" << pct
+                  << (used_estimate ? " (est)" : "")
                   << std::endl;
         // Republish buffering percent so the Dart side has a pulse even on
         // sources whose BUFFERING messages are quiet between edges.
@@ -633,14 +645,15 @@ bool GstVideoPlayer::Init() {
     }
   }
   LogPlaybackStartup(
-      "startup_buffer_gate_completed",
-      "bufferPercent=" + std::to_string(last_buffering_percent_.load()));
+      "startup_frame_gate_completed",
+      "firstFrameReady=" +
+          std::string(first_frame_ready_.load() ? "true" : "false") +
+          " bufferPercent=" +
+          std::to_string(last_buffering_percent_.load()));
 
-  // Preroll aborted by a fatal bus error (e.g. HTTP 4xx, EOS on VOD manifest,
-  // souphttpsrc inactivity timeout). Bail before the first-frame wait so we
-  // don't sit another 5s on a dead pipeline. Audio is still muted here from
-  // the top of Init(); the pipeline is torn down immediately below so no
-  // audio can leak.
+  // Startup aborted by a fatal bus error or the first-frame timeout. Audio is
+  // still muted here from the top of Init(); the pipeline is torn down
+  // immediately below so no audio can leak.
   if (error_notified_.load()) {
     std::cerr << "Init: pipeline error during preroll — failing Init()"
               << std::endl;
@@ -648,11 +661,9 @@ bool GstVideoPlayer::Init() {
     return false;
   }
 
-  // Wait up to 5 s for HandoffHandler to deliver the first decoded frame, or
-  // for a fatal bus error (e.g. typefind failure) to arrive first. After the
-  // preroll gate above, the buffer is deep so this should almost always be
-  // near-instant; kept intact so the deferred-init path still exists for the
-  // corner case where a frame slips past the query.
+  // Keep the condition-variable wait as a race guard for a frame arriving
+  // between the polling check above and this point. In the normal path the
+  // frame gate has already completed; the timeout is only a final fallback.
   {
     std::unique_lock<std::mutex> lock(mutex_first_frame_);
     first_frame_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
@@ -665,7 +676,7 @@ bool GstVideoPlayer::Init() {
           (first_frame_ready_.load() ? "true" : "false"));
 
   // Unmute audio only AFTER the first decoded frame has surfaced. Previously
-  // the unmute happened when the preroll gate opened, which was too early:
+  // the unmute happened when the startup gate opened, which was too early:
   // the very first video frame arrives a moment later, producing a visible
   // (audible) gap where sound plays over a still spinner. Moving the unmute
   // past first_frame_ready lines up audio start with picture start. On the
