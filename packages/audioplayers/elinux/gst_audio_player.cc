@@ -4,7 +4,66 @@
 
 #include "gst_audio_player.h"
 
+#include <cstdio>
+#include <fstream>
+#include <glob.h>
 #include <iostream>
+
+// Pick the ALSA device associated with the connected HDMI connector. Keep
+// this local to the audio player so the existing video-player routing remains
+// unchanged.
+static std::string PickAudioDevice() {
+  for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
+    char pattern[64];
+    std::snprintf(pattern, sizeof(pattern),
+                  "/sys/class/drm/card*-HDMI-A-%d/status", hdmi_idx);
+    glob_t g{};
+    if (glob(pattern, 0, nullptr, &g) != 0) {
+      globfree(&g);
+      continue;
+    }
+
+    bool connected = false;
+    for (size_t i = 0; i < g.gl_pathc; ++i) {
+      std::ifstream f(g.gl_pathv[i]);
+      std::string status;
+      if (f && std::getline(f, status) && status == "connected") {
+        connected = true;
+        break;
+      }
+    }
+    globfree(&g);
+    if (!connected) {
+      continue;
+    }
+
+    char target[16];
+    std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
+    for (int card = 0; card < 32; ++card) {
+      char id_path[64];
+      std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+      std::ifstream f(id_path);
+      std::string id;
+      if (f && std::getline(f, id) && id == target) {
+        char device[32];
+        std::snprintf(device, sizeof(device), "plughw:%d,0", card);
+        std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+                  << " connected, ALSA card " << card << " (" << id
+                  << ") -> " << device << std::endl;
+        return device;
+      }
+    }
+
+    std::cerr << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+              << " connected but no ALSA card matching '" << target
+              << "' found" << std::endl;
+  }
+
+  std::cout << "PickAudioDevice (audio): No connected HDMI, falling back to "
+               "plughw:0,0"
+            << std::endl;
+  return "plughw:0,0";
+}
 
 GstAudioPlayer::GstAudioPlayer(
     const std::string &player_id,
@@ -50,7 +109,15 @@ bool GstAudioPlayer::CreatePipeline() {
   gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
   if (gst_.panorama) {
     gst_.audiobin = gst_bin_new(NULL);
-    gst_.audiosink = gst_element_factory_make("autoaudiosink", "autoaudiosink");
+    gst_.audiosink = gst_element_factory_make("alsasink", "alsasink");
+    if (!gst_.audiosink) {
+      std::cerr << "Failed to create alsasink" << std::endl;
+      return false;
+    }
+
+    const std::string audio_device = PickAudioDevice();
+    g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+                 NULL);
 
     gst_bin_add_many(GST_BIN(gst_.audiobin), gst_.panorama, gst_.audiosink, NULL);
     gst_element_link(gst_.panorama, gst_.audiosink);
