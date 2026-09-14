@@ -192,6 +192,18 @@ bool GstAudioPlayer::CreatePipeline() {
   return true;
 }
 
+void GstAudioPlayer::UpdateAudioDevice() {
+  if (!gst_.audiosink) {
+    return;
+  }
+
+  const std::string audio_device = PickAudioDevice();
+  std::cout << "UpdateAudioDevice (audio): setting device to " << audio_device
+            << std::endl;
+  g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+               NULL);
+}
+
 // static
 void GstAudioPlayer::SourceSetup(GstElement* playbin,
                                  GstElement* source,
@@ -283,6 +295,9 @@ void GstAudioPlayer::Seek(int64_t position) {
 void GstAudioPlayer::SetSourceUrl(std::string url) {
   if (url_ != url) {
     url_ = url;
+
+    // Update audio device in case HDMI was connected after app startup
+    UpdateAudioDevice();
 
     // flush unhandled messeges
     gst_bus_set_flushing(gst_.bus, TRUE);

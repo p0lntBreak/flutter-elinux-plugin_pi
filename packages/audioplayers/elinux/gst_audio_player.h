@@ -56,6 +56,7 @@ class GstAudioPlayer {
                           GstElement* source,
                           GstElement** p_src);
   bool CreatePipeline();
+  void UpdateAudioDevice();
   std::string ParseUri(const std::string& uri);
 
   GstAudioElements gst_;
