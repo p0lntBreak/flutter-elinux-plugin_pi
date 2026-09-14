@@ -4,15 +4,62 @@
 
 #include "gst_audio_player.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <glob.h>
 #include <iostream>
+#include <string>
 
 // Pick the ALSA device associated with the connected HDMI connector. Keep
 // this local to the audio player so the existing video-player routing remains
 // unchanged.
+static bool ReadFirstLine(const std::string& path, std::string* line) {
+  std::ifstream f(path);
+  return f && std::getline(f, *line);
+}
+
+static std::string DeviceForAlsaCard(int card) {
+  char device[32];
+  std::snprintf(device, sizeof(device), "plughw:%d,0", card);
+  return device;
+}
+
+static bool FindAlsaCardById(const std::string& target_id, int* out_card) {
+  for (int card = 0; card < 32; ++card) {
+    char id_path[64];
+    std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+    std::string id;
+    if (ReadFirstLine(id_path, &id) && id == target_id) {
+      *out_card = card;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool FindAnyHdmiAlsaCard(int* out_card, std::string* out_id) {
+  for (int card = 0; card < 32; ++card) {
+    char id_path[64];
+    std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+    std::string id;
+    if (ReadFirstLine(id_path, &id) && id.rfind("vc4hdmi", 0) == 0) {
+      *out_card = card;
+      *out_id = id;
+      return true;
+    }
+  }
+  return false;
+}
+
 static std::string PickAudioDevice() {
+  const char* override_device = std::getenv("AUDIOPLAYERS_ELINUX_ALSA_DEVICE");
+  if (override_device && override_device[0] != '\0') {
+    std::cout << "PickAudioDevice (audio): using override "
+              << override_device << std::endl;
+    return override_device;
+  }
+
   for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
     char pattern[64];
     std::snprintf(pattern, sizeof(pattern),
@@ -25,9 +72,8 @@ static std::string PickAudioDevice() {
 
     bool connected = false;
     for (size_t i = 0; i < g.gl_pathc; ++i) {
-      std::ifstream f(g.gl_pathv[i]);
       std::string status;
-      if (f && std::getline(f, status) && status == "connected") {
+      if (ReadFirstLine(g.gl_pathv[i], &status) && status == "connected") {
         connected = true;
         break;
       }
@@ -39,19 +85,13 @@ static std::string PickAudioDevice() {
 
     char target[16];
     std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
-    for (int card = 0; card < 32; ++card) {
-      char id_path[64];
-      std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
-      std::ifstream f(id_path);
-      std::string id;
-      if (f && std::getline(f, id) && id == target) {
-        char device[32];
-        std::snprintf(device, sizeof(device), "plughw:%d,0", card);
-        std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
-                  << " connected, ALSA card " << card << " (" << id
-                  << ") -> " << device << std::endl;
-        return device;
-      }
+    int card = -1;
+    if (FindAlsaCardById(target, &card)) {
+      std::string device = DeviceForAlsaCard(card);
+      std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+                << " connected, ALSA card " << card << " (" << target
+                << ") -> " << device << std::endl;
+      return device;
     }
 
     std::cerr << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
@@ -59,8 +99,18 @@ static std::string PickAudioDevice() {
               << "' found" << std::endl;
   }
 
-  std::cout << "PickAudioDevice (audio): No connected HDMI, falling back to "
-               "plughw:0,0"
+  int hdmi_card = -1;
+  std::string hdmi_id;
+  if (FindAnyHdmiAlsaCard(&hdmi_card, &hdmi_id)) {
+    std::string device = DeviceForAlsaCard(hdmi_card);
+    std::cout << "PickAudioDevice (audio): DRM did not report connected HDMI, "
+              << "using ALSA HDMI card " << hdmi_card << " (" << hdmi_id
+              << ") -> " << device << std::endl;
+    return device;
+  }
+
+  std::cout << "PickAudioDevice (audio): no vc4hdmi ALSA card found, "
+               "falling back to plughw:0,0"
             << std::endl;
   return "plughw:0,0";
 }
