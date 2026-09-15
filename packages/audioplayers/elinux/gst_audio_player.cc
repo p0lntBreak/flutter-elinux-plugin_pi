@@ -120,6 +120,8 @@ GstAudioPlayer::GstAudioPlayer(
     std::unique_ptr<AudioPlayerStreamHandler> handler)
     : player_id_(player_id),
     stream_handler_(std::move(handler)) {
+  std::cerr << "GstAudioPlayer: constructing player " << player_id_
+            << std::endl;
   gst_.playbin = nullptr;
   gst_.bus = nullptr;
   gst_.source = nullptr;
@@ -149,6 +151,7 @@ void GstAudioPlayer::GstLibraryUnload() { gst_deinit(); }
 // Creates a audio playbin.
 // $ playbin uri=<file>
 bool GstAudioPlayer::CreatePipeline() {
+  std::cerr << "GstAudioPlayer: creating GStreamer pipeline" << std::endl;
   gst_.playbin = gst_element_factory_make("playbin", "playbin");
   if (!gst_.playbin) {
     std::cerr << "Failed to create a playbin" << std::endl;
@@ -157,7 +160,10 @@ bool GstAudioPlayer::CreatePipeline() {
 
   // Setup stereo balance controller
   gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
-  if (gst_.panorama) {
+  if (!gst_.panorama) {
+    std::cerr << "GstAudioPlayer: failed to create audiopanorama"
+              << std::endl;
+  } else {
     gst_.audiobin = gst_bin_new(NULL);
     gst_.audiosink = gst_element_factory_make("alsasink", "alsasink");
     if (!gst_.audiosink) {
