@@ -120,8 +120,6 @@ GstAudioPlayer::GstAudioPlayer(
     std::unique_ptr<AudioPlayerStreamHandler> handler)
     : player_id_(player_id),
     stream_handler_(std::move(handler)) {
-  std::cerr << "GstAudioPlayer: constructing player " << player_id_
-            << std::endl;
   gst_.playbin = nullptr;
   gst_.bus = nullptr;
   gst_.source = nullptr;
@@ -151,30 +149,28 @@ void GstAudioPlayer::GstLibraryUnload() { gst_deinit(); }
 // Creates a audio playbin.
 // $ playbin uri=<file>
 bool GstAudioPlayer::CreatePipeline() {
-  std::cerr << "GstAudioPlayer: creating GStreamer pipeline" << std::endl;
   gst_.playbin = gst_element_factory_make("playbin", "playbin");
   if (!gst_.playbin) {
     std::cerr << "Failed to create a playbin" << std::endl;
     return false;
   }
 
-  // Setup stereo balance controller
+  gst_.audiosink = gst_element_factory_make("alsasink", "alsasink");
+  if (!gst_.audiosink) {
+    std::cerr << "Failed to create alsasink" << std::endl;
+    return false;
+  }
+
+  const std::string audio_device = PickAudioDevice();
+  g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+               NULL);
+
+  // Setup stereo balance controller when the optional element is available.
   gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
   if (!gst_.panorama) {
-    std::cerr << "GstAudioPlayer: failed to create audiopanorama"
-              << std::endl;
+    g_object_set(G_OBJECT(gst_.playbin), "audio-sink", gst_.audiosink, NULL);
   } else {
     gst_.audiobin = gst_bin_new(NULL);
-    gst_.audiosink = gst_element_factory_make("alsasink", "alsasink");
-    if (!gst_.audiosink) {
-      std::cerr << "Failed to create alsasink" << std::endl;
-      return false;
-    }
-
-    const std::string audio_device = PickAudioDevice();
-    g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
-                 NULL);
-
     gst_bin_add_many(GST_BIN(gst_.audiobin), gst_.panorama, gst_.audiosink, NULL);
     gst_element_link(gst_.panorama, gst_.audiosink);
 

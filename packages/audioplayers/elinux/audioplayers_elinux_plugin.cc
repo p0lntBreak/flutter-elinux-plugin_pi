@@ -128,8 +128,6 @@ class AudioplayersElinuxPlugin : public flutter::Plugin {
     }
 
     const std::string &method_name = method_call.method_name();
-    std::cerr << "audioplayers: method " << method_name
-              << " for player " << player_id << std::endl;
     if (method_name == "create") {
       CreateAudioPlayer(player_id);
       result->Success();
@@ -251,8 +249,6 @@ class AudioplayersElinuxPlugin : public flutter::Plugin {
   }
 
   void CreateAudioPlayer(const std::string &player_id) {
-    std::cerr << "audioplayers: creating native player " << player_id
-              << std::endl;
     auto event_channel =
         std::make_unique<flutter::EventChannel<flutter::EncodableValue>>(
             registrar_->messenger(),
