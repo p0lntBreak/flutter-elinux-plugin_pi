@@ -29,13 +29,17 @@ class VideoPlayerStreamHandler {
   void OnNotifyPlaying(bool is_playing) { OnNotifyPlayingInternal(is_playing); }
 
   // Notifies a fatal playback error (e.g. network stall, stream failure).
-  void OnNotifyError(const std::string& message) { OnNotifyErrorInternal(message); }
+  void OnNotifyError(const std::string& message) {
+    OnNotifyErrorInternal(message);
+  }
 
   // Notifies the start of buffering.
   void OnNotifyBufferingStart() { OnNotifyBufferingStartInternal(); }
 
   // Notifies buffering progress update.
-  void OnNotifyBufferingUpdate(int percent) { OnNotifyBufferingUpdateInternal(percent); }
+  void OnNotifyBufferingUpdate(int percent) {
+    OnNotifyBufferingUpdateInternal(percent);
+  }
 
   // Notifies the end of buffering.
   void OnNotifyBufferingEnd() { OnNotifyBufferingEndInternal(); }

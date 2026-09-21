@@ -14,9 +14,12 @@
 #include <flutter/standard_method_codec.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -100,12 +103,33 @@ class VideoPlayerPlugin : public flutter::Plugin {
     // glTexImage2D read, released via the buffer's release_callback) against
     // DisposePlayer() tearing down `player`. See DisposePlayer().
     std::mutex buffer_mutex;
+    // Flutter posts both a raster task and a UI frame for every
+    // MarkTextureFrameAvailable call. Keep at most one notification in flight
+    // so a sustained live stream cannot build an input-blocking task backlog.
+    std::atomic<bool> texture_frame_pending{false};
 #ifdef USE_EGL_IMAGE_DMABUF
     std::unique_ptr<FlutterDesktopEGLImage> egl_image;
 #endif  // USE_EGL_IMAGE_DMABUF
     std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>>
         event_channel;
     std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink;
+    std::mutex error_delivery_mutex;
+    std::string pending_error;
+    std::atomic<bool> error_reported{false};
+
+    void DeliverError(const std::string& message) {
+      std::lock_guard<std::mutex> guard(error_delivery_mutex);
+      error_reported.store(true);
+      if (!event_sink) {
+        pending_error = message;
+        return;
+      }
+      event_sink->Error("VideoError", message);
+    }
+    // Native startup runs asynchronously so Dart can subscribe to the event
+    // channel immediately after create() returns.
+    std::thread initialization_thread;
+    std::atomic<bool> initialized_event_sent{false};
   };
 
   void HandleInitializeMethodCall(
@@ -342,8 +366,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
   }
 
   auto instance = std::make_unique<FlutterVideoPlayer>();
-  
-    
+
 #ifdef USE_EGL_IMAGE_DMABUF
   instance->egl_image = std::make_unique<FlutterDesktopEGLImage>();
   instance->texture =
@@ -351,6 +374,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           [instance = instance.get()](
               size_t width, size_t height, void* egl_display,
               void* egl_context) -> const FlutterDesktopEGLImage* {
+            instance->texture_frame_pending.store(
+                false, std::memory_order_release);
             if (!instance->player) {
               return nullptr;
             }
@@ -366,6 +391,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
       std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
           [instance = instance.get()](
               size_t width, size_t height) -> const FlutterDesktopPixelBuffer* {
+            instance->texture_frame_pending.store(
+                false, std::memory_order_release);
             // Hold buffer_mutex across the whole copy AND the engine's later
             // glTexImage2D read: the engine reads the returned buffer after
             // this callback returns and signals completion via the buffer's
@@ -374,7 +401,13 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             // `player`, so the frame can't be freed mid-read; and the shell is
             // kept alive past dispose (retired_players_), so this never
             // dereferences freed memory even if it fires after dispose.
-            instance->buffer_mutex.lock();
+            // Never wait on the raster thread. If the engine still owns the
+            // previous pixel buffer, retain that frame and try again when the
+            // next decoded frame arrives. Blocking here delays every Flutter
+            // overlay, including remote-driven media controls.
+            if (!instance->buffer_mutex.try_lock()) {
+              return nullptr;
+            }
             if (!instance->player) {
               instance->buffer_mutex.unlock();
               return nullptr;
@@ -411,13 +444,32 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
                 events)
             -> std::unique_ptr<
                 flutter::StreamHandlerError<flutter::EncodableValue>> {
-          instance->event_sink = std::move(events);
-          host->SendInitializedEventMessage(instance->texture_id);
+          bool replayed_error = false;
+          {
+            std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+            instance->event_sink = std::move(events);
+            if (!instance->pending_error.empty()) {
+              instance->event_sink->Error("VideoError", instance->pending_error);
+              instance->pending_error.clear();
+              replayed_error = true;
+            }
+          }
+          if (instance->player) {
+            instance->player->LogPlaybackStartup(
+                "plugin_event_channel_listening");
+          }
+          // If native initialization already completed before Dart attached,
+          // replay the event now. Otherwise Init() will send it when the first
+          // frame and startup buffer gate are ready.
+          if (!replayed_error && instance->player->IsInitialized()) {
+            host->SendInitializedEventMessage(instance->texture_id);
+          }
           return nullptr;
         },
         [instance = instance.get()](const flutter::EncodableValue* arguments)
             -> std::unique_ptr<
                 flutter::StreamHandlerError<flutter::EncodableValue>> {
+          std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
           instance->event_sink = nullptr;
           return nullptr;
         });
@@ -431,8 +483,17 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           host->SendInitializedEventMessage(texture_id);
         },
         // OnNotifyFrameDecoded
-        [texture_id, host = this]() {
-          host->texture_registrar_->MarkTextureFrameAvailable(texture_id);
+        [texture_id, instance = instance.get(), host = this]() {
+          bool expected = false;
+          if (!instance->texture_frame_pending.compare_exchange_strong(
+                  expected, true, std::memory_order_acq_rel)) {
+            return;
+          }
+          if (!host->texture_registrar_->MarkTextureFrameAvailable(
+                  texture_id)) {
+            instance->texture_frame_pending.store(
+                false, std::memory_order_release);
+          }
         },
         // OnNotifyCompleted
         [texture_id, host = this]() {
@@ -468,9 +529,7 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
             flutter::EncodableList ranges = {
                 flutter::EncodableValue(flutter::EncodableList{
                     flutter::EncodableValue(static_cast<int64_t>(0)),
-                    flutter::EncodableValue(buffered_end)
-                })
-            };
+                    flutter::EncodableValue(buffered_end)})};
             flutter::EncodableMap encodables = {
                 {flutter::EncodableValue("event"),
                  flutter::EncodableValue("bufferingUpdate")},
@@ -492,61 +551,61 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
           }
         });
 
-      
     instance->player =
         std::make_unique<GstVideoPlayer>(uri, std::move(player_handler));
 
-      
-
-    //Extract and apply HTTP headers dynamically
+    // Extract and apply HTTP headers dynamically
     const auto& http_headers = meta.GetHttpHeaders();
     if (!http_headers.empty()) {
-      std::cout << "Received " << http_headers.size() << " HTTP headers from Flutter" << std::endl;
-      
+      std::cout << "Received " << http_headers.size()
+                << " HTTP headers from Flutter" << std::endl;
+
       // Log all headers
       for (const auto& [key, value] : http_headers) {
         std::cout << "  Header: " << key << " = " << value << std::endl;
       }
-      
+
       // Pass ALL headers to the player
       std::cout << "Setting ALL HTTP headers on player" << std::endl;
       instance->player->SetAuthHeaders(http_headers);
     } else {
       std::cout << "No HTTP headers provided from Flutter" << std::endl;
     }
-      
+
     players_[texture_id] = std::move(instance);
   }
 
-flutter::EncodableMap value;
+  flutter::EncodableMap value;
   TextureMessage result;
 
-  bool ok = players_[texture_id]->player->Init();
-  if (ok) {
-    result.SetTextureId(texture_id);
-    value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
-                  result.ToMap());
-  } else {
-    // Prefer the specific error surfaced from Init() (e.g. NETWORK_TOO_SLOW:,
-    // STREAM_UNAVAILABLE:) if one was recorded — the Dart side branches on
-    // those prefixes to render distinct UIs. Fall back to the generic
-    // texture-id message if nothing was recorded (e.g. a very early failure
-    // before any NotifyError path fired).
-    std::string specific = players_[texture_id]->player->GetLastError();
-    auto error_message = !specific.empty()
-        ? specific
-        : ("Failed to initialize the player with texture id: " +
-           std::to_string(texture_id));
-    value.emplace(flutter::EncodableValue(kEncodableMapkeyError),
-                  flutter::EncodableValue(WrapError(error_message)));
-    // Init() failed. The texture was already registered and this entry
-    // already inserted into players_ above, but Dart's create() never
-    // returns a textureId on this branch (the Future rejects with
-    // PlatformException) — so Dart has no id to pass to dispose() later.
-    // Clean up here or the texture + player leak on every failed Init().
-    // DisposePlayer() erases from players_ itself.
-    DisposePlayer(texture_id);
-  }
+  auto player_entry = players_[texture_id];
+  player_entry->player->LogPlaybackStartup("plugin_create_reply_ready");
+  result.SetTextureId(texture_id);
+  value.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
+                result.ToMap());
+
+  // Do not block the platform message handler on GStreamer preroll. The Dart
+  // video controller subscribes to the EventChannel only after this reply;
+  // keeping Init() synchronous created the multi-second event-channel gap.
+  player_entry->player->LogPlaybackStartup("plugin_init_call_started");
+  player_entry->initialization_thread = std::thread(
+      [player_entry, texture_id]() {
+        player_entry->player->LogPlaybackStartup("plugin_async_init_started");
+        const bool ok = player_entry->player->Init();
+        player_entry->player->LogPlaybackStartup(
+            "plugin_init_returned",
+            std::string("success=") + (ok ? "true" : "false"));
+        if (!ok) {
+          const std::string specific = player_entry->player->GetLastError();
+          const std::string error_message =
+              !specific.empty()
+                  ? specific
+                  : ("Failed to initialize the player with texture id: " +
+                     std::to_string(texture_id));
+          // The shared entry stays alive even if disposal removed its map key.
+          player_entry->DeliverError(error_message);
+        }
+      });
   reply(flutter::EncodableValue(value));
 }
 
@@ -738,8 +797,22 @@ void VideoPlayerPlugin::HandleSeekToMethodCall(
 }
 
 void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
-  if (players_.find(texture_id) == players_.end() ||
-      !players_[texture_id]->event_sink) {
+  if (players_.find(texture_id) == players_.end()) {
+    return;
+  }
+  const auto instance = players_[texture_id];
+  std::lock_guard<std::mutex> guard(instance->error_delivery_mutex);
+  if (instance->error_reported.load()) return;
+
+  players_[texture_id]->player->LogPlaybackStartup(
+      "plugin_initialized_event_attempt",
+      std::string("sinkReady=") +
+          (players_[texture_id]->event_sink ? "true" : "false"));
+  if (!players_[texture_id]->event_sink) return;
+  if (!players_[texture_id]->player->IsInitialized()) return;
+  bool expected = false;
+  if (!players_[texture_id]->initialized_event_sent.compare_exchange_strong(
+          expected, true)) {
     return;
   }
 
@@ -754,6 +827,8 @@ void VideoPlayerPlugin::SendInitializedEventMessage(int64_t texture_id) {
       {flutter::EncodableValue("height"), flutter::EncodableValue(height)}};
   flutter::EncodableValue event(encodables);
   players_[texture_id]->event_sink->Success(event);
+  players_[texture_id]->player->LogPlaybackStartup(
+      "plugin_initialized_event_sent");
 }
 
 void VideoPlayerPlugin::SendPlayCompletedEventMessage(int64_t texture_id) {
@@ -786,11 +861,11 @@ void VideoPlayerPlugin::SendIsPlayingStateUpdate(int64_t texture_id,
 
 void VideoPlayerPlugin::SendErrorEventMessage(int64_t texture_id,
                                               const std::string& message) {
-  if (players_.find(texture_id) == players_.end() ||
-      !players_[texture_id]->event_sink) {
-    return;
-  }
-  players_[texture_id]->event_sink->Error("VideoError", message);
+  const auto it = players_.find(texture_id);
+  if (it == players_.end()) return;
+  const auto instance = it->second;
+  // Init can fail before Dart subscribes. Retain errors until it attaches.
+  instance->DeliverError(message);
 }
 
 void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
@@ -801,8 +876,18 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
   std::shared_ptr<FlutterVideoPlayer> player = it->second;
   players_.erase(it);
 
+  // Init() runs asynchronously; finish it before releasing the Gst player.
+  if (player->initialization_thread.joinable() &&
+      player->initialization_thread.get_id() != std::this_thread::get_id()) {
+    player->initialization_thread.join();
+  }
+
   // Detach the Dart-facing channels (platform thread — safe).
-  player->event_sink = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(player->error_delivery_mutex);
+    player->event_sink = nullptr;
+    player->pending_error.clear();
+  }
   if (player->event_channel) {
     player->event_channel->SetStreamHandler(nullptr);
   }

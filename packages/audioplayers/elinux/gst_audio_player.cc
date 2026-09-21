@@ -4,7 +4,116 @@
 
 #include "gst_audio_player.h"
 
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <glob.h>
 #include <iostream>
+#include <string>
+
+// Pick the ALSA device associated with the connected HDMI connector. Keep
+// this local to the audio player so the existing video-player routing remains
+// unchanged.
+static bool ReadFirstLine(const std::string& path, std::string* line) {
+  std::ifstream f(path);
+  return f && std::getline(f, *line);
+}
+
+static std::string DeviceForAlsaCard(int card) {
+  char device[32];
+  std::snprintf(device, sizeof(device), "plughw:%d,0", card);
+  return device;
+}
+
+static bool FindAlsaCardById(const std::string& target_id, int* out_card) {
+  for (int card = 0; card < 32; ++card) {
+    char id_path[64];
+    std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+    std::string id;
+    if (ReadFirstLine(id_path, &id) && id == target_id) {
+      *out_card = card;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool FindAnyHdmiAlsaCard(int* out_card, std::string* out_id) {
+  for (int card = 0; card < 32; ++card) {
+    char id_path[64];
+    std::snprintf(id_path, sizeof(id_path), "/proc/asound/card%d/id", card);
+    std::string id;
+    if (ReadFirstLine(id_path, &id) && id.rfind("vc4hdmi", 0) == 0) {
+      *out_card = card;
+      *out_id = id;
+      return true;
+    }
+  }
+  return false;
+}
+
+static std::string PickAudioDevice() {
+  const char* override_device = std::getenv("AUDIOPLAYERS_ELINUX_ALSA_DEVICE");
+  if (override_device && override_device[0] != '\0') {
+    std::cout << "PickAudioDevice (audio): using override "
+              << override_device << std::endl;
+    return override_device;
+  }
+
+  for (int hdmi_idx = 1; hdmi_idx <= 4; ++hdmi_idx) {
+    char pattern[64];
+    std::snprintf(pattern, sizeof(pattern),
+                  "/sys/class/drm/card*-HDMI-A-%d/status", hdmi_idx);
+    glob_t g{};
+    if (glob(pattern, 0, nullptr, &g) != 0) {
+      globfree(&g);
+      continue;
+    }
+
+    bool connected = false;
+    for (size_t i = 0; i < g.gl_pathc; ++i) {
+      std::string status;
+      if (ReadFirstLine(g.gl_pathv[i], &status) && status == "connected") {
+        connected = true;
+        break;
+      }
+    }
+    globfree(&g);
+    if (!connected) {
+      continue;
+    }
+
+    char target[16];
+    std::snprintf(target, sizeof(target), "vc4hdmi%d", hdmi_idx - 1);
+    int card = -1;
+    if (FindAlsaCardById(target, &card)) {
+      std::string device = DeviceForAlsaCard(card);
+      std::cout << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+                << " connected, ALSA card " << card << " (" << target
+                << ") -> " << device << std::endl;
+      return device;
+    }
+
+    std::cerr << "PickAudioDevice (audio): HDMI-A-" << hdmi_idx
+              << " connected but no ALSA card matching '" << target
+              << "' found" << std::endl;
+  }
+
+  int hdmi_card = -1;
+  std::string hdmi_id;
+  if (FindAnyHdmiAlsaCard(&hdmi_card, &hdmi_id)) {
+    std::string device = DeviceForAlsaCard(hdmi_card);
+    std::cout << "PickAudioDevice (audio): DRM did not report connected HDMI, "
+              << "using ALSA HDMI card " << hdmi_card << " (" << hdmi_id
+              << ") -> " << device << std::endl;
+    return device;
+  }
+
+  std::cout << "PickAudioDevice (audio): no vc4hdmi ALSA card found, "
+               "falling back to plughw:0,0"
+            << std::endl;
+  return "plughw:0,0";
+}
 
 GstAudioPlayer::GstAudioPlayer(
     const std::string &player_id,
@@ -46,12 +155,22 @@ bool GstAudioPlayer::CreatePipeline() {
     return false;
   }
 
-  // Setup stereo balance controller
-  gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
-  if (gst_.panorama) {
-    gst_.audiobin = gst_bin_new(NULL);
-    gst_.audiosink = gst_element_factory_make("autoaudiosink", "autoaudiosink");
+  gst_.audiosink = gst_element_factory_make("alsasink", "alsasink");
+  if (!gst_.audiosink) {
+    std::cerr << "Failed to create alsasink" << std::endl;
+    return false;
+  }
 
+  const std::string audio_device = PickAudioDevice();
+  g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+               NULL);
+
+  // Setup stereo balance controller when the optional element is available.
+  gst_.panorama = gst_element_factory_make("audiopanorama", "audiopanorama");
+  if (!gst_.panorama) {
+    g_object_set(G_OBJECT(gst_.playbin), "audio-sink", gst_.audiosink, NULL);
+  } else {
+    gst_.audiobin = gst_bin_new(NULL);
     gst_bin_add_many(GST_BIN(gst_.audiobin), gst_.panorama, gst_.audiosink, NULL);
     gst_element_link(gst_.panorama, gst_.audiosink);
 
@@ -73,6 +192,18 @@ bool GstAudioPlayer::CreatePipeline() {
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
   return true;
+}
+
+void GstAudioPlayer::UpdateAudioDevice() {
+  if (!gst_.audiosink) {
+    return;
+  }
+
+  const std::string audio_device = PickAudioDevice();
+  std::cout << "UpdateAudioDevice (audio): setting device to " << audio_device
+            << std::endl;
+  g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
+               NULL);
 }
 
 // static
@@ -166,6 +297,9 @@ void GstAudioPlayer::Seek(int64_t position) {
 void GstAudioPlayer::SetSourceUrl(std::string url) {
   if (url_ != url) {
     url_ = url;
+
+    // Update audio device in case HDMI was connected after app startup
+    UpdateAudioDevice();
 
     // flush unhandled messeges
     gst_bus_set_flushing(gst_.bus, TRUE);

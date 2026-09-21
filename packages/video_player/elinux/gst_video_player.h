@@ -18,11 +18,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <map>
 #include <thread>
 
 struct AuthHeaders {
@@ -39,6 +39,9 @@ class GstVideoPlayer {
 
   static void GstLibraryLoad();
   static void GstLibraryUnload();
+
+  void LogPlaybackStartup(const char* stage,
+                          const std::string& details = "") const;
 
   bool Init();
   bool Play();
@@ -64,7 +67,8 @@ class GstVideoPlayer {
 #endif  // USE_EGL_IMAGE_DMABUF
   int32_t GetWidth() const { return width_; };
   int32_t GetHeight() const { return height_; };
-  
+  bool IsInitialized() const { return initialized_.load(); }
+
   // ADD THIS METHOD DECLARATION
   void SetAuthHeaders(const std::map<std::string, std::string>& headers);
 
@@ -76,7 +80,7 @@ class GstVideoPlayer {
   // failure. Returns an empty string if no error was ever recorded.
   std::string GetLastError() const { return last_error_; }
 
- AuthHeaders auth_headers_;
+  AuthHeaders auth_headers_;
 
  private:
   struct GstVideoElements {
@@ -141,15 +145,17 @@ class GstVideoPlayer {
   // element directly gives us a working mute during the preroll gate.
   GstElement* audio_volume_ = nullptr;
   std::string uri_;
-  // Cold-start rung hint parsed from a `#soatv:startup_kbps=N` fragment on
-  // the URI. When non-zero, overrides kColdStartConnSpeedKbps at pipeline
-  // construction so hlsdemux picks a rendition suited to the current
-  // network measurement (from soatv's auth-GET throughput probe) or the
-  // rung a preceding ABR_RESTART decided on. Zero means "no hint, use
-  // the fixed default". Stripped from uri_ before being handed to
-  // playbin — playbin doesn't need to see it (GStreamer would ignore
-  // it anyway, but keeping the URL clean avoids surprises).
+  // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
+  // selects the cold-start rung; trace and offset_ms join native diagnostics
+  // to the app-side startup timeline. The fragment is stripped before playbin.
   guint64 startup_kbps_hint_ = 0;
+  std::string startup_trace_id_ = "native";
+  int64_t startup_elapsed_offset_ms_ = 0;
+  std::chrono::steady_clock::time_point startup_started_at_ =
+      std::chrono::steady_clock::now();
+  std::atomic<bool> first_network_chunk_logged_{false};
+  std::atomic<bool> first_http_burst_logged_{false};
+  std::atomic<bool> hls_demux_ready_logged_{false};
   std::unique_ptr<uint32_t[]> pixels_;
   int32_t width_ = 0;
   int32_t height_ = 0;
@@ -158,9 +164,10 @@ class GstVideoPlayer {
   bool mute_ = false;
   bool auto_repeat_ = false;
   bool is_completed_ = false;
-  // True when the source is LIVE (set in Preroll from GST_STATE_CHANGE_NO_PREROLL).
-  // A live stream has no end: EOS on it is spurious and must never be treated as
-  // completion (no seek-0, no 'completed' event) or it loops the buffered window.
+  // True when the source is LIVE (set in Preroll from
+  // GST_STATE_CHANGE_NO_PREROLL). A live stream has no end: EOS on it is
+  // spurious and must never be treated as completion (no seek-0, no 'completed'
+  // event) or it loops the buffered window.
   bool is_live_ = false;
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
@@ -179,7 +186,8 @@ class GstVideoPlayer {
   // video sink (HandoffHandler), so it is the ground-truth liveness signal.
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_running_{false};
-  std::atomic<bool> error_notified_{false};  // single-fire guard for OnNotifyError
+  std::atomic<bool> error_notified_{
+      false};  // single-fire guard for OnNotifyError
   // Last error message stored alongside the single-fire guard. Read by
   // GetLastError() so the create-method-channel reply can carry the specific
   // error text (e.g. NETWORK_TOO_SLOW:) when Init() fails. Written only under
@@ -193,7 +201,8 @@ class GstVideoPlayer {
   // Flutter to check the subscription instead of reconnecting forever. Reset
   // to 0 whenever a video frame advances (proof the stream is alive).
   std::atomic<int> consecutive_unauthorized_{0};
-  std::atomic<bool> play_state_requested_{false}; // tracks if user requested PLAYING
+  std::atomic<bool> play_state_requested_{
+      false};  // tracks if user requested PLAYING
   std::chrono::steady_clock::time_point last_buffering_progress_time_ =
       std::chrono::steady_clock::now();
   std::atomic<uint64_t> frames_handed_off_{0};  // bumped per video buffer
