@@ -552,7 +552,8 @@ void VideoPlayerPlugin::HandleCreateMethodCall(
         });
 
     instance->player =
-        std::make_unique<GstVideoPlayer>(uri, std::move(player_handler));
+        std::make_unique<GstVideoPlayer>(
+            uri, std::move(player_handler), meta.GetSupportedVideoCodecs());
 
     // Extract and apply HTTP headers dynamically
     const auto& http_headers = meta.GetHttpHeaders();

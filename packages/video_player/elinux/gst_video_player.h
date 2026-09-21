@@ -34,7 +34,8 @@ struct AuthHeaders {
 class GstVideoPlayer {
  public:
   GstVideoPlayer(const std::string& uri,
-                 std::unique_ptr<VideoPlayerStreamHandler> handler);
+                 std::unique_ptr<VideoPlayerStreamHandler> handler,
+                 std::vector<std::string> supported_video_codecs);
   ~GstVideoPlayer();
 
   static void GstLibraryLoad();
@@ -130,9 +131,16 @@ class GstVideoPlayer {
                          std::chrono::steady_clock::time_point last_frame_time);
   static void DeepElementAddedHandler(GstBin* bin, GstBin* sub_bin,
                                       GstElement* element, gpointer user_data);
+  static gint AutoplugSelectCallback(
+      GstElement* decodebin, GstPad* pad, GstCaps* caps,
+      GstElementFactory* factory, gpointer user_data);
+  static gboolean SelectStreamCallback(GstElement* decodebin,
+                                       GstStreamCollection* collection,
+                                       GstStream* stream, gpointer user_data);
   static GstPadProbeReturn AbrThroughputProbe(GstPad* pad,
                                               GstPadProbeInfo* info,
                                               gpointer user_data);
+  bool IsVideoCodecAllowed(const GstCaps* caps) const;
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -145,6 +153,7 @@ class GstVideoPlayer {
   // element directly gives us a working mute during the preroll gate.
   GstElement* audio_volume_ = nullptr;
   std::string uri_;
+  std::vector<std::string> supported_video_codecs_;
   // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
   // selects the cold-start rung; trace and offset_ms join native diagnostics
   // to the app-side startup timeline. The fragment is stripped before playbin.

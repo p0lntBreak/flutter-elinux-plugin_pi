@@ -40,6 +40,7 @@ class CreateMessage {
     this.packageName,
     this.formatHint,
     required this.httpHeaders,
+    required this.supportedVideoCodecs,
   });
 
   String? asset;
@@ -47,6 +48,7 @@ class CreateMessage {
   String? packageName;
   String? formatHint;
   Map<String?, String?> httpHeaders;
+  List<String> supportedVideoCodecs;
 
   Object encode() {
     final Map<Object?, Object?> pigeonMap = <Object?, Object?>{};
@@ -55,6 +57,7 @@ class CreateMessage {
     pigeonMap['packageName'] = packageName;
     pigeonMap['formatHint'] = formatHint;
     pigeonMap['httpHeaders'] = httpHeaders;
+    pigeonMap['supportedVideoCodecs'] = supportedVideoCodecs;
     return pigeonMap;
   }
 
@@ -66,6 +69,11 @@ class CreateMessage {
       packageName: pigeonMap['packageName'] as String?,
       formatHint: pigeonMap['formatHint'] as String?,
       httpHeaders: pigeonMap['httpHeaders'] as Map<String?, String?>,
+      supportedVideoCodecs:
+          (pigeonMap['supportedVideoCodecs'] as List<Object?>?)
+                  ?.whereType<String>()
+                  .toList() ??
+              <String>['h264'],
     );
   }
 }
@@ -191,7 +199,7 @@ class MixWithOthersMessage {
   }
 }
 
-/// [VideoPlayerApi] in 
+/// [VideoPlayerApi] in
 class ELinuxVideoPlayerApi {
   Future<void> initialize() async {
     const BasicMessageChannel<Object?> channel = BasicMessageChannel<Object?>(

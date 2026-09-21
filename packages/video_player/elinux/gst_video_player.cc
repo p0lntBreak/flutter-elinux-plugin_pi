@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -20,6 +21,11 @@
 #include "logging.h"
 
 namespace {
+// GstAutoplugSelectResult is defined by gst-plugins-base but is not exported
+// in a public header on all target images. These are its stable signal values.
+constexpr gint kAutoplugSelectTry = 0;
+constexpr gint kAutoplugSelectSkip = 2;
+
 // Buffer discipline retune (task #60, 2026-08-29). Doubled from 30 to 60 s to
 // give the multiqueue more headroom against jitter on marginal networks. The
 // ABR gates below (kHealthyBufferSecs, hardcoded 6 s / 15 s thresholds in
@@ -324,8 +330,10 @@ void DumpKernelFreezeDiagnostic() {
 }  // namespace
 
 GstVideoPlayer::GstVideoPlayer(
-    const std::string& uri, std::unique_ptr<VideoPlayerStreamHandler> handler)
-    : stream_handler_(std::move(handler)) {
+    const std::string& uri, std::unique_ptr<VideoPlayerStreamHandler> handler,
+    std::vector<std::string> supported_video_codecs)
+    : supported_video_codecs_(std::move(supported_video_codecs)),
+      stream_handler_(std::move(handler)) {
   video_player_elinux::InitTimestampedLogging();
   gst_.pipeline = nullptr;
   gst_.playbin = nullptr;
@@ -336,6 +344,25 @@ GstVideoPlayer::GstVideoPlayer(
   gst_.buffer = nullptr;
 
   uri_ = ParseUri(uri);
+
+  for (auto& codec : supported_video_codecs_) {
+    std::transform(codec.begin(), codec.end(), codec.begin(),
+                   [](unsigned char value) { return std::tolower(value); });
+  }
+  supported_video_codecs_.erase(
+      std::remove_if(supported_video_codecs_.begin(),
+                     supported_video_codecs_.end(),
+                     [](const std::string& codec) { return codec.empty(); }),
+      supported_video_codecs_.end());
+  if (supported_video_codecs_.empty()) {
+    supported_video_codecs_.push_back("h264");
+  }
+  std::cout << "CODEC-POLICY: allowed video codecs=";
+  for (size_t i = 0; i < supported_video_codecs_.size(); ++i) {
+    if (i > 0) std::cout << ",";
+    std::cout << supported_video_codecs_[i];
+  }
+  std::cout << std::endl;
 
   // Private startup metadata. The fragment never reaches the origin. It can
   // thread either (a) a measured throughput sample from its auth GET
@@ -2283,6 +2310,21 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
           << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
           << std::endl;
     }
+  } else if (name && (g_str_has_prefix(name, "decodebin") ||
+                      g_str_has_prefix(name, "uridecodebin"))) {
+    if (g_signal_lookup("autoplug-select", G_OBJECT_TYPE(element)) != 0) {
+      g_signal_connect(element, "autoplug-select",
+                       G_CALLBACK(GstVideoPlayer::AutoplugSelectCallback),
+                       self);
+      std::cout << "CODEC-POLICY: attached decoder selection filter to "
+                << name << std::endl;
+    }
+    if (g_signal_lookup("select-stream", G_OBJECT_TYPE(element)) != 0) {
+      g_signal_connect(element, "select-stream",
+                       G_CALLBACK(GstVideoPlayer::SelectStreamCallback), self);
+      std::cout << "CODEC-POLICY: attached stream selection filter to "
+                << name << std::endl;
+    }
   } else if (name && (g_str_has_prefix(name, "souphttpsrc") ||
                       g_str_has_prefix(name, "curlhttpsrc"))) {
     // Segments DO cross the http source's src pad — probe here for real
@@ -2312,6 +2354,91 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
               << " (time=60s bytes=20MB buffers=unlimited)" << std::endl;
   }
   g_free(name);
+}
+
+bool GstVideoPlayer::IsVideoCodecAllowed(const GstCaps* caps) const {
+  if (!caps || gst_caps_is_empty(caps)) {
+    return false;
+  }
+
+  bool saw_encoded_video = false;
+  for (guint i = 0; i < gst_caps_get_size(caps); ++i) {
+    const GstStructure* structure = gst_caps_get_structure(caps, i);
+    const gchar* media_type = gst_structure_get_name(structure);
+    if (!media_type || !g_str_has_prefix(media_type, "video/")) {
+      continue;
+    }
+    if (g_str_has_prefix(media_type, "video/x-raw")) {
+      return true;
+    }
+    saw_encoded_video = true;
+
+    std::string codec;
+    if (g_str_has_prefix(media_type, "video/x-h264")) {
+      codec = "h264";
+    } else if (g_str_has_prefix(media_type, "video/x-av1")) {
+      codec = "av1";
+    } else if (g_str_has_prefix(media_type, "video/x-h265") ||
+               g_str_has_prefix(media_type, "video/x-hevc")) {
+      codec = "hevc";
+    } else if (g_str_has_prefix(media_type, "video/x-vp9")) {
+      codec = "vp9";
+    } else if (g_str_has_prefix(media_type, "video/x-vp8")) {
+      codec = "vp8";
+    } else if (g_str_has_prefix(media_type, "video/mpeg")) {
+      codec = "mpeg";
+    } else {
+      // Unknown encoded video is not safe to select under an explicit codec
+      // policy. Add its normalized name to the policy when supporting it.
+      codec = media_type;
+    }
+
+    if (std::find(supported_video_codecs_.begin(),
+                  supported_video_codecs_.end(),
+                  codec) != supported_video_codecs_.end()) {
+      return true;
+    }
+  }
+
+  return !saw_encoded_video;
+}
+
+// static
+gint GstVideoPlayer::AutoplugSelectCallback(
+    GstElement* /*decodebin*/, GstPad* /*pad*/, GstCaps* caps,
+    GstElementFactory* factory, gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  if (self->IsVideoCodecAllowed(caps)) {
+    return kAutoplugSelectTry;
+  }
+
+  gchar* caps_text = gst_caps_to_string(caps);
+  const gchar* factory_name = gst_plugin_feature_get_name(
+      GST_PLUGIN_FEATURE(factory));
+  std::cout << "CODEC-POLICY: rejecting unsupported video caps "
+            << (caps_text ? caps_text : "<unknown>") << " for decoder "
+            << (factory_name ? factory_name : "<unknown>") << std::endl;
+  g_free(caps_text);
+  return kAutoplugSelectSkip;
+}
+
+// static
+gboolean GstVideoPlayer::SelectStreamCallback(
+    GstElement* /*decodebin*/, GstStreamCollection* /*collection*/,
+    GstStream* stream, gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  GstCaps* caps = gst_stream_get_caps(stream);
+  const gboolean allowed = self->IsVideoCodecAllowed(caps) ? TRUE : FALSE;
+  if (!allowed) {
+    gchar* caps_text = caps ? gst_caps_to_string(caps) : nullptr;
+    std::cout << "CODEC-POLICY: rejecting unsupported stream caps "
+              << (caps_text ? caps_text : "<unknown>") << std::endl;
+    g_free(caps_text);
+  }
+  if (caps) {
+    gst_caps_unref(caps);
+  }
+  return allowed;
 }
 
 // static
