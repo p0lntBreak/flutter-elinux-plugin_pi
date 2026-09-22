@@ -2359,7 +2359,7 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
 
 bool GstVideoPlayer::IsVideoCodecAllowed(const GstCaps* caps) const {
   if (!caps || gst_caps_is_empty(caps)) {
-    return false;
+    return true;
   }
 
   bool saw_encoded_video = false;
@@ -2372,6 +2372,22 @@ bool GstVideoPlayer::IsVideoCodecAllowed(const GstCaps* caps) const {
     if (g_str_has_prefix(media_type, "video/x-raw")) {
       return true;
     }
+
+    // These are containers or demuxer inputs, not video codecs. They must be
+    // allowed through so decodebin can reach the elementary H.264/AV1 stream
+    // inside them. In particular, rejecting video/mpegts prevents tsdemux
+    // from ever exposing the actual codec.
+    if (g_strcmp0(media_type, "video/mpegts") == 0 ||
+        g_strcmp0(media_type, "video/mp2t") == 0 ||
+        g_strcmp0(media_type, "video/quicktime") == 0 ||
+        g_strcmp0(media_type, "video/x-matroska") == 0 ||
+        g_strcmp0(media_type, "video/x-flv") == 0 ||
+        g_strcmp0(media_type, "application/x-hls") == 0 ||
+        g_strcmp0(media_type, "application/vnd.apple.mpegurl") == 0 ||
+        g_strcmp0(media_type, "application/dash+xml") == 0) {
+      return true;
+    }
+
     saw_encoded_video = true;
 
     std::string codec;
