@@ -191,6 +191,8 @@ bool GstAudioPlayer::CreatePipeline() {
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.playbin));
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
+  std::cout << "AUDIO-PIPELINE: created player=" << player_id_ << std::endl;
+
   return true;
 }
 
@@ -296,6 +298,8 @@ void GstAudioPlayer::Seek(int64_t position) {
 
 void GstAudioPlayer::SetSourceUrl(std::string url) {
   if (url_ != url) {
+    std::cout << "AUDIO-SOURCE: player=" << player_id_ << " replacing source"
+              << std::endl;
     url_ = url;
 
     // Update audio device in case HDMI was connected after app startup
@@ -315,6 +319,8 @@ void GstAudioPlayer::SetSourceUrl(std::string url) {
         std::cerr << "Unable to set the pipeline to GST_STATE_READY."
                   << std::endl;
       }
+      std::cout << "AUDIO-PIPELINE: player=" << player_id_
+                << " prepared state=READY" << std::endl;
     }
     is_initialized_ = true;
   }
@@ -406,6 +412,7 @@ int64_t GstAudioPlayer::GetCurrentPosition() {
 }
 
 void GstAudioPlayer::Release() {
+  std::cout << "AUDIO-PIPELINE: releasing player=" << player_id_ << std::endl;
   is_playing_ = false;
   is_initialized_ = false;
   url_.clear();
@@ -427,6 +434,7 @@ void GstAudioPlayer::Dispose() {
   is_playing_ = false;
   is_initialized_ = false;
   url_.clear();
+  std::cout << "AUDIO-PIPELINE: disposing player=" << player_id_ << std::endl;
 
   if (gst_.bus) {
     gst_bus_set_flushing(gst_.bus, TRUE);
@@ -468,19 +476,27 @@ GstBusSyncReply GstAudioPlayer::HandleGstMessage(GstBus* bus,
       if (GST_MESSAGE_SRC(message) == GST_OBJECT(self->gst_.playbin)) {
         GstState old_state, new_state;
         gst_message_parse_state_changed(message, &old_state, &new_state, NULL);
+        std::cout << "AUDIO-PIPELINE-STATE: player=" << self->player_id_
+                  << " " << gst_element_state_get_name(old_state) << " -> "
+                  << gst_element_state_get_name(new_state) << std::endl;
       }
       break;
     }
     case GST_MESSAGE_EOS:
+      std::cout << "AUDIO-EOS: player=" << self->player_id_ << std::endl;
       self->is_completed_ = true;
       break;
     case GST_MESSAGE_WARNING: {
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
-      g_printerr("WARNING from element %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
-      g_printerr("Warning details: %s\n", debug);
+      std::cerr << "AUDIO-WARNING: player=" << self->player_id_
+                << " element=" << GST_OBJECT_NAME(message->src) << ": "
+                << (error->message ? error->message : "unknown warning")
+                << std::endl;
+      if (debug && debug[0]) {
+        std::cerr << "AUDIO-WARNING-DEBUG: " << debug << std::endl;
+      }
       g_free(debug);
       g_error_free(error);
       break;
@@ -489,9 +505,13 @@ GstBusSyncReply GstAudioPlayer::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_error(message, &error, &debug);
-      g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
-      g_printerr("Error details: %s\n", debug);
+      std::cerr << "AUDIO-ERROR: player=" << self->player_id_
+                << " element=" << GST_OBJECT_NAME(message->src) << ": "
+                << (error->message ? error->message : "unknown error")
+                << std::endl;
+      if (debug && debug[0]) {
+        std::cerr << "AUDIO-ERROR-DEBUG: " << debug << std::endl;
+      }
       g_free(debug);
       g_error_free(error);
       break;

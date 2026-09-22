@@ -18,8 +18,6 @@
 #include <string>
 #include <vector>
 
-#include "logging.h"
-
 namespace {
 // GstAutoplugSelectResult is defined by gst-plugins-base but is not exported
 // in a public header on all target images. These are its stable signal values.
@@ -334,7 +332,6 @@ GstVideoPlayer::GstVideoPlayer(
     std::vector<std::string> supported_video_codecs)
     : supported_video_codecs_(std::move(supported_video_codecs)),
       stream_handler_(std::move(handler)) {
-  video_player_elinux::InitTimestampedLogging();
   gst_.pipeline = nullptr;
   gst_.playbin = nullptr;
   gst_.video_convert = nullptr;
@@ -418,7 +415,7 @@ GstVideoPlayer::GstVideoPlayer(
   // playlist has an affirmative live marker (#EXT-X-PLAYLIST-TYPE:EVENT or
   // similar). Our origin currently serves a playlist with a sliding
   // #EXT-X-MEDIA-SEQUENCE (technically live) but NO affirmative type
-  // marker — device log /tmp/soatv.log 2026-08-06 confirmed hlsdemux
+  // marker — device logs confirmed hlsdemux classified the stream as VOD
   // classified it as VOD, is_live_ stayed false, and every live-guard
   // (Pause block, SetSeek live-ignore, EOS drop) fell through. The
   // pipeline paused on spurious lifecycle events, then hlsdemux
