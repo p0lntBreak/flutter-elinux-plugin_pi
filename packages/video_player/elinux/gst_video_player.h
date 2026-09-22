@@ -179,6 +179,19 @@ class GstVideoPlayer {
   // spurious and must never be treated as completion (no seek-0, no 'completed'
   // event) or it loops the buffered window.
   bool is_live_ = false;
+  // Set when the Dart wrapper explicitly supplies stream_type metadata. This
+  // is authoritative and prevents a VOD URL containing "/live/" from being
+  // misclassified as an unseekable live stream.
+  bool stream_type_is_explicit_ = false;
+  // Seek state is shared by the platform thread, streaming thread, position
+  // queries and watchdog. A flushing HLS seek may temporarily make position
+  // unavailable and stop frames while new segments are fetched; retain the
+  // requested position and give that operation a bounded recovery window.
+  std::mutex seek_mutex_;
+  std::atomic<bool> seek_in_progress_{false};
+  std::atomic<int64_t> seek_target_ms_{0};
+  std::atomic<int64_t> last_known_position_ms_{0};
+  std::atomic<int64_t> last_seek_started_ticks_{0};
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;

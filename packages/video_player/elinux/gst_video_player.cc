@@ -397,6 +397,12 @@ GstVideoPlayer::GstVideoPlayer(
 
       const std::string trace = value_for("trace");
       if (!trace.empty()) startup_trace_id_ = trace;
+      const std::string stream_type = value_for("stream_type");
+      if (stream_type == "live" || stream_type == "onDemand") {
+        stream_type_is_explicit_ = true;
+        is_live_ = stream_type == "live";
+        std::cout << "URI-STREAM-TYPE: explicit " << stream_type << std::endl;
+      }
       const std::string offset_ms = value_for("offset_ms");
       if (!offset_ms.empty()) {
         try {
@@ -427,7 +433,7 @@ GstVideoPlayer::GstVideoPlayer(
   // https://ev-edgecache.soa.africa/edge/stream/live/<channel-id>...
   // pattern). Preroll's NO_PREROLL check still runs and can also flip
   // is_live_=true; whichever signal fires first wins.
-  if (uri_.find("/live/") != std::string::npos) {
+  if (!stream_type_is_explicit_ && uri_.find("/live/") != std::string::npos) {
     is_live_ = true;
     std::cout << "URI-LIVE-HINT: /live/ path detected — is_live_=true "
                  "before preroll"
@@ -866,6 +872,7 @@ bool GstVideoPlayer::SetPlaybackRate(double rate) {
 }
 
 bool GstVideoPlayer::SetSeek(int64_t position) {
+  std::lock_guard<std::mutex> seek_lock(seek_mutex_);
   if (!gst_.pipeline) {
     return false;
   }
@@ -882,21 +889,49 @@ bool GstVideoPlayer::SetSeek(int64_t position) {
   // A live stream has no seekable timeline anyway (the "duration" reported by
   // playbin is the current sliding-window depth, not an addressable range),
   // so rejecting the seek is the correct behavior — not a workaround.
-  // Returns true so the plugin API doesn't surface an error to Flutter.
   if (is_live_) {
-    std::cout << "SetSeek ignored for live stream (position=" << position
+    std::cerr << "SetSeek rejected for live stream (position=" << position
               << "ms)" << std::endl;
-    return true;
+    return false;
   }
-  auto nanosecond = position * 1000 * 1000;
+
+  const int64_t duration = GetDuration();
+  if (duration <= 0) {
+    std::cerr << "SetSeek rejected: duration unavailable" << std::endl;
+    return false;
+  }
+  position = std::clamp<int64_t>(position, 0, duration);
+
+  GstQuery* seeking_query = gst_query_new_seeking(GST_FORMAT_TIME);
+  gboolean seekable = FALSE;
+  if (seeking_query && gst_element_query(gst_.pipeline, seeking_query)) {
+    GstFormat format = GST_FORMAT_TIME;
+    gint64 start = 0;
+    gint64 end = 0;
+    gst_query_parse_seeking(seeking_query, &format, &seekable, &start, &end);
+  }
+  if (seeking_query) gst_query_unref(seeking_query);
+  if (!seekable) {
+    std::cerr << "SetSeek rejected: stream is not seekable" << std::endl;
+    return false;
+  }
+
+  seek_target_ms_.store(position);
+  last_known_position_ms_.store(position);
+  seek_in_progress_.store(true);
+  last_seek_started_ticks_.store(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  auto nanosecond = position * GST_MSECOND;
   if (!gst_element_seek(
           gst_.pipeline, playback_rate_, GST_FORMAT_TIME,
           (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-          GST_SEEK_TYPE_SET, nanosecond, GST_SEEK_TYPE_SET,
+          GST_SEEK_TYPE_SET, nanosecond, GST_SEEK_TYPE_NONE,
           GST_CLOCK_TIME_NONE)) {
+    seek_in_progress_.store(false);
     std::cerr << "Failed to seek " << nanosecond << std::endl;
     return false;
   }
+  std::cout << "SEEK: accepted target=" << position << "ms" << std::endl;
   return true;
 }
 
@@ -922,8 +957,14 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
 
   // Sometimes we get an error when playing streaming videos.
   if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
-    return 0;
+    return last_known_position_ms_.load();
   }
+
+  const int64_t position_ms = position / GST_MSECOND;
+  if (seek_in_progress_.load()) {
+    return seek_target_ms_.load();
+  }
+  last_known_position_ms_.store(position_ms);
 
   // TODO: We need to handle this code in the proper plase.
   // The VideoPlayer plugin doesn't have a main loop, so EOS message
@@ -944,7 +985,7 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
     }
   }
 
-  return position / GST_MSECOND;
+  return position_ms;
 }
 
 #ifdef USE_EGL_IMAGE_DMABUF
@@ -1557,11 +1598,15 @@ bool GstVideoPlayer::Preroll() {
   // more reliable than a duration/seekable heuristic (a live HLS playlist still
   // reports a small sliding-window duration, which looks like VOD). Capture it
   // so EOS handling never treats a live stream as "completed".
-  if (result == GST_STATE_CHANGE_NO_PREROLL) {
+  if (result == GST_STATE_CHANGE_NO_PREROLL && !stream_type_is_explicit_) {
     is_live_ = true;
     std::cout
         << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
         << std::endl;
+  } else if (result == GST_STATE_CHANGE_NO_PREROLL && !is_live_) {
+    std::cout << "PREROLL: NO_PREROLL ignored because stream type is explicitly "
+                 "onDemand"
+              << std::endl;
   }
   // Give GStreamer up to 5 s to settle before Init() advances to PLAYING.
   GstState state;
@@ -1755,6 +1800,10 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   // Ground-truth liveness signal for the watchdog: only moves when a real
   // video buffer reaches the sink, so a wedged decoder stalls it.
   self->frames_handed_off_.fetch_add(1, std::memory_order_relaxed);
+  if (self->seek_in_progress_.exchange(false)) {
+    self->last_seek_started_ticks_.store(0);
+    std::cout << "SEEK: first decoded frame reached sink" << std::endl;
+  }
 
   self->stream_handler_->OnNotifyFrameDecoded();
 }
@@ -2053,6 +2102,23 @@ void GstVideoPlayer::StartWatchdog() {
 
       auto now = std::chrono::steady_clock::now();
       const int pct = last_buffering_percent_.load();
+
+      // A flushing HLS seek legitimately stops decoded frames while the demuxer
+      // opens a distant segment and refills its queues. Never run the generic
+      // state-cycle recovery or fatal reconnect inside this bounded grace
+      // period; both can collide with the in-flight flush and wedge V4L2.
+      constexpr auto kSeekGrace = std::chrono::seconds(15);
+      const int64_t seek_started_ticks = last_seek_started_ticks_.load();
+      if (seek_in_progress_.load() && seek_started_ticks > 0) {
+        const auto seek_started = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(seek_started_ticks));
+        if (now - seek_started < kSeekGrace) {
+          last_seen_frames =
+              frames_handed_off_.load(std::memory_order_relaxed);
+          last_frame_advance_time = now;
+          continue;
+        }
+      }
 
       // --- Check 1 (DIAGNOSTIC ONLY — no longer reconnects): buffer-% plateau.
       // A LIVE stream sitting at the live edge legitimately plateaus below

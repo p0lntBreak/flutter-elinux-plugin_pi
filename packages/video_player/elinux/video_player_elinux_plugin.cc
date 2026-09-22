@@ -785,9 +785,15 @@ void VideoPlayerPlugin::HandleSeekToMethodCall(
   flutter::EncodableMap result;
 
   if (players_.find(texture_id) != players_.end()) {
-    players_[texture_id]->player->SetSeek(parameter.GetPosition());
-    result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
-                   flutter::EncodableValue());
+    if (players_[texture_id]->player->SetSeek(parameter.GetPosition())) {
+      result.emplace(flutter::EncodableValue(kEncodableMapkeyResult),
+                     flutter::EncodableValue());
+    } else {
+      result.emplace(
+          flutter::EncodableValue(kEncodableMapkeyError),
+          flutter::EncodableValue(WrapError(
+              "Native pipeline rejected the seek request", "seek_failed")));
+    }
   } else {
     auto error_message = "Couldn't find the player with texture id: " +
                          std::to_string(texture_id);
