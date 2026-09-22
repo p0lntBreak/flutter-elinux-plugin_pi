@@ -1596,6 +1596,7 @@ void GstVideoPlayer::DestroyPipeline() {
 
   if (gst_.pipeline) {
     gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
+    gst_element_get_state(gst_.pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
   }
 
   // A handoff in flight between disabling signal-handoffs and the NULL

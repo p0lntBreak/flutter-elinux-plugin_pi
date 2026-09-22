@@ -304,16 +304,16 @@ void GstAudioPlayer::SetSourceUrl(std::string url) {
     // flush unhandled messeges
     gst_bus_set_flushing(gst_.bus, TRUE);
     gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+    gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
+    gst_bus_set_flushing(gst_.bus, FALSE);
     is_playing_ = false;
     if (!url_.empty()) {
       g_object_set(GST_OBJECT(gst_.playbin), "uri", url_.c_str(), NULL);
-      if (gst_.playbin->current_state != GST_STATE_READY) {
-        GstStateChangeReturn ret =
-            gst_element_set_state(gst_.playbin, GST_STATE_READY);
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-          std::cerr <<
-            "Unable to set the pipeline to GST_STATE_READY." << std::endl;
-        }
+      GstStateChangeReturn ret =
+          gst_element_set_state(gst_.playbin, GST_STATE_READY);
+      if (ret == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "Unable to set the pipeline to GST_STATE_READY."
+                  << std::endl;
       }
     }
     is_initialized_ = true;
@@ -415,6 +415,7 @@ void GstAudioPlayer::Release() {
   if (state > GST_STATE_NULL) {
     gst_bus_set_flushing(gst_.bus, TRUE);
     gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+    gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
   }
 }
 
@@ -438,15 +439,23 @@ void GstAudioPlayer::Dispose() {
     gst_.source = nullptr;
   }
 
-  if (gst_.panorama) {
-    gst_element_set_state(gst_.audiobin, GST_STATE_NULL);
-    gst_element_remove_pad(gst_.audiobin, gst_.panoramasinkpad);
-    gst_bin_remove(GST_BIN(gst_.audiobin), gst_.audiosink);
-    gst_bin_remove(GST_BIN(gst_.audiobin), gst_.panorama);
-    gst_.panorama = nullptr;
+  if (gst_.playbin) {
+    gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+    gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
+    gst_object_unref(GST_OBJECT(gst_.playbin));
+  }
+
+  if (gst_.audiobin) {
+    gst_object_unref(GST_OBJECT(gst_.audiobin));
+  } else if (gst_.audiosink) {
+    gst_object_unref(GST_OBJECT(gst_.audiosink));
   }
 
   gst_.playbin = nullptr;
+  gst_.audiobin = nullptr;
+  gst_.panorama = nullptr;
+  gst_.audiosink = nullptr;
+  gst_.panoramasinkpad = nullptr;
 }
 
 // static
@@ -459,13 +468,6 @@ GstBusSyncReply GstAudioPlayer::HandleGstMessage(GstBus* bus,
       if (GST_MESSAGE_SRC(message) == GST_OBJECT(self->gst_.playbin)) {
         GstState old_state, new_state;
         gst_message_parse_state_changed(message, &old_state, &new_state, NULL);
-        if (new_state == GST_STATE_READY) {
-          if (gst_element_set_state(self->gst_.playbin, GST_STATE_PAUSED) ==
-              GST_STATE_CHANGE_FAILURE) {
-            g_printerr("Unable to set the pipeline from GST_STATE_READY "
-                "to GST_STATE_PAUSED\n");
-          }
-        }
       }
       break;
     }
