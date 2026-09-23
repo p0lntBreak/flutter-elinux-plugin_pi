@@ -876,7 +876,7 @@ bool GstVideoPlayer::SetSeek(int64_t position) {
   if (!gst_.pipeline) {
     return false;
   }
-  // Block ALL seeks on live streams. The base video_player package's
+  // Ignore ALL seeks on live streams. The base video_player package's
   // VideoPlayerController.play() has a "if (value.position == value.duration)
   // seekTo(0)" line that fires on the auto-resume after a spurious app-
   // lifecycle pause (cage-less GBM backend on Pi4 emits AppLifecycleState.
@@ -887,16 +887,28 @@ bool GstVideoPlayer::SetSeek(int64_t position) {
   // is why the bug is channel-specific.
   //
   // A live stream has no seekable timeline anyway (the "duration" reported by
-  // playbin is the current sliding-window depth, not an addressable range),
-  // so rejecting the seek is the correct behavior — not a workaround.
+  // playbin is the current sliding-window depth, not an addressable range).
+  // Report this as a successful no-op: play() can issue its own seekTo(0), and
+  // surfacing an error here would incorrectly fail live-player startup even
+  // though the application never requested a seek.
   if (is_live_) {
-    std::cerr << "SetSeek rejected for live stream (position=" << position
+    std::cout << "SetSeek ignored for live stream (position=" << position
               << "ms)" << std::endl;
-    return false;
+    return true;
   }
 
   const int64_t duration = GetDuration();
   if (duration <= 0) {
+    // video_player's play() seeks to zero when its initial position and
+    // duration are both zero. During startup the native duration may not be
+    // queryable yet, so accept that framework-generated request as a no-op.
+    // Non-zero VOD seeks still fail until a real duration is available.
+    if (position == 0) {
+      std::cout << "SetSeek ignored: startup seek-to-zero before duration is "
+                   "available"
+                << std::endl;
+      return true;
+    }
     std::cerr << "SetSeek rejected: duration unavailable" << std::endl;
     return false;
   }
