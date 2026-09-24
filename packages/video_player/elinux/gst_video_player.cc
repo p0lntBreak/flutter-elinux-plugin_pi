@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -17,9 +18,12 @@
 #include <string>
 #include <vector>
 
-#include "logging.h"
-
 namespace {
+// GstAutoplugSelectResult is defined by gst-plugins-base but is not exported
+// in a public header on all target images. These are its stable signal values.
+constexpr gint kAutoplugSelectTry = 0;
+constexpr gint kAutoplugSelectSkip = 2;
+
 // Buffer discipline retune (task #60, 2026-08-29). Doubled from 30 to 60 s to
 // give the multiqueue more headroom against jitter on marginal networks. The
 // ABR gates below (kHealthyBufferSecs, hardcoded 6 s / 15 s thresholds in
@@ -324,9 +328,10 @@ void DumpKernelFreezeDiagnostic() {
 }  // namespace
 
 GstVideoPlayer::GstVideoPlayer(
-    const std::string& uri, std::unique_ptr<VideoPlayerStreamHandler> handler)
-    : stream_handler_(std::move(handler)) {
-  video_player_elinux::InitTimestampedLogging();
+    const std::string& uri, std::unique_ptr<VideoPlayerStreamHandler> handler,
+    std::vector<std::string> supported_video_codecs)
+    : supported_video_codecs_(std::move(supported_video_codecs)),
+      stream_handler_(std::move(handler)) {
   gst_.pipeline = nullptr;
   gst_.playbin = nullptr;
   gst_.video_convert = nullptr;
@@ -336,6 +341,25 @@ GstVideoPlayer::GstVideoPlayer(
   gst_.buffer = nullptr;
 
   uri_ = ParseUri(uri);
+
+  for (auto& codec : supported_video_codecs_) {
+    std::transform(codec.begin(), codec.end(), codec.begin(),
+                   [](unsigned char value) { return std::tolower(value); });
+  }
+  supported_video_codecs_.erase(
+      std::remove_if(supported_video_codecs_.begin(),
+                     supported_video_codecs_.end(),
+                     [](const std::string& codec) { return codec.empty(); }),
+      supported_video_codecs_.end());
+  if (supported_video_codecs_.empty()) {
+    supported_video_codecs_.push_back("h264");
+  }
+  std::cout << "CODEC-POLICY: allowed video codecs=";
+  for (size_t i = 0; i < supported_video_codecs_.size(); ++i) {
+    if (i > 0) std::cout << ",";
+    std::cout << supported_video_codecs_[i];
+  }
+  std::cout << std::endl;
 
   // Private startup metadata. The fragment never reaches the origin. It can
   // thread either (a) a measured throughput sample from its auth GET
@@ -373,6 +397,12 @@ GstVideoPlayer::GstVideoPlayer(
 
       const std::string trace = value_for("trace");
       if (!trace.empty()) startup_trace_id_ = trace;
+      const std::string stream_type = value_for("stream_type");
+      if (stream_type == "live" || stream_type == "onDemand") {
+        stream_type_is_explicit_ = true;
+        is_live_ = stream_type == "live";
+        std::cout << "URI-STREAM-TYPE: explicit " << stream_type << std::endl;
+      }
       const std::string offset_ms = value_for("offset_ms");
       if (!offset_ms.empty()) {
         try {
@@ -391,7 +421,7 @@ GstVideoPlayer::GstVideoPlayer(
   // playlist has an affirmative live marker (#EXT-X-PLAYLIST-TYPE:EVENT or
   // similar). Our origin currently serves a playlist with a sliding
   // #EXT-X-MEDIA-SEQUENCE (technically live) but NO affirmative type
-  // marker — device log /tmp/soatv.log 2026-08-06 confirmed hlsdemux
+  // marker — device logs confirmed hlsdemux classified the stream as VOD
   // classified it as VOD, is_live_ stayed false, and every live-guard
   // (Pause block, SetSeek live-ignore, EOS drop) fell through. The
   // pipeline paused on spurious lifecycle events, then hlsdemux
@@ -403,7 +433,7 @@ GstVideoPlayer::GstVideoPlayer(
   // https://ev-edgecache.soa.africa/edge/stream/live/<channel-id>...
   // pattern). Preroll's NO_PREROLL check still runs and can also flip
   // is_live_=true; whichever signal fires first wins.
-  if (uri_.find("/live/") != std::string::npos) {
+  if (!stream_type_is_explicit_ && uri_.find("/live/") != std::string::npos) {
     is_live_ = true;
     std::cout << "URI-LIVE-HINT: /live/ path detected — is_live_=true "
                  "before preroll"
@@ -842,10 +872,11 @@ bool GstVideoPlayer::SetPlaybackRate(double rate) {
 }
 
 bool GstVideoPlayer::SetSeek(int64_t position) {
+  std::lock_guard<std::mutex> seek_lock(seek_mutex_);
   if (!gst_.pipeline) {
     return false;
   }
-  // Block ALL seeks on live streams. The base video_player package's
+  // Ignore ALL seeks on live streams. The base video_player package's
   // VideoPlayerController.play() has a "if (value.position == value.duration)
   // seekTo(0)" line that fires on the auto-resume after a spurious app-
   // lifecycle pause (cage-less GBM backend on Pi4 emits AppLifecycleState.
@@ -856,23 +887,63 @@ bool GstVideoPlayer::SetSeek(int64_t position) {
   // is why the bug is channel-specific.
   //
   // A live stream has no seekable timeline anyway (the "duration" reported by
-  // playbin is the current sliding-window depth, not an addressable range),
-  // so rejecting the seek is the correct behavior — not a workaround.
-  // Returns true so the plugin API doesn't surface an error to Flutter.
+  // playbin is the current sliding-window depth, not an addressable range).
+  // Report this as a successful no-op: play() can issue its own seekTo(0), and
+  // surfacing an error here would incorrectly fail live-player startup even
+  // though the application never requested a seek.
   if (is_live_) {
     std::cout << "SetSeek ignored for live stream (position=" << position
               << "ms)" << std::endl;
     return true;
   }
-  auto nanosecond = position * 1000 * 1000;
+
+  const int64_t duration = GetDuration();
+  if (duration <= 0) {
+    // video_player's play() seeks to zero when its initial position and
+    // duration are both zero. During startup the native duration may not be
+    // queryable yet, so accept that framework-generated request as a no-op.
+    // Non-zero VOD seeks still fail until a real duration is available.
+    if (position == 0) {
+      std::cout << "SetSeek ignored: startup seek-to-zero before duration is "
+                   "available"
+                << std::endl;
+      return true;
+    }
+    std::cerr << "SetSeek rejected: duration unavailable" << std::endl;
+    return false;
+  }
+  position = std::clamp<int64_t>(position, 0, duration);
+
+  GstQuery* seeking_query = gst_query_new_seeking(GST_FORMAT_TIME);
+  gboolean seekable = FALSE;
+  if (seeking_query && gst_element_query(gst_.pipeline, seeking_query)) {
+    GstFormat format = GST_FORMAT_TIME;
+    gint64 start = 0;
+    gint64 end = 0;
+    gst_query_parse_seeking(seeking_query, &format, &seekable, &start, &end);
+  }
+  if (seeking_query) gst_query_unref(seeking_query);
+  if (!seekable) {
+    std::cerr << "SetSeek rejected: stream is not seekable" << std::endl;
+    return false;
+  }
+
+  seek_target_ms_.store(position);
+  last_known_position_ms_.store(position);
+  seek_in_progress_.store(true);
+  last_seek_started_ticks_.store(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  auto nanosecond = position * GST_MSECOND;
   if (!gst_element_seek(
           gst_.pipeline, playback_rate_, GST_FORMAT_TIME,
           (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-          GST_SEEK_TYPE_SET, nanosecond, GST_SEEK_TYPE_SET,
+          GST_SEEK_TYPE_SET, nanosecond, GST_SEEK_TYPE_NONE,
           GST_CLOCK_TIME_NONE)) {
+    seek_in_progress_.store(false);
     std::cerr << "Failed to seek " << nanosecond << std::endl;
     return false;
   }
+  std::cout << "SEEK: accepted target=" << position << "ms" << std::endl;
   return true;
 }
 
@@ -898,8 +969,14 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
 
   // Sometimes we get an error when playing streaming videos.
   if (!gst_element_query_position(gst_.pipeline, GST_FORMAT_TIME, &position)) {
-    return 0;
+    return last_known_position_ms_.load();
   }
+
+  const int64_t position_ms = position / GST_MSECOND;
+  if (seek_in_progress_.load()) {
+    return seek_target_ms_.load();
+  }
+  last_known_position_ms_.store(position_ms);
 
   // TODO: We need to handle this code in the proper plase.
   // The VideoPlayer plugin doesn't have a main loop, so EOS message
@@ -920,7 +997,7 @@ int64_t GstVideoPlayer::GetCurrentPosition() {
     }
   }
 
-  return position / GST_MSECOND;
+  return position_ms;
 }
 
 #ifdef USE_EGL_IMAGE_DMABUF
@@ -1533,11 +1610,15 @@ bool GstVideoPlayer::Preroll() {
   // more reliable than a duration/seekable heuristic (a live HLS playlist still
   // reports a small sliding-window duration, which looks like VOD). Capture it
   // so EOS handling never treats a live stream as "completed".
-  if (result == GST_STATE_CHANGE_NO_PREROLL) {
+  if (result == GST_STATE_CHANGE_NO_PREROLL && !stream_type_is_explicit_) {
     is_live_ = true;
     std::cout
         << "PREROLL: live source (NO_PREROLL) — EOS will not complete/seek"
         << std::endl;
+  } else if (result == GST_STATE_CHANGE_NO_PREROLL && !is_live_) {
+    std::cout << "PREROLL: NO_PREROLL ignored because stream type is explicitly "
+                 "onDemand"
+              << std::endl;
   }
   // Give GStreamer up to 5 s to settle before Init() advances to PLAYING.
   GstState state;
@@ -1569,6 +1650,7 @@ void GstVideoPlayer::DestroyPipeline() {
 
   if (gst_.pipeline) {
     gst_element_set_state(gst_.pipeline, GST_STATE_NULL);
+    gst_element_get_state(gst_.pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
   }
 
   // A handoff in flight between disabling signal-handoffs and the NULL
@@ -1730,6 +1812,10 @@ void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
   // Ground-truth liveness signal for the watchdog: only moves when a real
   // video buffer reaches the sink, so a wedged decoder stalls it.
   self->frames_handed_off_.fetch_add(1, std::memory_order_relaxed);
+  if (self->seek_in_progress_.exchange(false)) {
+    self->last_seek_started_ticks_.store(0);
+    std::cout << "SEEK: first decoded frame reached sink" << std::endl;
+  }
 
   self->stream_handler_->OnNotifyFrameDecoded();
 }
@@ -2029,6 +2115,23 @@ void GstVideoPlayer::StartWatchdog() {
       auto now = std::chrono::steady_clock::now();
       const int pct = last_buffering_percent_.load();
 
+      // A flushing HLS seek legitimately stops decoded frames while the demuxer
+      // opens a distant segment and refills its queues. Never run the generic
+      // state-cycle recovery or fatal reconnect inside this bounded grace
+      // period; both can collide with the in-flight flush and wedge V4L2.
+      constexpr auto kSeekGrace = std::chrono::seconds(15);
+      const int64_t seek_started_ticks = last_seek_started_ticks_.load();
+      if (seek_in_progress_.load() && seek_started_ticks > 0) {
+        const auto seek_started = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(seek_started_ticks));
+        if (now - seek_started < kSeekGrace) {
+          last_seen_frames =
+              frames_handed_off_.load(std::memory_order_relaxed);
+          last_frame_advance_time = now;
+          continue;
+        }
+      }
+
       // --- Check 1 (DIAGNOSTIC ONLY — no longer reconnects): buffer-% plateau.
       // A LIVE stream sitting at the live edge legitimately plateaus below
       // 100%: the cache-target (e.g. 30s) is unsatisfiable because no segments
@@ -2283,6 +2386,21 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
           << "ABR: set hlsdemux bitrate-limit=1.0 (removes default 0.8 shave)"
           << std::endl;
     }
+  } else if (name && (g_str_has_prefix(name, "decodebin") ||
+                      g_str_has_prefix(name, "uridecodebin"))) {
+    if (g_signal_lookup("autoplug-select", G_OBJECT_TYPE(element)) != 0) {
+      g_signal_connect(element, "autoplug-select",
+                       G_CALLBACK(GstVideoPlayer::AutoplugSelectCallback),
+                       self);
+      std::cout << "CODEC-POLICY: attached decoder selection filter to "
+                << name << std::endl;
+    }
+    if (g_signal_lookup("select-stream", G_OBJECT_TYPE(element)) != 0) {
+      g_signal_connect(element, "select-stream",
+                       G_CALLBACK(GstVideoPlayer::SelectStreamCallback), self);
+      std::cout << "CODEC-POLICY: attached stream selection filter to "
+                << name << std::endl;
+    }
   } else if (name && (g_str_has_prefix(name, "souphttpsrc") ||
                       g_str_has_prefix(name, "curlhttpsrc"))) {
     // Segments DO cross the http source's src pad — probe here for real
@@ -2312,6 +2430,107 @@ void GstVideoPlayer::DeepElementAddedHandler(GstBin* /*bin*/,
               << " (time=60s bytes=20MB buffers=unlimited)" << std::endl;
   }
   g_free(name);
+}
+
+bool GstVideoPlayer::IsVideoCodecAllowed(const GstCaps* caps) const {
+  if (!caps || gst_caps_is_empty(caps)) {
+    return true;
+  }
+
+  bool saw_encoded_video = false;
+  for (guint i = 0; i < gst_caps_get_size(caps); ++i) {
+    const GstStructure* structure = gst_caps_get_structure(caps, i);
+    const gchar* media_type = gst_structure_get_name(structure);
+    if (!media_type || !g_str_has_prefix(media_type, "video/")) {
+      continue;
+    }
+    if (g_str_has_prefix(media_type, "video/x-raw")) {
+      return true;
+    }
+
+    // These are containers or demuxer inputs, not video codecs. They must be
+    // allowed through so decodebin can reach the elementary H.264/AV1 stream
+    // inside them. In particular, rejecting video/mpegts prevents tsdemux
+    // from ever exposing the actual codec.
+    if (g_strcmp0(media_type, "video/mpegts") == 0 ||
+        g_strcmp0(media_type, "video/mp2t") == 0 ||
+        g_strcmp0(media_type, "video/quicktime") == 0 ||
+        g_strcmp0(media_type, "video/x-matroska") == 0 ||
+        g_strcmp0(media_type, "video/x-flv") == 0 ||
+        g_strcmp0(media_type, "application/x-hls") == 0 ||
+        g_strcmp0(media_type, "application/vnd.apple.mpegurl") == 0 ||
+        g_strcmp0(media_type, "application/dash+xml") == 0) {
+      return true;
+    }
+
+    saw_encoded_video = true;
+
+    std::string codec;
+    if (g_str_has_prefix(media_type, "video/x-h264")) {
+      codec = "h264";
+    } else if (g_str_has_prefix(media_type, "video/x-av1")) {
+      codec = "av1";
+    } else if (g_str_has_prefix(media_type, "video/x-h265") ||
+               g_str_has_prefix(media_type, "video/x-hevc")) {
+      codec = "hevc";
+    } else if (g_str_has_prefix(media_type, "video/x-vp9")) {
+      codec = "vp9";
+    } else if (g_str_has_prefix(media_type, "video/x-vp8")) {
+      codec = "vp8";
+    } else if (g_str_has_prefix(media_type, "video/mpeg")) {
+      codec = "mpeg";
+    } else {
+      // Unknown encoded video is not safe to select under an explicit codec
+      // policy. Add its normalized name to the policy when supporting it.
+      codec = media_type;
+    }
+
+    if (std::find(supported_video_codecs_.begin(),
+                  supported_video_codecs_.end(),
+                  codec) != supported_video_codecs_.end()) {
+      return true;
+    }
+  }
+
+  return !saw_encoded_video;
+}
+
+// static
+gint GstVideoPlayer::AutoplugSelectCallback(
+    GstElement* /*decodebin*/, GstPad* /*pad*/, GstCaps* caps,
+    GstElementFactory* factory, gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  if (self->IsVideoCodecAllowed(caps)) {
+    return kAutoplugSelectTry;
+  }
+
+  gchar* caps_text = gst_caps_to_string(caps);
+  const gchar* factory_name = gst_plugin_feature_get_name(
+      GST_PLUGIN_FEATURE(factory));
+  std::cout << "CODEC-POLICY: rejecting unsupported video caps "
+            << (caps_text ? caps_text : "<unknown>") << " for decoder "
+            << (factory_name ? factory_name : "<unknown>") << std::endl;
+  g_free(caps_text);
+  return kAutoplugSelectSkip;
+}
+
+// static
+gboolean GstVideoPlayer::SelectStreamCallback(
+    GstElement* /*decodebin*/, GstStreamCollection* /*collection*/,
+    GstStream* stream, gpointer user_data) {
+  auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  GstCaps* caps = gst_stream_get_caps(stream);
+  const gboolean allowed = self->IsVideoCodecAllowed(caps) ? TRUE : FALSE;
+  if (!allowed) {
+    gchar* caps_text = caps ? gst_caps_to_string(caps) : nullptr;
+    std::cout << "CODEC-POLICY: rejecting unsupported stream caps "
+              << (caps_text ? caps_text : "<unknown>") << std::endl;
+    g_free(caps_text);
+  }
+  if (caps) {
+    gst_caps_unref(caps);
+  }
+  return allowed;
 }
 
 // static

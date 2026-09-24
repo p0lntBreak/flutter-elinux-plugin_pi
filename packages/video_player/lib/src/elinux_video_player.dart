@@ -15,10 +15,28 @@ import 'messages.g.dart';
 /// Pigeon-generated [VideoPlayerApi].
 class ELinuxVideoPlayer extends VideoPlayerPlatform {
   final ELinuxVideoPlayerApi _api = ELinuxVideoPlayerApi();
+  static const List<String> _defaultSupportedVideoCodecs = <String>['h264'];
+  static ELinuxVideoPlayer? _instance;
+  List<String> _supportedVideoCodecs = _defaultSupportedVideoCodecs;
 
   /// Registers this class as the default instance of [PathProviderPlatform].
   static void registerWith() {
-    VideoPlayerPlatform.instance = ELinuxVideoPlayer();
+    final player = ELinuxVideoPlayer();
+    _instance = player;
+    VideoPlayerPlatform.instance = player;
+  }
+
+  /// Sets the codecs allowed for the next eLinux video-player creations.
+  ///
+  /// The capability belongs to the box, so this configuration is shared by
+  /// players created by this process. An empty list safely falls back to H.264.
+  static void setSupportedVideoCodecs(Iterable<String> codecs) {
+    final normalized = <String>{
+      for (final codec in codecs) codec.trim().toLowerCase(),
+    }..removeWhere((codec) => codec.isEmpty);
+    _instance?._supportedVideoCodecs = List.unmodifiable(
+      normalized.isEmpty ? _defaultSupportedVideoCodecs : normalized,
+    );
   }
 
   @override
@@ -62,6 +80,7 @@ class ELinuxVideoPlayer extends VideoPlayerPlatform {
       uri: uri,
       httpHeaders: httpHeaders,
       formatHint: formatHint,
+      supportedVideoCodecs: _supportedVideoCodecs,
     );
 
     final TextureMessage response = await _api.create(message);

@@ -8,6 +8,7 @@
 #include <flutter/binary_messenger.h>
 #include <flutter/encodable_value.h>
 #include <map>
+#include <vector>
 
 class CreateMessage {
  public:
@@ -47,6 +48,14 @@ class CreateMessage {
     return http_headers_;
   }
 
+  void SetSupportedVideoCodecs(const std::vector<std::string>& codecs) {
+    supported_video_codecs_ = codecs;
+  }
+
+  std::vector<std::string> GetSupportedVideoCodecs() const {
+    return supported_video_codecs_;
+  }
+
   flutter::EncodableValue ToMap() {
     flutter::EncodableMap map = {
         {flutter::EncodableValue("asset"), flutter::EncodableValue(asset_)},
@@ -64,6 +73,13 @@ class CreateMessage {
       }
       map[flutter::EncodableValue("httpHeaders")] = flutter::EncodableValue(headers_map);
     }
+
+    flutter::EncodableList codecs;
+    for (const auto& codec : supported_video_codecs_) {
+      codecs.emplace_back(codec);
+    }
+    map[flutter::EncodableValue("supportedVideoCodecs")] =
+        flutter::EncodableValue(codecs);
     
     return flutter::EncodableValue(map);
   }
@@ -113,6 +129,23 @@ class CreateMessage {
           message.SetHttpHeaders(headers);
         }
       }
+
+      auto codecs_it = map.find(
+          flutter::EncodableValue("supportedVideoCodecs"));
+      if (codecs_it != map.end() &&
+          std::holds_alternative<flutter::EncodableList>(codecs_it->second)) {
+        const auto codecs =
+            std::get<flutter::EncodableList>(codecs_it->second);
+        std::vector<std::string> supported_codecs;
+        for (const auto& codec : codecs) {
+          if (std::holds_alternative<std::string>(codec)) {
+            supported_codecs.push_back(std::get<std::string>(codec));
+          }
+        }
+        if (!supported_codecs.empty()) {
+          message.SetSupportedVideoCodecs(supported_codecs);
+        }
+      }
     }
 
     return message;
@@ -124,6 +157,7 @@ class CreateMessage {
   std::string package_name_;
   std::string format_hint_;
   std::map<std::string, std::string> http_headers_;  // ADD THIS
+  std::vector<std::string> supported_video_codecs_{"h264"};
 };
 
 #endif 

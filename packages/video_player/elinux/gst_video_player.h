@@ -24,6 +24,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 struct AuthHeaders {
   std::map<std::string, std::string> all_headers;  // Store ALL headers as a map
@@ -34,7 +35,8 @@ struct AuthHeaders {
 class GstVideoPlayer {
  public:
   GstVideoPlayer(const std::string& uri,
-                 std::unique_ptr<VideoPlayerStreamHandler> handler);
+                 std::unique_ptr<VideoPlayerStreamHandler> handler,
+                 std::vector<std::string> supported_video_codecs);
   ~GstVideoPlayer();
 
   static void GstLibraryLoad();
@@ -130,9 +132,16 @@ class GstVideoPlayer {
                          std::chrono::steady_clock::time_point last_frame_time);
   static void DeepElementAddedHandler(GstBin* bin, GstBin* sub_bin,
                                       GstElement* element, gpointer user_data);
+  static gint AutoplugSelectCallback(
+      GstElement* decodebin, GstPad* pad, GstCaps* caps,
+      GstElementFactory* factory, gpointer user_data);
+  static gboolean SelectStreamCallback(GstElement* decodebin,
+                                       GstStreamCollection* collection,
+                                       GstStream* stream, gpointer user_data);
   static GstPadProbeReturn AbrThroughputProbe(GstPad* pad,
                                               GstPadProbeInfo* info,
                                               gpointer user_data);
+  bool IsVideoCodecAllowed(const GstCaps* caps) const;
 #ifdef USE_EGL_IMAGE_DMABUF
   void UnrefEGLImage();
 #endif  // USE_EGL_IMAGE_DMABUF
@@ -145,6 +154,7 @@ class GstVideoPlayer {
   // element directly gives us a working mute during the preroll gate.
   GstElement* audio_volume_ = nullptr;
   std::string uri_;
+  std::vector<std::string> supported_video_codecs_;
   // Private metadata parsed from the `#soatv:` URI fragment. startup_kbps
   // selects the cold-start rung; trace and offset_ms join native diagnostics
   // to the app-side startup timeline. The fragment is stripped before playbin.
@@ -169,6 +179,19 @@ class GstVideoPlayer {
   // spurious and must never be treated as completion (no seek-0, no 'completed'
   // event) or it loops the buffered window.
   bool is_live_ = false;
+  // Set when the Dart wrapper explicitly supplies stream_type metadata. This
+  // is authoritative and prevents a VOD URL containing "/live/" from being
+  // misclassified as an unseekable live stream.
+  bool stream_type_is_explicit_ = false;
+  // Seek state is shared by the platform thread, streaming thread, position
+  // queries and watchdog. A flushing HLS seek may temporarily make position
+  // unavailable and stop frames while new segments are fetched; retain the
+  // requested position and give that operation a bounded recovery window.
+  std::mutex seek_mutex_;
+  std::atomic<bool> seek_in_progress_{false};
+  std::atomic<int64_t> seek_target_ms_{0};
+  std::atomic<int64_t> last_known_position_ms_{0};
+  std::atomic<int64_t> last_seek_started_ticks_{0};
   std::mutex mutex_event_completed_;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<VideoPlayerStreamHandler> stream_handler_;
