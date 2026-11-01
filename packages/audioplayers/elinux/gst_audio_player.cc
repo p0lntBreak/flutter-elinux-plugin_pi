@@ -160,6 +160,10 @@ bool GstAudioPlayer::CreatePipeline() {
     std::cerr << "Failed to create alsasink" << std::endl;
     return false;
   }
+  // Hold our own references to the sink (and audiobin below). playbin's
+  // audio-sink and gst_bin_add take the floating reference, so without these
+  // the unrefs in Dispose() freed elements playbin had already freed.
+  gst_object_ref_sink(gst_.audiosink);
 
   const std::string audio_device = PickAudioDevice();
   g_object_set(G_OBJECT(gst_.audiosink), "device", audio_device.c_str(),
@@ -171,6 +175,7 @@ bool GstAudioPlayer::CreatePipeline() {
     g_object_set(G_OBJECT(gst_.playbin), "audio-sink", gst_.audiosink, NULL);
   } else {
     gst_.audiobin = gst_bin_new(NULL);
+    gst_object_ref_sink(gst_.audiobin);
     gst_bin_add_many(GST_BIN(gst_.audiobin), gst_.panorama, gst_.audiosink, NULL);
     gst_element_link(gst_.panorama, gst_.audiosink);
 
@@ -224,13 +229,13 @@ std::string GstAudioPlayer::ParseUri(const std::string& uri) {
     return uri;
   }
 
-  const auto* filename_uri = gst_filename_to_uri(uri.c_str(), NULL);
+  gchar* filename_uri = gst_filename_to_uri(uri.c_str(), NULL);
   if (!filename_uri) {
     std::cerr << "Faild to open " << uri.c_str() << std::endl;
     return uri;
   }
   std::string result_uri(filename_uri);
-  delete filename_uri;
+  g_free(filename_uri);
 
   return result_uri;
 }
@@ -436,8 +441,15 @@ void GstAudioPlayer::Dispose() {
   url_.clear();
   std::cout << "AUDIO-PIPELINE: disposing player=" << player_id_ << std::endl;
 
+  // Go to NULL first: this closes the ALSA device before dispose() returns to
+  // Dart, so the next player can open plughw straight away.
+  gst_element_set_state(gst_.playbin, GST_STATE_NULL);
+  gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
+  std::cout << "AUDIO-PIPELINE: released audio device player=" << player_id_
+            << std::endl;
+
   if (gst_.bus) {
-    gst_bus_set_flushing(gst_.bus, TRUE);
+    gst_bus_set_sync_handler(gst_.bus, NULL, NULL, NULL);
     gst_object_unref(GST_OBJECT(gst_.bus));
     gst_.bus = nullptr;
   }
@@ -447,15 +459,12 @@ void GstAudioPlayer::Dispose() {
     gst_.source = nullptr;
   }
 
-  if (gst_.playbin) {
-    gst_element_set_state(gst_.playbin, GST_STATE_NULL);
-    gst_element_get_state(gst_.playbin, NULL, NULL, GST_CLOCK_TIME_NONE);
-    gst_object_unref(GST_OBJECT(gst_.playbin));
-  }
-
+  gst_object_unref(GST_OBJECT(gst_.playbin));
+  // Our own references from CreatePipeline().
   if (gst_.audiobin) {
     gst_object_unref(GST_OBJECT(gst_.audiobin));
-  } else if (gst_.audiosink) {
+  }
+  if (gst_.audiosink) {
     gst_object_unref(GST_OBJECT(gst_.audiosink));
   }
 

@@ -1208,6 +1208,12 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
         stats.texture_no_player.exchange(0, std::memory_order_relaxed);
     const uint64_t no_frame =
         stats.texture_no_frame.exchange(0, std::memory_order_relaxed);
+    // Subset of no_frame: the frame existed but a handoff held the player's
+    // buffer lock. The rest of no_frame means no decoded frame yet.
+    uint64_t frame_lock_busy = 0;
+    if (std::shared_ptr<GstVideoPlayer> native = player->GetPlayer()) {
+      frame_lock_busy = native->TakeFrameLockBusyCount();
+    }
     const uint64_t releases =
         stats.buffer_releases.exchange(0, std::memory_order_relaxed);
     const uint64_t copy_time_ns =
@@ -1235,7 +1241,8 @@ void VideoPlayerPlugin::ReportTextureDiagnostics(
          << " coalesced=" << coalesced << " mark_failed=" << mark_failed
          << " callbacks=" << callbacks << " returned=" << returned
          << " lock_busy=" << lock_busy << " no_player=" << no_player
-         << " no_frame=" << no_frame << " releases=" << releases;
+         << " no_frame=" << no_frame
+         << " frame_lock_busy=" << frame_lock_busy << " releases=" << releases;
     if (copy_samples > 0) {
       line << " copy_avg_ms="
            << (static_cast<double>(copy_time_ns) / copy_samples / 1000000.0)
@@ -1293,6 +1300,14 @@ void VideoPlayerPlugin::DisposePlayer(int64_t texture_id) {
   }
   if (player->event_channel) {
     player->event_channel->SetStreamHandler(nullptr);
+  }
+
+  // Free the ALSA device and decoder before dispose() returns to Dart, so the
+  // next player (video or audio) never finds plughw busy. ClearPlayer() below
+  // only drops this map's reference; the destructor may run later on the
+  // raster thread if a frame copy still holds the native player.
+  if (std::shared_ptr<GstVideoPlayer> native = player->GetPlayer()) {
+    native->ReleasePipeline();
   }
 
   // Tear down the GstVideoPlayer now (stops the pipeline and frees its
