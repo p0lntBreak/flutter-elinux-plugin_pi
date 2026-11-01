@@ -1955,9 +1955,31 @@ bool GstVideoPlayer::Preroll() {
     if (result != GST_STATE_CHANGE_FAILURE && !audio_device_busy_.load()) {
       // NO_PREROLL (live source) and ASYNC are both acceptable — not errors.
       // NO_PREROLL is GStreamer's authoritative "this source is LIVE" signal.
-      // The ALSA open can also fail during this wait.
-      GstState state;
-      gst_element_get_state(gst_.pipeline, &state, NULL, 5 * GST_SECOND);
+      // The ALSA open usually fails during this wait (playsink opens alsasink
+      // from a streaming thread) and the async change then never completes,
+      // so wait in short slices and stop as soon as the bus reports busy or an
+      // error. A single 5 s wait per attempt made 4 retries cost ~27 s, all of
+      // it blocking a dispose() that joins this thread.
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!audio_device_busy_.load() && !error_notified_.load() &&
+             std::chrono::steady_clock::now() < deadline) {
+        GstState state;
+        if (gst_element_get_state(gst_.pipeline, &state, NULL,
+                                  100 * GST_MSECOND) !=
+            GST_STATE_CHANGE_ASYNC) {
+          break;
+        }
+      }
+    }
+    if (audio_device_busy_.load() && error_notified_.load()) {
+      // Another error already reached Dart, which is reconnecting. Retrying
+      // here would only hold the device while the new player starts, and
+      // Init() fails on error_notified_ regardless.
+      std::cerr << "Preroll: ALSA device busy after an error was reported; "
+                   "not retrying"
+                << std::endl;
+      return false;
     }
     if (audio_device_busy_.load()) {
       if (!audio_disabled_ && busy_retries < kAlsaBusyRetries) {
